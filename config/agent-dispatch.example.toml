@@ -40,6 +40,14 @@ worktree_root = "~/agent-dispatch/worktrees"
 # SQLite state database. MUST live outside target repositories.
 state_db = "~/.local/state/agent-dispatch/state.db"
 
+# Raw NDJSON run logs. MUST live outside every target repository and worktree:
+# a log written inside a worktree can be swept into a commit by `git add -A`
+# and would polute the PR with a raw agent transcript.
+run_log_dir = "~/.local/state/agent-dispatch/runs"
+
+# Bounded retention for run logs (count-based pruning).
+run_log_keep = 50
+
 # Single-process lock; prevents accidentally running two workers.
 lock_file = "~/.local/state/agent-dispatch/worker.lock"
 
@@ -53,12 +61,37 @@ lock_file = "~/.local/state/agent-dispatch/worker.lock"
 # detail and must not be hardcoded into the reusable package.
 command = "/home/craftlypse/.local/bin/gh-craftlypse"
 
-# Explicit credential helper for Git HTTPS inside managed worktrees.
-# REQUIRED: this VM's ambient git config also registers
-# `/usr/bin/gh auth git-credential`, so a worktree that inherits ambient
-# config could authenticate with an unapproved credential. Every remote
-# operation in a managed worktree passes this helper explicitly via
-#   git -c credential.https://github.com.helper="!<command> auth git-credential"
+# EXPLICIT credential helper for Git HTTPS inside managed worktrees.
+#
+# WHY THE ORDER MATTERS: `credential.helper` is MULTI-VALUED and a bare
+# `-c ...helper=!<cmd>` APPENDS to the inherited list instead of replacing it.
+# An earlier ambient helper is therefore queried FIRST and stops the chain as
+# soon as it returns credentials. Verified on this VM with instrumented
+# helpers; the empty value below is a LIST RESET, not a no-op.
+#
+# On this VM the inherited order for github.com is:
+#   1. /usr/bin/gh auth git-credential   (unapproved, from ~/.gitconfig)
+#   2. gh-craftlypse auth git-credential (approved, from .git/config)
+# Today the raw helper returns no credentials so the chain happens to fall
+# through to the wrapper. That is incidental, NOT guaranteed. Always reset.
+#
+# Correct form (reset, THEN set):
+#   git -c credential.https://github.com.helper= \
+#       -c credential.https://github.com.helper="!<wrapper> auth git-credential" <cmd>
+#
+# COVERAGE LIMITS:
+#   * A per-invocation -c applies only to that one process; it is NOT inherited
+#     by Git processes the agent spawns itself.
+#   * The orchestrator therefore also writes this reset-then-wrapper sequence
+#     into the worktree's REPO-LOCAL Git config at provisioning time. A worktree
+#     shares --git-common-dir with its source clone, so repo-local config is
+#     shared and covers agent-issued Git automatically (verified on this VM).
+#   * GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n are inherited by
+#     child processes (verified) if a subtree must be pinned without config edits.
+#
+# This is an operational guardrail on a personal VM, not hard isolation: an
+# unrestricted agent could reconfigure Git.
+credential_helper_reset = ""
 credential_helper = "!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential"
 
 # Fail fast (before any API call) if a configured repository is absent from

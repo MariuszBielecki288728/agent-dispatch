@@ -51,6 +51,17 @@
           "minLength": 1,
           "description": "SQLite state database path. MUST live outside target repositories."
         },
+        "run_log_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Directory for raw NDJSON run logs. MUST live outside every target repository and worktree, otherwise a log can be swept into a commit by 'git add -A' and would pollute the PR with a raw agent transcript."
+        },
+        "run_log_keep": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 50,
+          "description": "Bounded retention for run logs (count-based pruning)."
+        },
         "lock_file": {
           "type": "string",
           "minLength": 1,
@@ -66,7 +77,7 @@
     "github": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command", "credential_helper", "labels"],
+      "required": ["command", "credential_helper", "credential_helper_reset", "labels"],
       "properties": {
         "command": {
           "type": "string",
@@ -77,7 +88,12 @@
           "type": "string",
           "minLength": 1,
           "pattern": "^!",
-          "description": "Explicit Git credential helper, e.g. '!/path/to/wrapper auth git-credential'. REQUIRED because ambient git config may register an unapproved helper for github.com; managed worktrees override it per invocation."
+          "description": "Approved Git credential helper, e.g. '!/path/to/wrapper auth git-credential'. MUST be applied AFTER credential_helper_reset, because credential.helper is multi-valued and a bare -c override appends instead of replacing. The reset entry is what prevents an ambient unapproved helper from being queried first."
+        },
+        "credential_helper_reset": {
+          "type": "string",
+          "const": "",
+          "description": "Empty value that RESETS the inherited credential.helper list before the approved helper is added (per gitcredentials). Must remain empty: it is not a no-op. Set via -c for orchestrator commands and written into the worktree's repo-local config so agent-issued Git inherits the same order."
         },
         "fail_fast_on_denied_repo": {
           "type": "boolean",

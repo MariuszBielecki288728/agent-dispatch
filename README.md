@@ -63,13 +63,25 @@ The permission grant does **not** persist across `--session` resume, so the flag
 
 A blocked run still reports `subtype: "success"` with exit code 0 and no error flag, so the orchestrator must scan the NDJSON stream for `tool_hook_blocked` events and treat any occurrence as a hard failure. See [`docs/architecture.md` §2](docs/architecture.md).
 
+**Interrupted runs cannot be resumed.** The session ID is emitted on the stream's first line, but the transcript is only written on clean completion — a run killed by timeout, `SIGKILL`, or even `SIGINT` leaves no transcript, and `--session <id>` then fails with *"neither an existing .jsonl transcript nor a known session-id prefix"*. Bounded retries therefore start a **fresh** session while preserving any uncommitted edits.
+
+**Raw run logs never live inside a worktree.** They are written to the private state directory, because a log created in the worktree could be swept into a commit by `git add -A` and would dirty the tree the ownership check relies on.
+
 ---
 
 ## Security posture — stated plainly
 
 - **`--yolo` is a trust choice, not isolation.** It grants the agent unrestricted shell and file access as your user. The maintainer has accepted this on this trusted personal VM. Do not describe it as a sandbox.
 - **A Git worktree is Git isolation only.** It is not a filesystem, process, network, or credential boundary. An agent with unrestricted shell access can reach files outside its worktree and the same user's credentials. These are consciously accepted risks, not guarantees the orchestrator can prevent.
-- **All GitHub access goes through a configurable wrapper command** (on this VM: `gh-craftlypse`), which holds a repository-scoped credential. Never substitute raw `gh`, run `gh auth login`, or export `GH_TOKEN` on this VM. Worktrees pass an explicit Git credential helper per invocation so an ambient, unapproved helper is never picked up.
+- **All GitHub access goes through a configurable wrapper command** (on this VM: `gh-craftlypse`), which holds a repository-scoped credential. Never substitute raw `gh`, run `gh auth login`, or export `GH_TOKEN` on this VM.
+- **Credential-helper ordering is explicit, because `credential.helper` is multi-valued.** A bare `-c credential.https://github.com.helper=!<cmd>` *appends* to the inherited list; an earlier ambient helper is then queried first and stops the chain once it returns credentials. The correct form **resets the list, then sets the wrapper**:
+
+  ```bash
+  git -c credential.https://github.com.helper= \
+      -c credential.https://github.com.helper="!<wrapper> auth git-credential" <command>
+  ```
+
+  A per-invocation `-c` covers only that process, so managed worktrees also get this reset-then-wrapper sequence written into their **repo-local** config, which agent-issued Git inherits. On this VM the inherited order is the unapproved raw `gh` helper first and the wrapper second; the raw helper currently returns nothing, so the chain happens to fall through — that is incidental, not guaranteed.
 - **Operational guardrails:** repository allowlist only, no automatic merge, no Issue closure, no reviewer approval, no touching unrelated repositories, one task at a time, bounded run timeout and retries, no token or raw-log dumping.
 
 ---
