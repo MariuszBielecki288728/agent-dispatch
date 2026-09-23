@@ -13,6 +13,7 @@ htmlcov/
 
 # Agent & Worktree runtime data
 .worktrees/
+.commandcode/
 tmp/
 scratch/
 

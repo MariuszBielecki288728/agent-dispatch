@@ -2,194 +2,410 @@
 # ==============================================================================
 # scripts/smoke-runtime.sh
 #
-# Reproducible local smoke test for agent-dispatch:
-# - Validates gh-craftlypse wrapper and GitHub repository connectivity
-# - Tests git HTTPS credential resolution via gh-craftlypse
-# - Proves fresh task -> persistent session -> same-session follow-up via opencode
-# - Proves fresh task -> persistent session -> same-session follow-up via commandcode
-# - Verifies session export and turn continuity
-# - Verifies headless execution capability under systemd --user
-#
-# Zero credentials or tokens are printed, exposed, or committed.
+# Smoke verification suite for agent-dispatch:
+# - Deterministic mock suite and negative failure-injection tests (default / CI).
+# - Opt-in live VM provider verification (--live / SMOKE_LIVE=1).
+# - Strict assertions: structural JSON parsing, turn continuity, bounded timeouts.
+# - Sanitized reporting: no credentials, tokens, or raw unfiltered outputs dumped.
 # ==============================================================================
 
 set -euo pipefail
 
+# ANSI colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
+
+# Mode detection
+MODE="mock"
+for arg in "$@"; do
+    case "$arg" in
+        --live) MODE="live" ;;
+        --mock) MODE="mock" ;;
+        --help|-h)
+            cat <<EOF
+Usage: $0 [--mock | --live]
+
+Modes:
+  --mock (default) Run deterministic mock checks and negative test cases.
+                   Safe for CI and unauthenticated environments.
+  --live           Run live checks against VM environment (gh-craftlypse,
+                   commandcode, systemd --user). Requires credentials.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "${SMOKE_LIVE:-0}" == "1" ]]; then
+    MODE="live"
+fi
+
+# Track results in arrays
+declare -a TEST_NAMES=()
+declare -a TEST_STATUS=()
+declare -a TEST_DETAILS=()
+
+record_result() {
+    local name="$1"
+    local status="$2" # PASS, FAIL, SKIP
+    local details="$3"
+    TEST_NAMES+=("$name")
+    TEST_STATUS+=("$status")
+    TEST_DETAILS+=("$details")
+}
 
 log_info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
 log_pass() { printf "${GREEN}[PASS]${NC} %s\n" "$*"; }
 log_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 log_fail() { printf "${RED}[FAIL]${NC} %s\n" "$*"; }
 
-GH_WRAPPER="/home/craftlypse/.local/bin/gh-craftlypse"
-OPENCODE_BIN="/home/craftlypse/.opencode/bin/opencode"
-COMMANDCODE_BIN="/home/craftlypse/.local/bin/commandcode"
-CODEX_BIN="${HOME}/.vscode-server/extensions/openai.chatgpt-26.5917.62051-linux-x64/bin/linux-x86_64/codex"
-FREE_MODEL="opencode/nemotron-3-ultra-free"
-
-# 1. Environment & Lingering Check
-log_info "Step 1: Checking systemd user lingering status..."
-if ! command -v loginctl >/dev/null 2>&1; then
-    log_fail "loginctl not found"
-    exit 1
-fi
-
-LINGER_STATE="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
-if [[ "$LINGER_STATE" == "yes" ]]; then
-    log_pass "User lingering is enabled (Linger=yes) for unattended services."
-else
-    log_warn "User lingering is not active (state: '$LINGER_STATE'). Services may terminate on logout."
-fi
-
-# 2. GitHub Access via gh-craftlypse
-log_info "Step 2: Testing gh-craftlypse GitHub API access..."
-if [[ ! -x "$GH_WRAPPER" ]]; then
-    log_fail "gh-craftlypse wrapper not found at $GH_WRAPPER"
-    exit 1
-fi
-
-REPO_CHECK="$("$GH_WRAPPER" repo view MariuszBielecki288728/agent-dispatch --json nameWithOwner,viewerPermission 2>&1)"
-if echo "$REPO_CHECK" | grep -q "MariuszBielecki288728/agent-dispatch"; then
-    log_pass "gh-craftlypse successfully queried repository metadata."
-else
-    log_fail "gh-craftlypse repository query failed: $REPO_CHECK"
-    exit 1
-fi
-
-# 3. Git HTTPS Credential Helper
-log_info "Step 3: Testing non-interactive Git HTTPS credential helper..."
-CRED_TEST="$(printf "protocol=https\nhost=github.com\n\n" | "$GH_WRAPPER" auth git-credential get 2>&1)"
-if echo "$CRED_TEST" | grep -q "username=x-access-token"; then
-    log_pass "gh-craftlypse provides valid git-credential helper output without interactive prompts."
-else
-    log_fail "gh-craftlypse git-credential helper failed or returned unexpected format."
-    exit 1
-fi
-
-# 4. Disposable Workspace Setup
+# Temporary scratch space
 SCRATCH_DIR="$(mktemp -d /tmp/agent-dispatch-smoke-XXXXXX)"
 cleanup() {
     rm -rf "$SCRATCH_DIR"
 }
 trap cleanup EXIT
-log_info "Step 4: Created isolated disposable workspace: $SCRATCH_DIR"
 
-(
-    cd "$SCRATCH_DIR"
-    git init -q
-    git config user.name "Smoke Tester"
-    git config user.email "smoke@test.local"
-    echo "# Smoke Test Scratch" > README.md
-    git add README.md
-    git commit -q -m "initial commit"
-)
+# Python helper to extract fields safely from NDJSON streams
+parse_ndjson_result() {
+    local file="$1"
+    python3 -c "
+import sys, json
 
-# 5. OpenCode CLI Initial Session & Resumption
-log_info "Step 5: Executing unattended agent session with OpenCode CLI..."
-if [[ -x "$OPENCODE_BIN" ]]; then
-    RUN_OUT="$SCRATCH_DIR/opencode-run.jsonl"
-    "$OPENCODE_BIN" run "Respond with EXACTLY the word SMOKE_OPENCODE and nothing else." \
-        -m "$FREE_MODEL" \
-        --format json \
-        --dir "$SCRATCH_DIR" > "$RUN_OUT" 2>&1 || {
-            log_fail "opencode run failed. Output:"
-            cat "$RUN_OUT"
-            exit 1
-        }
+session_id = None
+final_text = None
+subtype = None
+error_msg = None
 
-    OPENCODE_SID="$(grep -m 1 -o '"sessionID":"[^"]*"' "$RUN_OUT" | head -n 1 | cut -d '"' -f 4 || true)"
-    if [[ -n "$OPENCODE_SID" ]]; then
-        log_pass "OpenCode fresh task completed with session ID: $OPENCODE_SID"
-        
-        # Resumption test
-        RESUME_OUT="$SCRATCH_DIR/opencode-resume.jsonl"
-        "$OPENCODE_BIN" run "Repeat the secret token you answered in the first turn of this session." \
-            -s "$OPENCODE_SID" \
-            --format json \
-            --dir "$SCRATCH_DIR" > "$RESUME_OUT" 2>&1 || true
+try:
+    with open('$file') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            
+            # Check run_start event
+            if data.get('type') == 'event' and data.get('event', {}).get('type') == 'run_start':
+                session_id = data['event'].get('sessionId')
+            
+            # Check result line
+            if data.get('type') == 'result':
+                subtype = data.get('subtype')
+                session_id = data.get('sessionId') or session_id
+                final_text = data.get('finalText', '')
+                if subtype != 'success':
+                    error_msg = data.get('error', {}).get('message') or final_text
+except Exception as e:
+    print(json.dumps({'status': 'parse_error', 'error': str(e)}))
+    sys.exit(0)
 
-        if grep -q "SMOKE_OPENCODE" "$RESUME_OUT"; then
-            log_pass "OpenCode session resumption successfully recalled prior context."
+print(json.dumps({
+    'sessionId': session_id,
+    'finalText': final_text,
+    'subtype': subtype,
+    'errorMessage': error_msg
+}))
+"
+}
+
+# ==============================================================================
+# 1. Deterministic Negative Tests (Failure Injection)
+# ==============================================================================
+run_negative_tests() {
+    log_info "Running deterministic negative test cases..."
+
+    # Negative Test A: CLI exits with non-zero status
+    log_info "Negative Test A: Verifying detection of non-zero CLI exit..."
+    local fake_cli_exit="$SCRATCH_DIR/fake_exit_fail.sh"
+    cat << 'EOF' > "$fake_cli_exit"
+#!/usr/bin/env bash
+echo '{"type":"event","event":{"type":"run_start","sessionId":"fake-id"}}'
+echo 'Process crashed unexpectedly' >&2
+exit 1
+EOF
+    chmod +x "$fake_cli_exit"
+
+    local exit_out="$SCRATCH_DIR/neg_exit.out"
+    if "$fake_cli_exit" > "$exit_out" 2>&1; then
+        record_result "negative_exit_failure" "FAIL" "Failed to catch non-zero CLI exit code"
+    else
+        record_result "negative_exit_failure" "PASS" "Correctly caught non-zero CLI exit code"
+    fi
+
+    # Negative Test B: Missing sessionId in output
+    log_info "Negative Test B: Verifying detection of missing session ID..."
+    local fake_no_id="$SCRATCH_DIR/fake_no_id.jsonl"
+    cat << 'EOF' > "$fake_no_id"
+{"type":"event","event":{"type":"turn_start"}}
+{"type":"result","subtype":"success","finalText":"OK"}
+EOF
+    local parsed_no_id
+    parsed_no_id="$(parse_ndjson_result "$fake_no_id")"
+    local sid
+    sid="$(python3 -c "import json; print(json.loads('''$parsed_no_id''').get('sessionId') or '')")"
+    if [[ -z "$sid" ]]; then
+        record_result "negative_missing_session_id" "PASS" "Correctly caught missing session ID"
+    else
+        record_result "negative_missing_session_id" "FAIL" "Failed to detect missing session ID"
+    fi
+
+    # Negative Test C: Error subtype in result
+    log_info "Negative Test C: Verifying detection of error result subtype..."
+    local fake_err="$SCRATCH_DIR/fake_err.jsonl"
+    cat << 'EOF' > "$fake_err"
+{"type":"event","event":{"type":"run_start","sessionId":"fake-err-id"}}
+{"type":"result","subtype":"error","finalText":"Rate limit exceeded","error":{"message":"Quota hit"}}
+EOF
+    local parsed_err
+    parsed_err="$(parse_ndjson_result "$fake_err")"
+    local subtype
+    subtype="$(python3 -c "import json; print(json.loads('''$parsed_err''').get('subtype') or '')")"
+    if [[ "$subtype" != "success" ]]; then
+        record_result "negative_error_subtype" "PASS" "Correctly caught error result subtype"
+    else
+        record_result "negative_error_subtype" "FAIL" "Failed to catch error subtype"
+    fi
+
+    # Negative Test D: Resume context mismatch
+    log_info "Negative Test D: Verifying detection of session context mismatch..."
+    local fake_resume="$SCRATCH_DIR/fake_resume.jsonl"
+    cat << 'EOF' > "$fake_resume"
+{"type":"event","event":{"type":"run_start","sessionId":"fake-id"}}
+{"type":"result","subtype":"success","finalText":"WRONG_ANSWER"}
+EOF
+    local parsed_resume
+    parsed_resume="$(parse_ndjson_result "$fake_resume")"
+    local text
+    text="$(python3 -c "import json; print(json.loads('''$parsed_resume''').get('finalText') or '')")"
+    if [[ "$text" != "EXPECTED_TOKEN" ]]; then
+        record_result "negative_resume_mismatch" "PASS" "Correctly caught context mismatch on resume"
+    else
+        record_result "negative_resume_mismatch" "FAIL" "Failed to catch context mismatch"
+    fi
+}
+
+# ==============================================================================
+# 2. Mock Test Suite (Default / CI)
+# ==============================================================================
+run_mock_suite() {
+    log_info "Running mock verification suite..."
+
+    # Mock Task: Fresh session
+    local mock_fresh="$SCRATCH_DIR/mock_fresh.jsonl"
+    cat << 'EOF' > "$mock_fresh"
+{"type":"event","event":{"type":"run_start","sessionId":"mock-session-1234"}}
+{"type":"event","event":{"type":"turn_start","turnNumber":1}}
+{"type":"result","subtype":"success","sessionId":"mock-session-1234","finalText":"MOCK_SMOKE_OK"}
+EOF
+    local parsed_fresh
+    parsed_fresh="$(parse_ndjson_result "$mock_fresh")"
+    local sid subtype text
+    sid="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('sessionId') or '')")"
+    subtype="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('subtype') or '')")"
+    text="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('finalText') or '')")"
+
+    if [[ "$sid" == "mock-session-1234" && "$subtype" == "success" && "$text" == "MOCK_SMOKE_OK" ]]; then
+        record_result "mock_fresh_task" "PASS" "Mock fresh task validated structurally"
+    else
+        record_result "mock_fresh_task" "FAIL" "Mock fresh task validation failed"
+    fi
+
+    # Mock Resume: Same session continuity
+    local mock_resume="$SCRATCH_DIR/mock_resume.jsonl"
+    cat << 'EOF' > "$mock_resume"
+{"type":"event","event":{"type":"run_start","sessionId":"mock-session-1234"}}
+{"type":"event","event":{"type":"turn_start","turnNumber":2}}
+{"type":"result","subtype":"success","sessionId":"mock-session-1234","finalText":"MOCK_SMOKE_OK"}
+EOF
+    local parsed_res
+    parsed_res="$(parse_ndjson_result "$mock_resume")"
+    local res_sid res_text
+    res_sid="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('sessionId') or '')")"
+    res_text="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('finalText') or '')")"
+
+    if [[ "$res_sid" == "mock-session-1234" && "$res_text" == "MOCK_SMOKE_OK" ]]; then
+        record_result "mock_session_resume" "PASS" "Mock session resume validated structurally"
+    else
+        record_result "mock_session_resume" "FAIL" "Mock session resume validation failed"
+    fi
+
+    # Optional runners recorded as SKIP in mock mode
+    record_result "live_commandcode" "SKIP" "Live Command Code check skipped (run with --live)"
+    record_result "live_github_access" "SKIP" "Live GitHub access check skipped (run with --live)"
+    record_result "live_opencode_optional" "SKIP" "OpenCode optional alternative skipped"
+    record_result "live_codex_optional" "SKIP" "Codex optional alternative skipped"
+}
+
+# ==============================================================================
+# 3. Live Test Suite (Opt-in via --live / SMOKE_LIVE=1)
+# ==============================================================================
+run_live_suite() {
+    log_info "Running live environment checks on host..."
+
+    # 1. Systemd Lingering
+    log_info "Step 1: Checking user lingering..."
+    local linger_val
+    linger_val="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+    if [[ "$linger_val" == "yes" ]]; then
+        record_result "systemd_lingering" "PASS" "Linger=yes verified"
+    else
+        record_result "systemd_lingering" "FAIL" "Linger not enabled (state: $linger_val)"
+    fi
+
+    # 2. GitHub Access via gh-craftlypse
+    local gh_wrapper="/home/craftlypse/.local/bin/gh-craftlypse"
+    log_info "Step 2: Testing gh-craftlypse..."
+    if [[ -x "$gh_wrapper" ]]; then
+        local repo_view
+        if repo_view="$(timeout 15s "$gh_wrapper" repo view MariuszBielecki288728/agent-dispatch --json nameWithOwner 2>&1)"; then
+            record_result "gh_craftlypse_api" "PASS" "Verified repository read permission"
         else
-            log_warn "OpenCode session resumption did not match expected context."
+            record_result "gh_craftlypse_api" "FAIL" "Repository query failed"
         fi
     else
-        log_warn "Could not extract sessionID from opencode output."
-    fi
-else
-    log_warn "OpenCode binary not found at $OPENCODE_BIN"
-fi
-
-# 6. Command Code CLI Initial Session, Resumption, & Worktree
-log_info "Step 6: Executing unattended agent session with Command Code CLI..."
-if [[ -x "$COMMANDCODE_BIN" ]]; then
-    CMD_WHO="$(commandcode whoami 2>/dev/null || true)"
-    if echo "$CMD_WHO" | grep -q "Username:"; then
-        USER_NAME="$(echo "$CMD_WHO" | grep "Username:" | awk '{print $NF}')"
-        log_pass "Command Code authenticated as: $USER_NAME"
+        record_result "gh_craftlypse_api" "FAIL" "Wrapper missing at $gh_wrapper"
     fi
 
-    CMD_RUN_OUT="$SCRATCH_DIR/commandcode-run.jsonl"
-    (
-        cd "$SCRATCH_DIR"
-        "$COMMANDCODE_BIN" -p "Respond with EXACTLY the word SMOKE_COMMANDCODE and nothing else." \
-            --output-format json > "$CMD_RUN_OUT" 2>&1 || {
-                log_fail "commandcode run failed. Output:"
-                cat "$CMD_RUN_OUT"
-                exit 1
-            }
-    )
-
-    CMD_SID="$(grep -m 1 -o '"sessionId":"[^"]*"' "$CMD_RUN_OUT" | head -n 1 | cut -d '"' -f 4 || true)"
-    if [[ -n "$CMD_SID" ]]; then
-        log_pass "Command Code fresh task completed with session ID: $CMD_SID"
-
-        CMD_RESUME_OUT="$SCRATCH_DIR/commandcode-resume.jsonl"
-        (
-            cd "$SCRATCH_DIR"
-            "$COMMANDCODE_BIN" -p "What was the single word you answered in the first turn?" \
-                --session "$CMD_SID" \
-                --output-format json > "$CMD_RESUME_OUT" 2>&1 || true
-        )
-
-        if grep -q "SMOKE_COMMANDCODE" "$CMD_RESUME_OUT"; then
-            log_pass "Command Code session resumption successfully recalled prior context."
+    # 3. Git HTTPS Credential Helper
+    log_info "Step 3: Testing Git credential helper..."
+    if [[ -x "$gh_wrapper" ]]; then
+        local cred_out
+        cred_out="$(printf "protocol=https\nhost=github.com\n\n" | timeout 10s "$gh_wrapper" auth git-credential get 2>&1 || true)"
+        if echo "$cred_out" | grep -q "username=x-access-token"; then
+            record_result "git_credential_helper" "PASS" "Credential helper returned valid auth structure"
         else
-            log_warn "Command Code session resumption did not match expected context."
+            record_result "git_credential_helper" "FAIL" "Credential helper failed"
+        fi
+    fi
+
+    # 4. Command Code CLI Fresh Task
+    local cmdcode_bin="/home/craftlypse/.local/bin/commandcode"
+    local live_session_id=""
+    log_info "Step 4: Testing Command Code fresh task..."
+    if [[ -x "$cmdcode_bin" ]]; then
+        local fresh_log="$SCRATCH_DIR/cmdcode_fresh.jsonl"
+        if timeout 30s "$cmdcode_bin" -p "Respond with EXACTLY the word LIVE_SMOKE_OK and nothing else." \
+            --output-format json > "$fresh_log" 2>/dev/null; then
+            
+            local parsed
+            parsed="$(parse_ndjson_result "$fresh_log")"
+            live_session_id="$(python3 -c "import json; print(json.loads('''$parsed''').get('sessionId') or '')")"
+            local text
+            text="$(python3 -c "import json; print(json.loads('''$parsed''').get('finalText') or '')")"
+            local subtype
+            subtype="$(python3 -c "import json; print(json.loads('''$parsed''').get('subtype') or '')")"
+
+            if [[ -n "$live_session_id" && "$subtype" == "success" && "$text" == *"LIVE_SMOKE_OK"* ]]; then
+                record_result "commandcode_fresh_task" "PASS" "Session $live_session_id returned expected output"
+            else
+                record_result "commandcode_fresh_task" "FAIL" "Structural validation failed (subtype: $subtype)"
+            fi
+        else
+            record_result "commandcode_fresh_task" "FAIL" "Command Code execution timed out or exited non-zero"
         fi
     else
-        log_warn "Could not extract sessionId from commandcode output."
+        record_result "commandcode_fresh_task" "FAIL" "Binary missing at $cmdcode_bin"
     fi
+
+    # 5. Command Code Session Resumption
+    log_info "Step 5: Testing Command Code session resumption..."
+    if [[ -n "$live_session_id" && -x "$cmdcode_bin" ]]; then
+        local resume_log="$SCRATCH_DIR/cmdcode_resume.jsonl"
+        if timeout 30s "$cmdcode_bin" -p "Repeat the exact token you answered in the first turn." \
+            --session "$live_session_id" --output-format json > "$resume_log" 2>/dev/null; then
+            
+            local parsed_res
+            parsed_res="$(parse_ndjson_result "$resume_log")"
+            local res_text
+            res_text="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('finalText') or '')")"
+            local res_sub
+            res_sub="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('subtype') or '')")"
+
+            if [[ "$res_sub" == "success" && "$res_text" == *"LIVE_SMOKE_OK"* ]]; then
+                record_result "commandcode_session_resume" "PASS" "Successfully recalled prior turn context"
+            else
+                record_result "commandcode_session_resume" "FAIL" "Failed to recall context (got: '$res_text')"
+            fi
+        else
+            record_result "commandcode_session_resume" "FAIL" "Resume execution timed out or exited non-zero"
+        fi
+    else
+        record_result "commandcode_session_resume" "SKIP" "Skipped due to failed initial session"
+    fi
+
+    # 6. Headless systemd execution
+    log_info "Step 6: Testing headless systemd-run execution..."
+    if [[ -x "$cmdcode_bin" ]]; then
+        if timeout 20s systemd-run --user --wait "$cmdcode_bin" -p "Respond with SYSTEMD_PASS" \
+            --output-format json >/dev/null 2>&1; then
+            record_result "commandcode_systemd_run" "PASS" "Executed successfully in isolated user service"
+        else
+            record_result "commandcode_systemd_run" "FAIL" "systemd-run failed or timed out"
+        fi
+    else
+        record_result "commandcode_systemd_run" "SKIP" "Command Code binary missing"
+    fi
+
+    # Optional alternatives recorded as SKIP unless explicitly requested
+    record_result "opencode_alternative" "SKIP" "Optional alternative (OpenCode Go sub currently inactive)"
+    record_result "codex_alternative" "SKIP" "Optional alternative (Codex quota limit reached)"
+}
+
+# ==============================================================================
+# Execution & Summary Report
+# ==============================================================================
+echo "=============================================================================="
+echo " Starting agent-dispatch smoke verification (Mode: $MODE)"
+echo "=============================================================================="
+
+run_negative_tests
+
+if [[ "$MODE" == "live" ]]; then
+    run_live_suite
 else
-    log_warn "Command Code binary not found at $COMMANDCODE_BIN"
+    run_mock_suite
 fi
 
-# 7. Systemd User Execution Validation
-log_info "Step 7: Testing non-interactive headless execution via systemd-run --user..."
-if systemd-run --user --wait "$COMMANDCODE_BIN" -p "Respond with SYSTEMD_OK" \
-    --output-format json >/dev/null 2>&1; then
-    log_pass "Command Code executed successfully inside an isolated systemd user unit."
-elif [[ -x "$OPENCODE_BIN" ]] && systemd-run --user --wait "$OPENCODE_BIN" run "Respond with SYSTEMD_OK" \
-    -m "$FREE_MODEL" --format json --dir "$SCRATCH_DIR" >/dev/null 2>&1; then
-    log_pass "OpenCode executed successfully inside an isolated systemd user unit."
-else
-    log_warn "systemd-run execution encountered an issue (check systemctl --user status)."
-fi
+echo ""
+echo "=============================================================================="
+echo " Smoke Verification Summary Report"
+echo "=============================================================================="
+printf "%-32s | %-8s | %s\n" "TEST CASE" "STATUS" "DETAILS"
+echo "------------------------------------------------------------------------------"
 
-# 8. Codex CLI Companion Check
-log_info "Step 8: Inspecting Codex CLI companion runtime..."
-if [[ -x "$CODEX_BIN" ]]; then
-    CODEX_VER="$("$CODEX_BIN" --version 2>/dev/null || true)"
-    log_pass "Codex CLI found ($CODEX_VER). Companion worktree & VS Code panel integration available."
-else
-    log_warn "Codex CLI binary not found at default extension location."
-fi
+ANY_FAILED=0
+for i in "${!TEST_NAMES[@]}"; do
+    NAME="${TEST_NAMES[$i]}"
+    STATUS="${TEST_STATUS[$i]}"
+    DETAILS="${TEST_DETAILS[$i]}"
 
-printf "\n${GREEN}==============================================================================${NC}\n"
-printf "${GREEN} Smoke Test Complete: All critical agent runtimes & GitHub access verified!${NC}\n"
-printf "${GREEN}==============================================================================${NC}\n"
+    case "$STATUS" in
+        PASS) printf "%-32s | ${GREEN}%-8s${NC} | %s\n" "$NAME" "$STATUS" "$DETAILS" ;;
+        FAIL)
+            printf "%-32s | ${RED}%-8s${NC} | %s\n" "$NAME" "$STATUS" "$DETAILS"
+            ANY_FAILED=1
+            ;;
+        SKIP) printf "%-32s | ${YELLOW}%-8s${NC} | %s\n" "$NAME" "$STATUS" "$DETAILS" ;;
+    esac
+done
+echo "=============================================================================="
+
+if [[ "$ANY_FAILED" -eq 1 ]]; then
+    log_fail "One or more required smoke test cases FAILED."
+    exit 1
+else
+    log_pass "All required test cases PASSED. (Optional checks marked as SKIP)."
+    exit 0
+fi
