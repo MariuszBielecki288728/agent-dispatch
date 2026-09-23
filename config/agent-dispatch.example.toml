@@ -1,0 +1,187 @@
+# ==============================================================================
+# agent-dispatch — example configuration
+#
+# Copy to a local, non-committed path and edit:
+#   cp config/agent-dispatch.example.toml ~/.config/agent-dispatch/config.toml
+#
+# SECURITY — READ FIRST
+#   * This file contains NO tokens and must never contain any.
+#     GitHub credentials live inside the configured wrapper (which validates
+#     ownership/mode 0600 and injects GH_TOKEN only into its own child process).
+#     Model-provider credentials live in the runtime's own auth store.
+#   * Never run `gh auth login`, never export GH_TOKEN, and on this VM never
+#     substitute raw `gh` for the approved wrapper.
+#   * A Git worktree is Git isolation only — NOT a filesystem, process, network,
+#     or credential boundary. See docs/architecture.md §10.
+#
+# Validation is fail-fast: an unknown repository, an unsupported driver, or an
+# unsupported model/effort combination is a startup error. The worker never
+# silently falls back to a different paid model.
+# ==============================================================================
+
+[worker]
+# Poll interval for issue/PR discovery.
+poll_interval_seconds = 120
+
+# MVP default is one active task total. Keeps at most one writer per worktree
+# and makes model cost predictable.
+max_concurrent_tasks = 1
+
+# Hard wall-clock cap for a single agent run.
+run_timeout_seconds = 3600
+
+# Bounded retries per task before the task is marked failed.
+max_attempts = 3
+
+# Where orchestrator-owned worktrees are created. The user's normal checkout
+# is never touched.
+worktree_root = "~/agent-dispatch/worktrees"
+
+# SQLite state database. MUST live outside target repositories.
+state_db = "~/.local/state/agent-dispatch/state.db"
+
+# Raw NDJSON run logs. MUST live outside every target repository and worktree:
+# a log written inside a worktree can be swept into a commit by `git add -A`
+# and would polute the PR with a raw agent transcript.
+run_log_dir = "~/.local/state/agent-dispatch/runs"
+
+# Bounded retention for run logs (count-based pruning).
+run_log_keep = 50
+
+# Single-process lock; prevents accidentally running two workers.
+lock_file = "~/.local/state/agent-dispatch/worker.lock"
+
+# Path to the runtime binary; resolved via PATH when omitted.
+# commandcode_path = "commandcode"
+
+
+[github]
+# The ONLY sanctioned GitHub access path on this development VM.
+# Deliberately configurable: the historical wrapper name is a local policy
+# detail and must not be hardcoded into the reusable package.
+command = "/home/craftlypse/.local/bin/gh-craftlypse"
+
+# EXPLICIT credential helper for Git HTTPS inside managed worktrees.
+#
+# WHY THE ORDER MATTERS: `credential.helper` is MULTI-VALUED and a bare
+# `-c ...helper=!<cmd>` APPENDS to the inherited list instead of replacing it.
+# An earlier ambient helper is therefore queried FIRST and stops the chain as
+# soon as it returns credentials. Verified on this VM with instrumented
+# helpers; the empty value below is a LIST RESET, not a no-op.
+#
+# On this VM the inherited order for github.com is:
+#   1. /usr/bin/gh auth git-credential   (unapproved, from ~/.gitconfig)
+#   2. gh-craftlypse auth git-credential (approved, from .git/config)
+# Today the raw helper returns no credentials so the chain happens to fall
+# through to the wrapper. That is incidental, NOT guaranteed. Always reset.
+#
+# Correct form (reset, THEN set):
+#   git -c credential.https://github.com.helper= \
+#       -c credential.https://github.com.helper="!<wrapper> auth git-credential" <cmd>
+#
+# COVERAGE LIMITS:
+#   * A per-invocation -c applies only to that one process; it is NOT inherited
+#     by Git processes the agent spawns itself.
+#   * The orchestrator therefore also writes this reset-then-wrapper sequence
+#     into the worktree's REPO-LOCAL Git config at provisioning time. A worktree
+#     shares --git-common-dir with its source clone, so repo-local config is
+#     shared and covers agent-issued Git automatically (verified on this VM).
+#   * GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n are inherited by
+#     child processes (verified) if a subtree must be pinned without config edits.
+#
+# This is an operational guardrail on a personal VM, not hard isolation: an
+# unrestricted agent could reconfigure Git.
+credential_helper_reset = ""
+credential_helper = "!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential"
+
+# Fail fast (before any API call) if a configured repository is absent from
+# the credential's permitted set, instead of retrying hopefully.
+fail_fast_on_denied_repo = true
+
+[github.labels]
+# Label on an Issue that expresses dispatch intent.
+trigger = "take-it"
+
+# Label on a PR that initiates ONE consolidated follow-up review round.
+# NOTE: review comments alone never start an agent — this explicit handoff does.
+review_handoff = "agent:fix"
+
+
+# ==============================================================================
+# Repositories
+#
+# Every repository the worker may touch MUST be listed here. Anything not
+# listed is refused with a clear error. `take-it` Issues in unlisted repos are
+# never discovered, and no unrelated repository is ever modified.
+# ==============================================================================
+
+[repos."MariuszBielecki288728/agent-dispatch"]
+# Absolute path to the local clone. A throwaway/worktree source, not the
+# maintainer's working copy.
+path = "/home/craftlypse/code/agent-dispatch"
+
+# Base branch for task branches.
+base_branch = "main"
+
+# Per-repo instruction file the agent should read (repo-relative).
+agents_file = "AGENTS.md"
+
+[repos."MariuszBielecki288728/agent-dispatch".runtime]
+# Runtime adapter to use. Only `commandcode` is implemented in the MVP.
+# Adding another runtime means adding one small adapter module — not rewriting
+# queue/worktree/review logic.
+driver = "commandcode"
+
+# Pinned model. Changing this affects NEW tasks only; existing tasks keep the
+# runtime/model/session recorded at start and are never silently migrated.
+# Verified available on this VM (v1.64.0: 80 models listed).
+model = "deepseek/deepseek-v4-flash"
+
+# Reasoning effort (low | medium | high — model dependent).
+effort = "medium"
+
+# ------------------------------------------------------------------------------
+# Permission mode — read this before changing.
+#
+# The MVP uses Command Code's broad allow-all flag so the agent can actually
+# write files and run shell commands unattended in headless print mode.
+#
+# On this trusted personal VM the maintainer has explicitly accepted that
+# broad permission grant. This is a deliberate TRUST CHOICE, not isolation:
+# it is NOT a sandbox, and it does NOT prevent access to files outside the
+# worktree or to the same user's credentials.
+#
+# OBSERVED ON VM (v1.64.0, 2026-09-24) — do not assume the alternatives work:
+#   --yolo                       -> writes ALLOWED   (verified)
+#   --permission-mode yolo       -> writes BLOCKED   (verified)
+#   --tools-all                  -> writes BLOCKED   (verified)
+#   --session <id> without --yolo-> writes BLOCKED   (verified)
+#
+# Permission grants do NOT persist inside a resumed session, so the flag is
+# re-passed on EVERY invocation, including every resume round.
+# ------------------------------------------------------------------------------
+permission_mode = "allow-all"
+
+# The literal flag string this driver appends. Recorded explicitly so the
+# effective permission grant is auditable in config rather than implied.
+permission_flag = "--yolo"
+
+# Turn cap per invocation. A cap hit exits with code 8 and is treated as a
+# bounded failure, not success.
+max_turns = 40
+
+
+# ------------------------------------------------------------------------------
+# Second repository (illustrative — remove or replace)
+# ------------------------------------------------------------------------------
+# [repos."MariuszBielecki288728/disposable-test-repo"]
+# path = "/home/craftlypse/code/disposable-test-repo"
+# base_branch = "main"
+#
+# [repos."MariuszBielecki288728/disposable-test-repo".runtime]
+# driver = "commandcode"
+# model = "deepseek/deepseek-v4-flash"
+# effort = "low"
+# permission_mode = "allow-all"
+# permission_flag = "--yolo"
+# max_turns = 40

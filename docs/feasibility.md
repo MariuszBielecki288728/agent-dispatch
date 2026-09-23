@@ -103,7 +103,7 @@ The authenticated identity is `MariuszBielecki288728` (User ID `22575146`), usin
 | **Structured Output** | NDJSON events (`--output-format json`) | JSONL stream (`--format json`) | JSONL stream (`--json`) | Internal IPC protocol | N/A |
 | **Worktree Support** | **Native** (`-w, --worktree [name]`) | Targetable via `--dir <path>` | **Native** (`--worktree`) | Manual / Editor folder | N/A |
 | **Headless / Unattended** | **Passed** (`-p` runs in `systemd --user`) | **Passed** (Runs in `systemd --user`) | **Passed** (`codex exec` non-interactive) | **Blocked** (Requires UI) | N/A |
-| **Mutating Tools in Headless Mode** | Blocked by tool hook without `--yolo` (YOLO not tested) | Configurable via `--auto` | Configurable via approval policy | N/A | N/A |
+| **Mutating Tools in Headless Mode** | Blocked by tool hook without `--yolo` (⚠️ *superseded by Issue #2 probes: `--yolo` unlocks writes; see [`docs/architecture.md` §2](./architecture.md)) | Configurable via `--auto` | Configurable via approval policy | N/A | N/A |
 | **VS Code GUI Observability** | **Unsupported by design** (IDE socket is context-only) | Indirect (extension reads `opencode.db` usage) | **Direct** (Shared with `openai.chatgpt` panel) | Native Editor Chat Panel | N/A |
 | **Active Subscription Status** | **Active & Verified** (`MariuszBielecki288728`) | OpenCode Go returned 403 (inactive) | ChatGPT OAuth returned 429 (quota hit) | Requires Copilot subscription | N/A |
 
@@ -124,6 +124,7 @@ In non-interactive print mode (`-p`), Command Code enforces an explicit security
 - Tool calls that mutate the filesystem (`write_file`, `edit_file`) or execute shell commands (`shell_command`) are blocked by the tool hook (`"Tool requires permissions"`).
 - Command Code requires `--yolo` / `--dangerously-skip-permissions` to authorize headless tool execution. Because Issue #1 explicitly prohibits broad YOLO permission grants during this spike, mutating tool execution was blocked by design in default print mode, and `--yolo` execution was intentionally not tested.
 - **Mandatory Decision Gate for Issue #2:** Production unattended code editing and file mutation are **not demonstrated** under bounded permissions in this spike. This is a real architectural requirement for unattended coding that must be resolved at the start of Issue #2: the project must evaluate and decide on an explicit, bounded approval mechanism (e.g., configuring guarded `--dangerously-skip-permissions` / `--yolo` strictly within ephemeral isolated Git worktrees or containerized sandboxes, or defining fine-grained tool allowlists) before autonomous coding tasks can run.
+- **✅ Resolved in Issue #2:** the maintainer approved the broad allow-all flag as an accepted trust choice on this personal VM, and bounded on-VM probes confirmed `--yolo` is the **only** working unlock — `--permission-mode yolo` and `--tools-all` were both observed **BLOCKED**, and the grant does not persist across `--session` resume. Blocked runs still report `subtype: "success"` with exit code 0, so the orchestrator must detect `tool_hook_blocked` events. See [`docs/architecture.md` §2](./architecture.md#2-verified-ground-truth-observed-on-this-vm) for the evidence and the resulting decisions.
 
 ### VS Code Observability Clarification
 Command Code maintains active Unix domain sockets in `~/.commandcode/ide/` (`code-*.sock`) connected to the active VS Code extension host (PID 7432).
@@ -202,7 +203,8 @@ Command Code maintains active Unix domain sockets in `~/.commandcode/ide/` (`cod
    - Store runtime identity and exact session IDs per task in task state, ensuring auditability and reliable follow-up resumption.
 5. **Mandatory Issue #2 Decision: Headless Tool-Permission & Mutation Strategy:**
    - Command Code in headless print mode (`-p`) blocks tool mutations (`write_file`, `edit_file`, `shell_command`) by default.
-   - Production unattended code editing is **not yet demonstrated** under bounded permissions.
-   - Issue #2 must explicitly evaluate and decide how mutations are authorized (e.g. passing guarded `--dangerously-skip-permissions` / `--yolo` strictly within ephemeral isolated Git worktrees/containers, or configuring granular tool allowlists).
+   - Production unattended code editing was **not** demonstrated under bounded permissions during this spike; it is now **resolved in Issue #2** by the maintainer-approved broad allow-all flag.
+   - Evidence from bounded Issue #2 probes: `--yolo` unlocks mutation, while `--permission-mode yolo` and `--tools-all` remain blocked, and the grant does not persist across `--session` resume.
+   - Decision: use `--yolo` as the explicit, configured permission mode on this trusted personal VM (a trust choice, not a sandbox), re-passed on every invocation. See [`docs/architecture.md` §2](./architecture.md) and [`config/agent-dispatch.example.toml`](../config/agent-dispatch.example.toml).
 6. **Handoff Caveat: VS Code Session UI vs Terminal:**
    - Retain the confirmed boundary: the IDE socket (`~/.commandcode/ide/code-*.sock`) provides editor context sharing only, not native session UI handoff in the VS Code Chat GUI. Operators interact with active sessions via the task worktree in the VS Code integrated terminal.
