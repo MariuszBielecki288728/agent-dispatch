@@ -1,0 +1,25 @@
+# System & Environment
+.env
+*.local
+*.log
+
+# Caches & Temporary Artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# Agent & Worktree runtime data
+.worktrees/
+.commandcode/
+tmp/
+scratch/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*~
+
