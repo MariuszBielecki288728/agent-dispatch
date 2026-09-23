@@ -7,6 +7,7 @@
 # - Opt-in live VM provider verification (--live / SMOKE_LIVE=1).
 # - Strict assertions: structural JSON parsing, turn continuity, bounded timeouts.
 # - Sanitized reporting: no credentials, tokens, or raw unfiltered outputs dumped.
+# - Safe parsing: zero code interpolation of untrusted model outputs into Python.
 # ==============================================================================
 
 set -euo pipefail
@@ -74,19 +75,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Python helper to extract fields safely from NDJSON streams
-parse_ndjson_result() {
-    local file="$1"
-    python3 -c "
-import sys, json
+# ==============================================================================
+# Shared Turn Validator & Data Parser
+#
+# Crucial Security Design:
+# Untrusted model outputs and filenames are NEVER interpolated into executable
+# Python code strings. Arguments are passed strictly as positional argv elements,
+# and JSON fields are extracted purely by decoding data streams from stdin.
+# ==============================================================================
+
+validate_turn() {
+    local log_file="$1"
+    local exit_code="$2"
+    local expected_session_id="${3:-}"
+    local expected_token="${4:-}"
+
+    python3 - "$log_file" "$exit_code" "$expected_session_id" "$expected_token" << 'PYEOF'
+import sys, json, os
+
+log_file = sys.argv[1]
+try:
+    exit_code = int(sys.argv[2])
+except ValueError:
+    exit_code = 1
+
+expected_session_id = sys.argv[3] if len(sys.argv) > 3 else ""
+expected_token = sys.argv[4] if len(sys.argv) > 4 else ""
+
+if exit_code != 0:
+    print(json.dumps({
+        "valid": False,
+        "reason": f"Process exited with non-zero code {exit_code}",
+        "sessionId": None
+    }))
+    sys.exit(0)
+
+if not os.path.exists(log_file):
+    print(json.dumps({
+        "valid": False,
+        "reason": "Log file does not exist",
+        "sessionId": None
+    }))
+    sys.exit(0)
 
 session_id = None
 final_text = None
 subtype = None
-error_msg = None
+has_result = False
 
 try:
-    with open('$file') as f:
+    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -95,70 +133,127 @@ try:
                 data = json.loads(line)
             except Exception:
                 continue
-            
+            if not isinstance(data, dict):
+                continue
+
             # Check run_start event
-            if data.get('type') == 'event' and data.get('event', {}).get('type') == 'run_start':
-                session_id = data['event'].get('sessionId')
-            
+            if data.get("type") == "event":
+                evt = data.get("event")
+                if isinstance(evt, dict) and evt.get("type") == "run_start":
+                    sid = evt.get("sessionId")
+                    if sid:
+                        session_id = str(sid).strip()
+
             # Check result line
-            if data.get('type') == 'result':
-                subtype = data.get('subtype')
-                session_id = data.get('sessionId') or session_id
-                final_text = data.get('finalText', '')
-                if subtype != 'success':
-                    error_msg = data.get('error', {}).get('message') or final_text
+            elif data.get("type") == "result":
+                has_result = True
+                subtype = data.get("subtype")
+                sid = data.get("sessionId")
+                if sid:
+                    session_id = str(sid).strip()
+                ft = data.get("finalText")
+                final_text = str(ft) if ft is not None else ""
 except Exception as e:
-    print(json.dumps({'status': 'parse_error', 'error': str(e)}))
+    print(json.dumps({
+        "valid": False,
+        "reason": f"Failed to read log stream: {type(e).__name__}",
+        "sessionId": None
+    }))
+    sys.exit(0)
+
+if not has_result:
+    print(json.dumps({
+        "valid": False,
+        "reason": "Missing completed result event in NDJSON stream",
+        "sessionId": None
+    }))
+    sys.exit(0)
+
+if subtype != "success":
+    print(json.dumps({
+        "valid": False,
+        "reason": f"Result subtype is '{subtype}' (expected 'success')",
+        "sessionId": session_id
+    }))
+    sys.exit(0)
+
+if not session_id:
+    print(json.dumps({
+        "valid": False,
+        "reason": "Missing or empty sessionId in NDJSON stream",
+        "sessionId": None
+    }))
+    sys.exit(0)
+
+if expected_session_id and session_id != expected_session_id:
+    print(json.dumps({
+        "valid": False,
+        "reason": "Session ID mismatch between turns",
+        "sessionId": session_id
+    }))
+    sys.exit(0)
+
+if expected_token and expected_token not in (final_text or ""):
+    print(json.dumps({
+        "valid": False,
+        "reason": "Response token mismatch",
+        "sessionId": session_id
+    }))
     sys.exit(0)
 
 print(json.dumps({
-    'sessionId': session_id,
-    'finalText': final_text,
-    'subtype': subtype,
-    'errorMessage': error_msg
+    "valid": True,
+    "reason": "Turn validation succeeded",
+    "sessionId": session_id
 }))
-"
+PYEOF
+}
+
+parse_validation_field() {
+    local field="$1"
+    python3 -c 'import sys, json; data = json.load(sys.stdin); val = data.get(sys.argv[1]); print(val if val is not None else "")' "$field"
 }
 
 # ==============================================================================
 # 1. Deterministic Negative Tests (Failure Injection)
+#
+# All negative tests run through the exact production validator (validate_turn)
+# ensuring acceptance logic cannot regress.
 # ==============================================================================
 run_negative_tests() {
-    log_info "Running deterministic negative test cases..."
+    log_info "Running deterministic negative test cases through shared validator..."
 
-    # Negative Test A: CLI exits with non-zero status
+    # Negative Test A: Non-zero process exit
     log_info "Negative Test A: Verifying detection of non-zero CLI exit..."
-    local fake_cli_exit="$SCRATCH_DIR/fake_exit_fail.sh"
-    cat << 'EOF' > "$fake_cli_exit"
-#!/usr/bin/env bash
-echo '{"type":"event","event":{"type":"run_start","sessionId":"fake-id"}}'
-echo 'Process crashed unexpectedly' >&2
-exit 1
-EOF
-    chmod +x "$fake_cli_exit"
+    local val_exit
+    val_exit="$(validate_turn "/dev/null" 1 "" "")"
+    local val_exit_valid val_exit_reason
+    val_exit_valid="$(printf '%s' "$val_exit" | parse_validation_field "valid")"
+    val_exit_reason="$(printf '%s' "$val_exit" | parse_validation_field "reason")"
 
-    local exit_out="$SCRATCH_DIR/neg_exit.out"
-    if "$fake_cli_exit" > "$exit_out" 2>&1; then
-        record_result "negative_exit_failure" "FAIL" "Failed to catch non-zero CLI exit code"
-    else
+    if [[ "$val_exit_valid" == "False" && "$val_exit_reason" == *"non-zero code"* ]]; then
         record_result "negative_exit_failure" "PASS" "Correctly caught non-zero CLI exit code"
+    else
+        record_result "negative_exit_failure" "FAIL" "Failed to detect non-zero exit code"
     fi
 
-    # Negative Test B: Missing sessionId in output
+    # Negative Test B: Missing sessionId in stream
     log_info "Negative Test B: Verifying detection of missing session ID..."
     local fake_no_id="$SCRATCH_DIR/fake_no_id.jsonl"
     cat << 'EOF' > "$fake_no_id"
 {"type":"event","event":{"type":"turn_start"}}
 {"type":"result","subtype":"success","finalText":"OK"}
 EOF
-    local parsed_no_id
-    parsed_no_id="$(parse_ndjson_result "$fake_no_id")"
-    local sid
-    sid="$(python3 -c "import json; print(json.loads('''$parsed_no_id''').get('sessionId') or '')")"
-    if [[ -z "$sid" ]]; then
+    local val_no_id
+    val_no_id="$(validate_turn "$fake_no_id" 0 "" "")"
+    local no_id_valid no_id_reason
+    no_id_valid="$(printf '%s' "$val_no_id" | parse_validation_field "valid")"
+    no_id_reason="$(printf '%s' "$val_no_id" | parse_validation_field "reason")"
+
+    if [[ "$no_id_valid" == "False" && "$no_id_reason" == *"Missing or empty sessionId"* ]]; then
         record_result "negative_missing_session_id" "PASS" "Correctly caught missing session ID"
     else
-        record_result "negative_missing_session_id" "FAIL" "Failed to detect missing session ID"
+        record_result "negative_missing_session_id" "FAIL" "Failed to catch missing session ID"
     fi
 
     # Negative Test C: Error subtype in result
@@ -166,33 +261,111 @@ EOF
     local fake_err="$SCRATCH_DIR/fake_err.jsonl"
     cat << 'EOF' > "$fake_err"
 {"type":"event","event":{"type":"run_start","sessionId":"fake-err-id"}}
-{"type":"result","subtype":"error","finalText":"Rate limit exceeded","error":{"message":"Quota hit"}}
+{"type":"result","subtype":"error","sessionId":"fake-err-id","finalText":"Rate limit exceeded","error":{"message":"Quota hit"}}
 EOF
-    local parsed_err
-    parsed_err="$(parse_ndjson_result "$fake_err")"
-    local subtype
-    subtype="$(python3 -c "import json; print(json.loads('''$parsed_err''').get('subtype') or '')")"
-    if [[ "$subtype" != "success" ]]; then
+    local val_err
+    val_err="$(validate_turn "$fake_err" 0 "" "")"
+    local err_valid err_reason
+    err_valid="$(printf '%s' "$val_err" | parse_validation_field "valid")"
+    err_reason="$(printf '%s' "$val_err" | parse_validation_field "reason")"
+
+    if [[ "$err_valid" == "False" && "$err_reason" == *"Result subtype is 'error'"* ]]; then
         record_result "negative_error_subtype" "PASS" "Correctly caught error result subtype"
     else
-        record_result "negative_error_subtype" "FAIL" "Failed to catch error subtype"
+        record_result "negative_error_subtype" "FAIL" "Failed to catch error result subtype"
     fi
 
-    # Negative Test D: Resume context mismatch
-    log_info "Negative Test D: Verifying detection of session context mismatch..."
-    local fake_resume="$SCRATCH_DIR/fake_resume.jsonl"
-    cat << 'EOF' > "$fake_resume"
-{"type":"event","event":{"type":"run_start","sessionId":"fake-id"}}
-{"type":"result","subtype":"success","finalText":"WRONG_ANSWER"}
+    # Negative Test D: Session ID mismatch on resume
+    log_info "Negative Test D: Verifying detection of session ID mismatch on resume..."
+    local fake_id_mismatch="$SCRATCH_DIR/fake_id_mismatch.jsonl"
+    cat << 'EOF' > "$fake_id_mismatch"
+{"type":"event","event":{"type":"run_start","sessionId":"session-new-different"}}
+{"type":"result","subtype":"success","sessionId":"session-new-different","finalText":"MOCK_SMOKE_OK"}
 EOF
-    local parsed_resume
-    parsed_resume="$(parse_ndjson_result "$fake_resume")"
-    local text
-    text="$(python3 -c "import json; print(json.loads('''$parsed_resume''').get('finalText') or '')")"
-    if [[ "$text" != "EXPECTED_TOKEN" ]]; then
-        record_result "negative_resume_mismatch" "PASS" "Correctly caught context mismatch on resume"
+    local val_id_mis
+    val_id_mis="$(validate_turn "$fake_id_mismatch" 0 "session-expected-original" "MOCK_SMOKE_OK")"
+    local id_mis_valid id_mis_reason
+    id_mis_valid="$(printf '%s' "$val_id_mis" | parse_validation_field "valid")"
+    id_mis_reason="$(printf '%s' "$val_id_mis" | parse_validation_field "reason")"
+
+    if [[ "$id_mis_valid" == "False" && "$id_mis_reason" == *"Session ID mismatch"* ]]; then
+        record_result "negative_resume_id_mismatch" "PASS" "Correctly caught session ID mismatch on resume"
     else
-        record_result "negative_resume_mismatch" "FAIL" "Failed to catch context mismatch"
+        record_result "negative_resume_id_mismatch" "FAIL" "Failed to catch session ID mismatch"
+    fi
+
+    # Negative Test E: Token mismatch on resume
+    log_info "Negative Test E: Verifying detection of response token mismatch..."
+    local fake_token_mis="$SCRATCH_DIR/fake_token_mis.jsonl"
+    cat << 'EOF' > "$fake_token_mis"
+{"type":"event","event":{"type":"run_start","sessionId":"matching-session-id"}}
+{"type":"result","subtype":"success","sessionId":"matching-session-id","finalText":"UNEXPECTED_ANSWER"}
+EOF
+    local val_tok_mis
+    val_tok_mis="$(validate_turn "$fake_token_mis" 0 "matching-session-id" "EXPECTED_TOKEN")"
+    local tok_mis_valid tok_mis_reason
+    tok_mis_valid="$(printf '%s' "$val_tok_mis" | parse_validation_field "valid")"
+    tok_mis_reason="$(printf '%s' "$val_tok_mis" | parse_validation_field "reason")"
+
+    if [[ "$tok_mis_valid" == "False" && "$tok_mis_reason" == *"Response token mismatch"* ]]; then
+        record_result "negative_token_mismatch" "PASS" "Correctly caught response token mismatch"
+    else
+        record_result "negative_token_mismatch" "FAIL" "Failed to catch response token mismatch"
+    fi
+
+    # Negative Test F: Truncated / malformed stream without result event
+    log_info "Negative Test F: Verifying detection of truncated stream..."
+    local fake_trunc="$SCRATCH_DIR/fake_trunc.jsonl"
+    cat << 'EOF' > "$fake_trunc"
+{"type":"event","event":{"type":"run_start","sessionId":"trunc-id"}}
+{"type":"event","event":{"type":"turn_start","turnNumber":1}}
+{"type":"event","event":{"type":"text_delta","text":"Process killed prematurely...
+EOF
+    local val_trunc
+    val_trunc="$(validate_turn "$fake_trunc" 0 "" "")"
+    local trunc_valid trunc_reason
+    trunc_valid="$(printf '%s' "$val_trunc" | parse_validation_field "valid")"
+    trunc_reason="$(printf '%s' "$val_trunc" | parse_validation_field "reason")"
+
+    if [[ "$trunc_valid" == "False" && "$trunc_reason" == *"Missing completed result event"* ]]; then
+        record_result "negative_truncated_incomplete" "PASS" "Correctly caught truncated stream"
+    else
+        record_result "negative_truncated_incomplete" "FAIL" "Failed to catch truncated stream"
+    fi
+
+    # Negative Test G: Hostile injection payload (quotes, backslashes, ''', code injection attempt)
+    log_info "Negative Test G: Verifying safe parsing of hostile payload without code execution..."
+    local canary_file="$SCRATCH_DIR/canary_pwned.txt"
+    rm -f "$canary_file"
+    local fake_hostile="$SCRATCH_DIR/fake_hostile.jsonl"
+
+    python3 - "$fake_hostile" "$canary_file" << 'PYEOF'
+import sys, json
+fake_file = sys.argv[1]
+canary = sys.argv[2]
+with open(fake_file, "w", encoding="utf-8") as f:
+    f.write(json.dumps({"type": "event", "event": {"type": "run_start", "sessionId": "hostile-sess-123"}}) + "\n")
+    f.write(json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "sessionId": "hostile-sess-123",
+        "finalText": f"Hostile: ''' + __import__('os').system('touch {canary}') + ''' \\ \" ' ; SAFE_CANARY_TOKEN"
+    }) + "\n")
+PYEOF
+
+    local val_hostile
+    val_hostile="$(validate_turn "$fake_hostile" 0 "hostile-sess-123" "SAFE_CANARY_TOKEN")"
+    local host_valid host_reason
+    host_valid="$(printf '%s' "$val_hostile" | parse_validation_field "valid")"
+    host_reason="$(printf '%s' "$val_hostile" | parse_validation_field "reason")"
+
+    if [[ -f "$canary_file" ]]; then
+        record_result "negative_hostile_injection" "FAIL" "VULNERABILITY: Code injection executed during parsing!"
+        rm -f "$canary_file"
+    elif [[ "$host_valid" == "True" ]]; then
+        record_result "negative_hostile_injection" "PASS" "Safely parsed hostile quotes/literals without code execution"
+    else
+        record_result "negative_hostile_injection" "FAIL" "Validator failed safe hostile parse: $host_reason"
     fi
 }
 
@@ -200,7 +373,7 @@ EOF
 # 2. Mock Test Suite (Default / CI)
 # ==============================================================================
 run_mock_suite() {
-    log_info "Running mock verification suite..."
+    log_info "Running mock verification suite through shared validator..."
 
     # Mock Task: Fresh session
     local mock_fresh="$SCRATCH_DIR/mock_fresh.jsonl"
@@ -209,17 +382,16 @@ run_mock_suite() {
 {"type":"event","event":{"type":"turn_start","turnNumber":1}}
 {"type":"result","subtype":"success","sessionId":"mock-session-1234","finalText":"MOCK_SMOKE_OK"}
 EOF
-    local parsed_fresh
-    parsed_fresh="$(parse_ndjson_result "$mock_fresh")"
-    local sid subtype text
-    sid="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('sessionId') or '')")"
-    subtype="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('subtype') or '')")"
-    text="$(python3 -c "import json; print(json.loads('''$parsed_fresh''').get('finalText') or '')")"
+    local val_mock_fresh
+    val_mock_fresh="$(validate_turn "$mock_fresh" 0 "" "MOCK_SMOKE_OK")"
+    local fresh_valid fresh_reason
+    fresh_valid="$(printf '%s' "$val_mock_fresh" | parse_validation_field "valid")"
+    fresh_reason="$(printf '%s' "$val_mock_fresh" | parse_validation_field "reason")"
 
-    if [[ "$sid" == "mock-session-1234" && "$subtype" == "success" && "$text" == "MOCK_SMOKE_OK" ]]; then
+    if [[ "$fresh_valid" == "True" ]]; then
         record_result "mock_fresh_task" "PASS" "Mock fresh task validated structurally"
     else
-        record_result "mock_fresh_task" "FAIL" "Mock fresh task validation failed"
+        record_result "mock_fresh_task" "FAIL" "Mock fresh task validation failed: $fresh_reason"
     fi
 
     # Mock Resume: Same session continuity
@@ -229,16 +401,16 @@ EOF
 {"type":"event","event":{"type":"turn_start","turnNumber":2}}
 {"type":"result","subtype":"success","sessionId":"mock-session-1234","finalText":"MOCK_SMOKE_OK"}
 EOF
-    local parsed_res
-    parsed_res="$(parse_ndjson_result "$mock_resume")"
-    local res_sid res_text
-    res_sid="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('sessionId') or '')")"
-    res_text="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('finalText') or '')")"
+    local val_mock_resume
+    val_mock_resume="$(validate_turn "$mock_resume" 0 "mock-session-1234" "MOCK_SMOKE_OK")"
+    local res_valid res_reason
+    res_valid="$(printf '%s' "$val_mock_resume" | parse_validation_field "valid")"
+    res_reason="$(printf '%s' "$val_mock_resume" | parse_validation_field "reason")"
 
-    if [[ "$res_sid" == "mock-session-1234" && "$res_text" == "MOCK_SMOKE_OK" ]]; then
+    if [[ "$res_valid" == "True" ]]; then
         record_result "mock_session_resume" "PASS" "Mock session resume validated structurally"
     else
-        record_result "mock_session_resume" "FAIL" "Mock session resume validation failed"
+        record_result "mock_session_resume" "FAIL" "Mock session resume validation failed: $res_reason"
     fi
 
     # Optional runners recorded as SKIP in mock mode
@@ -293,56 +465,54 @@ run_live_suite() {
     # 4. Command Code CLI Fresh Task
     local cmdcode_bin="/home/craftlypse/.local/bin/commandcode"
     local live_session_id=""
+    local fresh_passed=0
     log_info "Step 4: Testing Command Code fresh task..."
     if [[ -x "$cmdcode_bin" ]]; then
         local fresh_log="$SCRATCH_DIR/cmdcode_fresh.jsonl"
-        if timeout 30s "$cmdcode_bin" -p "Respond with EXACTLY the word LIVE_SMOKE_OK and nothing else." \
-            --output-format json > "$fresh_log" 2>/dev/null; then
-            
-            local parsed
-            parsed="$(parse_ndjson_result "$fresh_log")"
-            live_session_id="$(python3 -c "import json; print(json.loads('''$parsed''').get('sessionId') or '')")"
-            local text
-            text="$(python3 -c "import json; print(json.loads('''$parsed''').get('finalText') or '')")"
-            local subtype
-            subtype="$(python3 -c "import json; print(json.loads('''$parsed''').get('subtype') or '')")"
+        local fresh_code=0
+        timeout 30s "$cmdcode_bin" -p "Respond with EXACTLY the word LIVE_SMOKE_OK and nothing else." \
+            --output-format json > "$fresh_log" 2>/dev/null || fresh_code=$?
+        
+        local val_fresh
+        val_fresh="$(validate_turn "$fresh_log" "$fresh_code" "" "LIVE_SMOKE_OK")"
+        local fresh_valid fresh_sid fresh_reason
+        fresh_valid="$(printf '%s' "$val_fresh" | parse_validation_field "valid")"
+        fresh_sid="$(printf '%s' "$val_fresh" | parse_validation_field "sessionId")"
+        fresh_reason="$(printf '%s' "$val_fresh" | parse_validation_field "reason")"
 
-            if [[ -n "$live_session_id" && "$subtype" == "success" && "$text" == *"LIVE_SMOKE_OK"* ]]; then
-                record_result "commandcode_fresh_task" "PASS" "Session $live_session_id returned expected output"
-            else
-                record_result "commandcode_fresh_task" "FAIL" "Structural validation failed (subtype: $subtype)"
-            fi
+        if [[ "$fresh_valid" == "True" && -n "$fresh_sid" ]]; then
+            live_session_id="$fresh_sid"
+            fresh_passed=1
+            record_result "commandcode_fresh_task" "PASS" "Session $live_session_id returned expected output"
         else
-            record_result "commandcode_fresh_task" "FAIL" "Command Code execution timed out or exited non-zero"
+            record_result "commandcode_fresh_task" "FAIL" "Turn validation failed: $fresh_reason"
         fi
     else
         record_result "commandcode_fresh_task" "FAIL" "Binary missing at $cmdcode_bin"
     fi
 
-    # 5. Command Code Session Resumption
+    # 5. Command Code Session Resumption (Assert exact session ID equality)
     log_info "Step 5: Testing Command Code session resumption..."
-    if [[ -n "$live_session_id" && -x "$cmdcode_bin" ]]; then
+    if [[ "$fresh_passed" -eq 1 && -n "$live_session_id" && -x "$cmdcode_bin" ]]; then
         local resume_log="$SCRATCH_DIR/cmdcode_resume.jsonl"
-        if timeout 30s "$cmdcode_bin" -p "Repeat the exact token you answered in the first turn." \
-            --session "$live_session_id" --output-format json > "$resume_log" 2>/dev/null; then
-            
-            local parsed_res
-            parsed_res="$(parse_ndjson_result "$resume_log")"
-            local res_text
-            res_text="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('finalText') or '')")"
-            local res_sub
-            res_sub="$(python3 -c "import json; print(json.loads('''$parsed_res''').get('subtype') or '')")"
+        local resume_code=0
+        timeout 30s "$cmdcode_bin" -p "Repeat the exact token you answered in the first turn." \
+            --session "$live_session_id" --output-format json > "$resume_log" 2>/dev/null || resume_code=$?
+        
+        local val_resume
+        val_resume="$(validate_turn "$resume_log" "$resume_code" "$live_session_id" "LIVE_SMOKE_OK")"
+        local res_valid res_sid res_reason
+        res_valid="$(printf '%s' "$val_resume" | parse_validation_field "valid")"
+        res_sid="$(printf '%s' "$val_resume" | parse_validation_field "sessionId")"
+        res_reason="$(printf '%s' "$val_resume" | parse_validation_field "reason")"
 
-            if [[ "$res_sub" == "success" && "$res_text" == *"LIVE_SMOKE_OK"* ]]; then
-                record_result "commandcode_session_resume" "PASS" "Successfully recalled prior turn context"
-            else
-                record_result "commandcode_session_resume" "FAIL" "Failed to recall context (got: '$res_text')"
-            fi
+        if [[ "$res_valid" == "True" && "$res_sid" == "$live_session_id" ]]; then
+            record_result "commandcode_session_resume" "PASS" "Successfully recalled context in session $live_session_id"
         else
-            record_result "commandcode_session_resume" "FAIL" "Resume execution timed out or exited non-zero"
+            record_result "commandcode_session_resume" "FAIL" "Turn validation failed: $res_reason"
         fi
     else
-        record_result "commandcode_session_resume" "SKIP" "Skipped due to failed initial session"
+        record_result "commandcode_session_resume" "FAIL" "Dependency failed: fresh session was not established"
     fi
 
     # 6. Headless systemd execution

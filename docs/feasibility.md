@@ -122,7 +122,8 @@ While VS Code Remote Server runs an Agent Host supervisor process (`code agent h
 In non-interactive print mode (`-p`), Command Code enforces an explicit security boundary:
 - Read-only queries, generation, and reasoning delta streams execute without restrictions.
 - Tool calls that mutate the filesystem (`write_file`, `edit_file`) or execute shell commands (`shell_command`) are blocked by the tool hook (`"Tool requires permissions"`).
-- Command Code requires `--yolo` / `--dangerously-skip-permissions` to authorize headless tool execution. Because Issue #1 explicitly prohibits broad YOLO permission grants during this spike, mutating tool execution was marked blocked by design in default print mode, and `--yolo` execution was not tested.
+- Command Code requires `--yolo` / `--dangerously-skip-permissions` to authorize headless tool execution. Because Issue #1 explicitly prohibits broad YOLO permission grants during this spike, mutating tool execution was blocked by design in default print mode, and `--yolo` execution was intentionally not tested.
+- **Mandatory Decision Gate for Issue #2:** Production unattended code editing and file mutation are **not demonstrated** under bounded permissions in this spike. This is a real architectural requirement for unattended coding that must be resolved at the start of Issue #2: the project must evaluate and decide on an explicit, bounded approval mechanism (e.g., configuring guarded `--dangerously-skip-permissions` / `--yolo` strictly within ephemeral isolated Git worktrees or containerized sandboxes, or defining fine-grained tool allowlists) before autonomous coding tasks can run.
 
 ### VS Code Observability Clarification
 Command Code maintains active Unix domain sockets in `~/.commandcode/ide/` (`code-*.sock`) connected to the active VS Code extension host (PID 7432).
@@ -199,3 +200,9 @@ Command Code maintains active Unix domain sockets in `~/.commandcode/ide/` (`cod
    - Let the `agent-dispatch` orchestrator explicitly manage task branch names, worktree directories, and Git credential helper injection, rather than delegating worktree ownership exclusively to CLI-internal worktree flags.
 4. **Persistent Task Metadata:**
    - Store runtime identity and exact session IDs per task in task state, ensuring auditability and reliable follow-up resumption.
+5. **Mandatory Issue #2 Decision: Headless Tool-Permission & Mutation Strategy:**
+   - Command Code in headless print mode (`-p`) blocks tool mutations (`write_file`, `edit_file`, `shell_command`) by default.
+   - Production unattended code editing is **not yet demonstrated** under bounded permissions.
+   - Issue #2 must explicitly evaluate and decide how mutations are authorized (e.g. passing guarded `--dangerously-skip-permissions` / `--yolo` strictly within ephemeral isolated Git worktrees/containers, or configuring granular tool allowlists).
+6. **Handoff Caveat: VS Code Session UI vs Terminal:**
+   - Retain the confirmed boundary: the IDE socket (`~/.commandcode/ide/code-*.sock`) provides editor context sharing only, not native session UI handoff in the VS Code Chat GUI. Operators interact with active sessions via the task worktree in the VS Code integrated terminal.
