@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-dispatch"
+version = "0.1.0"
+description = "Poll GitHub Issues labelled take-it and maintain a durable dispatch queue (MVP foundation, Issue #3)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+# Deliberately zero runtime dependencies: TOML via stdlib tomllib, SQLite via
+# stdlib sqlite3, locking via stdlib fcntl. The VM has no pip for the system
+# interpreter, so "no dependencies" is also what keeps installation verifiable.
+dependencies = []
+
+[project.scripts]
+agent-dispatch = "agent_dispatch.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The approved schema ships with the package so an installed CLI validates
+# configuration without needing the source checkout. The repository copy in
+# config/ stays the reviewed source of truth; the offline suite asserts the two
+# files are identical.
+agent_dispatch = ["data/*.json"]

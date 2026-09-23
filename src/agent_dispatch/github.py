@@ -1,0 +1,522 @@
+"""GitHub adapter.
+
+The **only** sanctioned GitHub access path on this VM is the configured wrapper
+command (``github.command``; on this VM ``gh-craftlypse``). Hard rules from the
+approved design and Issue #3:
+
+* the wrapper is read from configuration — its historical name is never
+  hardcoded into the package;
+* no ``gh auth login``, no direct authenticated ``gh``, no token export,
+  inspection or printing — this module never touches ``GH_TOKEN`` and never
+  passes a credential in an environment dict of its own;
+* only allowlisted repositories are polled (enforced by :class:`~agent_dispatch.config.Config`);
+* an inaccessible repo, a missing wrapper, an auth failure, a rate limit or a
+  network error is reported **honestly** and must never mark an Issue as
+  completed, and never silently retried as another identity.
+
+Everything is executed through :meth:`GitHubClient._run`, which is the single
+seam the offline test-suite replaces with a fake wrapper executable — so the
+tests exercise the real subprocess, pagination and error-classification code
+rather than a parallel mock implementation.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+#: Hard cap on pagination so a pathological response cannot loop forever.
+MAX_PAGES = 50
+DEFAULT_PER_PAGE = 100
+
+#: `dispatch/issue-<N>-<slug>` is the branch naming convention from §4. Until #4
+#: creates branches, it is also the cheapest deterministic "this PR is mine" signal.
+DISPATCH_BRANCH_RE = re.compile(r"^dispatch/issue-(\d+)(?:-|$)")
+
+_CLOSING_REF_RE = re.compile(
+    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[:\s]*"
+    r"(?:https?://github\.com/(?P<urlrepo>[\w.-]+/[\w.-]+)/issues/(?P<urlnum>\d+)|#(?P<num>\d+))"
+)
+
+_ISSUE_URL_RE = re.compile(r"https?://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<num>\d+)")
+
+
+class ErrorKind:
+    """Coarse failure classes used for honest reporting and retry policy."""
+
+    MISSING_WRAPPER = "missing_wrapper"
+    DENIED_REPO = "denied_repo"
+    AUTH = "auth"
+    RATE_LIMIT = "rate_limit"
+    NETWORK = "network"
+    TIMEOUT = "timeout"
+    MALFORMED = "malformed_response"
+    UNKNOWN = "unknown"
+
+
+class GitHubError(Exception):
+    """A GitHub operation failed. ``kind`` drives reporting; never a silent success."""
+
+    def __init__(self, message: str, *, kind: str = ErrorKind.UNKNOWN, detail: str = "") -> None:
+        self.kind = kind
+        self.detail = detail
+        super().__init__(message)
+
+    @property
+    def retryable(self) -> bool:
+        """Rate limits and transient network faults are retried later; denials are not."""
+        return self.kind in {ErrorKind.RATE_LIMIT, ErrorKind.NETWORK, ErrorKind.TIMEOUT}
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str
+    state: str
+    url: str
+    labels: tuple[str, ...] = ()
+
+    def has_label(self, label: str) -> bool:
+        return label in self.labels
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    state: str
+    merged: bool
+    head_ref: str
+    url: str
+    title: str = ""
+    body: str = ""
+
+    def references_issue(self, repo: str, issue_number: int) -> bool:
+        """Whether this PR appears to implement ``repo#issue_number``.
+
+        Two conservative signals, both requiring a real link rather than a stray
+        ``#N`` in prose:
+
+        1. the deterministic dispatch branch name for that Issue, or
+        2. a closing keyword / the Issue URL in the PR body.
+        """
+        match = DISPATCH_BRANCH_RE.match(self.head_ref or "")
+        if match and int(match.group(1)) == issue_number:
+            return True
+
+        text = f"{self.title}\n{self.body}"
+        for closing in _CLOSING_REF_RE.finditer(text):
+            if closing.group("urlrepo") and closing.group("urlrepo").lower() == repo.lower():
+                if int(closing.group("urlnum")) == issue_number:
+                    return True
+            elif closing.group("num") and int(closing.group("num")) == issue_number:
+                return True
+
+        for url_match in _ISSUE_URL_RE.finditer(text):
+            if url_match.group("repo").lower() == repo.lower() and int(url_match.group("num")) == issue_number:
+                return True
+        return False
+
+
+@dataclass
+class PreflightReport:
+    """What the wrapper can actually prove right now. Nothing is assumed."""
+
+    wrapper_command: str
+    wrapper_found: bool
+    wrapper_executable: bool
+    identity: str | None = None
+    repo_access: dict[str, str] = field(default_factory=dict)  # slug -> "ok" | "<kind>: <msg>"
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.wrapper_found and not self.errors
+
+
+class GitHubClient:
+    """Invoke the configured wrapper for issues, PRs and labels."""
+
+    def __init__(
+        self,
+        command: str,
+        *,
+        timeout_seconds: float = 60.0,
+        per_page: int = DEFAULT_PER_PAGE,
+        runner: Callable[[Sequence[str], float], "subprocess.CompletedProcess[str]"] | None = None,
+    ) -> None:
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.per_page = per_page
+        self._runner = runner
+        #: Set when the most recent list call stopped at :data:`MAX_PAGES`. A
+        #: truncated PR scan means a pre-existing PR might not have been seen, so
+        #: callers must surface it instead of assuming "no PR exists".
+        self.pr_scan_truncated = False
+        self._last_page_reached_cap = False
+
+    # ------------------------------------------------------------------ core
+
+    def wrapper_path(self) -> Path | None:
+        """Resolve the configured wrapper to a concrete path, if it exists."""
+        expanded = os.path.expandvars(os.path.expanduser(self.command))
+        candidate = Path(expanded)
+        if candidate.is_file():
+            return candidate
+        located = shutil.which(self.command)
+        return Path(located) if located else None
+
+    def check_available(self) -> Path:
+        path = self.wrapper_path()
+        if path is None:
+            raise GitHubError(
+                f"GitHub wrapper command not found: {self.command!r}. "
+                "Set github.command in the config to the approved wrapper "
+                "(this VM: /home/craftlypse/.local/bin/gh-craftlypse).",
+                kind=ErrorKind.MISSING_WRAPPER,
+            )
+        if not os.access(path, os.X_OK):
+            raise GitHubError(
+                f"GitHub wrapper {path} is not executable.",
+                kind=ErrorKind.MISSING_WRAPPER,
+            )
+        return path
+
+    def _execute(self, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+        if self._runner is not None:
+            return self._runner(args, self.timeout_seconds)
+        return subprocess.run(
+            [self.command, *args],
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_seconds,
+            check=False,
+        )
+
+    def _run_json(self, args: Sequence[str]) -> Any:
+        """Run the wrapper and parse a JSON response.
+
+        Only whole JSON documents are requested (never ``--jq`` scalars), so
+        parsing is unambiguous and a malformed response is a hard error rather
+        than something silently coerced.
+
+        Raises :class:`GitHubError` with a classified ``kind`` on any failure.
+        The error message never contains credential material: only the wrapper's
+        own stderr text and the argument list are surfaced.
+        """
+        self.check_available()
+        argv = list(args)
+        try:
+            proc = self._execute(argv)
+        except FileNotFoundError as exc:
+            raise GitHubError(
+                f"GitHub wrapper {self.command!r} could not be executed: {exc}",
+                kind=ErrorKind.MISSING_WRAPPER,
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubError(
+                f"GitHub wrapper timed out after {self.timeout_seconds:.0f}s: {_argv_hint(argv)}",
+                kind=ErrorKind.TIMEOUT,
+            ) from exc
+
+        if proc.returncode != 0:
+            raise _classify_failure(proc.returncode, proc.stderr or "", argv)
+
+        text = (proc.stdout or "").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                f"GitHub wrapper returned unparseable JSON for {_argv_hint(argv)}: {exc}",
+                kind=ErrorKind.MALFORMED,
+                detail=(proc.stdout or "")[:400],
+            ) from exc
+
+    # ------------------------------------------------------------- read ops
+
+    def identity(self) -> str:
+        """The account the configured credential actually acts as."""
+        data = self._run_json(["api", "user"])
+        if isinstance(data, dict) and data.get("login"):
+            return str(data["login"])
+        raise GitHubError(
+            "GitHub wrapper returned no identity from 'api user'",
+            kind=ErrorKind.MALFORMED,
+        )
+
+    def repo_accessible(self, slug: str) -> str:
+        """Return the API's own view of ``slug``; raises if it is not accessible."""
+        data = self._run_json(["api", f"repos/{slug}"])
+        if isinstance(data, dict) and data.get("full_name"):
+            return str(data["full_name"])
+        raise GitHubError(f"GitHub returned no data for repository {slug}", kind=ErrorKind.MALFORMED)
+
+    def list_labels(self, slug: str) -> set[str]:
+        names: set[str] = set()
+        for page in self._paginate(f"repos/{slug}/labels"):
+            if isinstance(page, dict) and "name" in page:
+                names.add(str(page["name"]))
+        return names
+
+    def create_label(self, slug: str, name: str, *, color: str, description: str) -> bool:
+        """Create a label if absent. Idempotent; returns True when it was created.
+
+        Called only from the explicit, maintainer-invoked ``setup-labels``
+        command — never as a side effect of polling.
+        """
+        if name in self.list_labels(slug):
+            return False
+
+        self.check_available()
+        argv = [
+            "api",
+            "-X",
+            "POST",
+            f"repos/{slug}/labels",
+            "-f",
+            f"name={name}",
+            "-f",
+            f"color={color}",
+            "-f",
+            f"description={description}",
+        ]
+        try:
+            proc = self._execute(argv)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise GitHubError(f"failed to create label {name!r} in {slug}: {exc}") from exc
+
+        if proc.returncode == 0:
+            return True
+
+        stderr = proc.stderr or ""
+        # Already exists (e.g. created between our check and the POST) is success.
+        if "already_exists" in stderr or "422" in stderr and "already" in stderr.lower():
+            return False
+        raise _classify_failure(proc.returncode, stderr, argv)
+
+    def list_issues_with_label(self, slug: str, label: str) -> list[Issue]:
+        """Open Issues carrying ``label``.
+
+        Pull requests are filtered out explicitly: GitHub's issues endpoint
+        returns PRs too, which is how a naive implementation schedules a PR as if
+        it were an Issue.
+        """
+        issues: list[Issue] = []
+        for raw in self._paginate(
+            f"repos/{slug}/issues", {"state": "open", "labels": label}
+        ):
+            if not isinstance(raw, dict):
+                continue
+            if "pull_request" in raw:
+                continue  # a PR object, not an Issue
+            issues.append(_to_issue(raw))
+        return issues
+
+    def list_pulls(self, slug: str, state: str = "all") -> list[PullRequest]:
+        """Every PR for ``slug``, and whether the scan hit the page cap.
+
+        ``pr_scan_truncated`` is set to ``True`` when pagination stopped at
+        :data:`MAX_PAGES` with more data pending, so the caller can report an
+        incomplete scan rather than silently treating "not found" as "absent".
+        """
+        self.pr_scan_truncated = False
+        pulls: list[PullRequest] = []
+        for raw in self._paginate(f"repos/{slug}/pulls", {"state": state}):
+            if isinstance(raw, dict) and "number" in raw:
+                pulls.append(_to_pull(raw))
+        if self._last_page_reached_cap:
+            self.pr_scan_truncated = True
+        return pulls
+
+    def open_issue(self, slug: str, issue_number: int) -> Issue:
+        raw = self._run_json(["api", f"repos/{slug}/issues/{issue_number}"])
+        if not isinstance(raw, dict):
+            raise GitHubError(
+                f"GitHub returned no data for {slug}#{issue_number}", kind=ErrorKind.MALFORMED
+            )
+        return _to_issue(raw)
+
+    def _paginate(self, endpoint: str, params: dict[str, str] | None = None) -> list[Any]:
+        """Collect all pages of a list endpoint, page by page.
+
+        ``--paginate`` is not used because it concatenates separate JSON
+        documents per page; an explicit page loop keeps parsing unambiguous and
+        makes the pagination behaviour directly testable offline.
+        """
+        self._last_page_reached_cap = False
+        collected: list[Any] = []
+        page = 1
+        while page <= MAX_PAGES:
+            args = ["api", "-X", "GET", endpoint]
+            for key, value in (params or {}).items():
+                args += ["-f", f"{key}={value}"]
+            args += ["-f", f"per_page={self.per_page}", "-f", f"page={page}"]
+
+            data = self._run_json(args)
+            if data is None:
+                break
+            if isinstance(data, dict):
+                # A single object means the endpoint is not a list.
+                collected.append(data)
+                break
+            if not isinstance(data, list):
+                raise GitHubError(
+                    f"GitHub wrapper returned {type(data).__name__} for {endpoint} (expected a list)",
+                    kind=ErrorKind.MALFORMED,
+                )
+            collected.extend(data)
+            if len(data) < self.per_page:
+                break
+            page += 1
+        else:
+            # The loop ran out of pages, not out of data: the listing is
+            # incomplete. Callers decide how to report that; nothing is guessed.
+            self._last_page_reached_cap = True
+        return collected
+
+    # ------------------------------------------------------------ preflight
+
+    def preflight(self, slugs: Sequence[str], required_labels: Sequence[str]) -> PreflightReport:
+        """Verify only what the wrapper can actually prove.
+
+        Deliberately does **not** claim to validate token scopes: that is not
+        observable through the allowed wrapper, and Issue #3 requires honesty
+        about unverified capabilities.
+        """
+        report = PreflightReport(
+            wrapper_command=self.command,
+            wrapper_found=False,
+            wrapper_executable=False,
+        )
+        path = self.wrapper_path()
+        if path is None:
+            report.errors.append(
+                f"wrapper not found: {self.command!r} (configure github.command to the approved wrapper)"
+            )
+            return report
+
+        report.wrapper_found = True
+        report.wrapper_executable = os.access(path, os.X_OK)
+        if not report.wrapper_executable:
+            report.errors.append(f"wrapper {path} is not executable")
+            return report
+
+        try:
+            report.identity = self.identity()
+        except GitHubError as exc:
+            report.errors.append(f"authentication check failed ({exc.kind}): {exc}")
+
+        for slug in slugs:
+            try:
+                self.repo_accessible(slug)
+                report.repo_access[slug] = "ok"
+            except GitHubError as exc:
+                report.repo_access[slug] = f"{exc.kind}: {exc}"
+                if exc.kind == ErrorKind.DENIED_REPO:
+                    report.errors.append(
+                        f"{slug}: not accessible with the configured credential "
+                        "(add the repository to the credential's permitted set; "
+                        "this service will not try another identity)"
+                    )
+                else:
+                    report.errors.append(f"{slug}: {exc.kind}: {exc}")
+
+            try:
+                labels = self.list_labels(slug)
+            except GitHubError as exc:
+                report.notes.append(f"{slug}: could not read labels ({exc.kind}): {exc}")
+                continue
+            missing = [name for name in required_labels if name not in labels]
+            if missing:
+                report.notes.append(
+                    f"{slug}: missing labels: {', '.join(missing)} "
+                    "— create them explicitly with `agent-dispatch setup-labels --repo "
+                    f"{slug}` (the trigger protocol stays inert until then)"
+                )
+
+        return report
+
+
+def _to_issue(raw: dict[str, Any]) -> Issue:
+    labels = tuple(
+        str(item.get("name"))
+        for item in (raw.get("labels") or [])
+        if isinstance(item, dict) and item.get("name")
+    )
+    return Issue(
+        number=int(raw.get("number", 0)),
+        title=str(raw.get("title") or ""),
+        state=str(raw.get("state") or "unknown"),
+        url=str(raw.get("html_url") or ""),
+        labels=labels,
+    )
+
+
+def _to_pull(raw: dict[str, Any]) -> PullRequest:
+    merged_at = raw.get("merged_at")
+    head = raw.get("head") or {}
+    return PullRequest(
+        number=int(raw.get("number", 0)),
+        state=str(raw.get("state") or "unknown"),
+        merged=bool(merged_at),
+        head_ref=str(head.get("ref") or ""),
+        url=str(raw.get("html_url") or ""),
+        title=str(raw.get("title") or ""),
+        body=str(raw.get("body") or ""),
+    )
+
+
+def _argv_hint(argv: Sequence[str]) -> str:
+    return " ".join(argv[:4]) + (" …" if len(argv) > 4 else "")
+
+
+def _classify_failure(returncode: int, stderr: str, argv: Sequence[str]) -> GitHubError:
+    """Turn a wrapper failure into a classified, honest error.
+
+    Never guesses success, never suggests another identity, and never includes
+    credential material — only the wrapper's own stderr text.
+    """
+    text = (stderr or "").strip()
+    lowered = text.lower()
+    hint = _argv_hint(argv)
+
+    if "rate limit" in lowered or "secondary rate" in lowered:
+        return GitHubError(
+            f"GitHub rate limit hit for {hint}: {text}",
+            kind=ErrorKind.RATE_LIMIT,
+            detail=text,
+        )
+    if "no such host" in lowered or "connection refused" in lowered or "dial tcp" in lowered \
+            or "network is unreachable" in lowered or "tls handshake" in lowered \
+            or "could not resolve host" in lowered:
+        return GitHubError(
+            f"network error contacting GitHub for {hint}: {text}",
+            kind=ErrorKind.NETWORK,
+            detail=text,
+        )
+    if "bad credentials" in lowered or "http 401" in lowered or "authentication" in lowered \
+            or "token" in lowered and "invalid" in lowered:
+        return GitHubError(
+            f"GitHub authentication failed for {hint}: {text}",
+            kind=ErrorKind.AUTH,
+            detail=text,
+        )
+    if "http 404" in lowered or "not found" in lowered or "http 403" in lowered or "forbidden" in lowered:
+        return GitHubError(
+            f"GitHub denied access for {hint}: {text}",
+            kind=ErrorKind.DENIED_REPO,
+            detail=text,
+        )
+    return GitHubError(
+        f"GitHub wrapper failed (exit {returncode}) for {hint}: {text}",
+        kind=ErrorKind.UNKNOWN,
+        detail=text,
+    )

@@ -11,6 +11,11 @@ __pycache__/
 htmlcov/
 .cache/
 
+# Python packaging artefacts
+build/
+dist/
+*.egg-info/
+
 # Agent & Worktree runtime data
 .worktrees/
 .commandcode/
