@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MariuszBielecki288728/agent-dispatch/config/config.schema.json",
+  "title": "agent-dispatch configuration",
+  "description": "Schema for agent-dispatch TOML configuration. Contains no credentials by design: the GitHub wrapper owns its token and the runtime owns model-provider auth.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["worker", "github", "repos"],
+  "properties": {
+    "worker": { "$ref": "#/$defs/worker" },
+    "github": { "$ref": "#/$defs/github" },
+    "repos": { "$ref": "#/$defs/repos" }
+  },
+  "$defs": {
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["poll_interval_seconds", "state_db", "worktree_root"],
+      "properties": {
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "default": 120,
+          "description": "Discovery poll interval. Polling (no webhook server) keeps the VM free of inbound endpoints."
+        },
+        "max_concurrent_tasks": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "MVP default is 1. Keeps at most one writer per worktree and bounds model cost."
+        },
+        "run_timeout_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "default": 3600,
+          "description": "Hard wall-clock cap for a single agent run. A hung run is killed and bounded-retried."
+        },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "Bounded retries before a task is marked failed with a human recovery path."
+        },
+        "worktree_root": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Root for orchestrator-owned worktrees. The user's normal checkout is never modified."
+        },
+        "state_db": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SQLite state database path. MUST live outside target repositories."
+        },
+        "lock_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Single-process lock; prevents two workers running at once."
+        },
+        "commandcode_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to the runtime binary. Resolved via PATH when omitted."
+        }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "credential_helper", "labels"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Approved GitHub wrapper command. Deliberately configurable so the historical wrapper name is not hardcoded into the reusable package."
+        },
+        "credential_helper": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^!",
+          "description": "Explicit Git credential helper, e.g. '!/path/to/wrapper auth git-credential'. REQUIRED because ambient git config may register an unapproved helper for github.com; managed worktrees override it per invocation."
+        },
+        "fail_fast_on_denied_repo": {
+          "type": "boolean",
+          "default": true,
+          "description": "Refuse to proceed when a configured repository is absent from the credential's permitted set, rather than retrying."
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["trigger", "review_handoff"],
+          "properties": {
+            "trigger": {
+              "type": "string",
+              "minLength": 1,
+              "default": "take-it",
+              "description": "Issue label expressing dispatch intent. Stays for the whole active lifetime; it is not a local status mirror."
+            },
+            "review_handoff": {
+              "type": "string",
+              "minLength": 1,
+              "default": "agent:fix",
+              "description": "PR label that initiates exactly ONE consolidated follow-up round on the existing session. Review comments alone never start an agent."
+            }
+          }
+        }
+      }
+    },
+    "repos": {
+      "type": "object",
+      "description": "Allowlist of repositories. Anything not listed here is refused. Keys are 'owner/name'.",
+      "propertyNames": {
+        "pattern": "^[^/\\s]+/[^/\\s]+$"
+      },
+      "additionalProperties": { "$ref": "#/$defs/repo" }
+    },
+    "repo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "base_branch", "runtime"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path to the local clone used as the worktree source."
+        },
+        "base_branch": {
+          "type": "string",
+          "minLength": 1,
+          "default": "main",
+          "description": "Base branch for task branches, fetched fresh before worktree creation."
+        },
+        "agents_file": {
+          "type": "string",
+          "minLength": 1,
+          "default": "AGENTS.md",
+          "description": "Repo-relative instructions file the agent should read before implementing."
+        },
+        "runtime": { "$ref": "#/$defs/runtime" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driver", "model", "permission_mode", "permission_flag"],
+      "properties": {
+        "driver": {
+          "type": "string",
+          "enum": ["commandcode"],
+          "description": "Runtime adapter. Only 'commandcode' is implemented in the MVP (pinned per task; adding a driver means adding one adapter module, not rewriting queue/worktree/review logic)."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Pinned model id, e.g. 'deepseek/deepseek-v4-flash'. Unsupported ids are a startup error; the worker never silently substitutes another paid model. Changing this affects new tasks only."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Reasoning effort (model dependent)."
+        },
+        "permission_mode": {
+          "type": "string",
+          "enum": ["allow-all"],
+          "description": "Broad allow-all grant for unattended headless mutation. A deliberate trust choice on this personal VM, NOT a sandbox."
+        },
+        "permission_flag": {
+          "type": "string",
+          "const": "--yolo",
+          "description": "Literal flag appended by the driver. '--yolo' is the only flag verified on VM v1.64.0 to unlock headless writes; '--permission-mode yolo' and '--tools-all' were both observed BLOCKED, and the grant does not persist across --session resume, so it is re-passed every invocation."
+        },
+        "max_turns": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 40,
+          "description": "Turn cap per invocation. A cap hit exits with code 8 and is treated as a bounded failure, not success."
+        }
+      }
+    }
+  }
+}
