@@ -367,14 +367,6 @@ class Store:
         )
         return created
 
-    def set_phase(self, task_id: int, phase: str, *, note: str | None = None) -> None:
-        if phase not in PHASES:
-            raise ValueError(f"unknown phase {phase!r}")
-        self._conn.execute(
-            "UPDATE tasks SET phase = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE id = ?",
-            (phase, note, utcnow_iso(), task_id),
-        )
-
     def pause(self, repo: str, issue_number: int) -> Task:
         task = self._require(repo, issue_number)
         if task.phase in TERMINAL_PHASES:
@@ -483,12 +475,6 @@ class Store:
         if task is None:
             raise ValueError(f"no task recorded for {repo}#{issue_number}")
         return task
-
-    # -------------------------------------------------------------- test hook
-
-    def table_names(self) -> set[str]:
-        rows = self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        return {str(row["name"]) for row in rows}
 
 
 def _row_to_task(row: Mapping[str, Any]) -> Task:

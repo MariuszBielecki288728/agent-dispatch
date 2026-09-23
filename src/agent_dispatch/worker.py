@@ -161,9 +161,6 @@ class Worker:
 
     # ------------------------------------------------------------- signals
 
-    def request_stop(self) -> None:
-        self._stop = True
-
     def _install_signal_handlers(self) -> None:
         def handler(signum: int, _frame: object) -> None:
             self.log.info("signal_received", signal=signal.Signals(signum).name)
