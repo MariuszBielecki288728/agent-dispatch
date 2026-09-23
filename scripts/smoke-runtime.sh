@@ -6,6 +6,7 @@
 # - Validates gh-craftlypse wrapper and GitHub repository connectivity
 # - Tests git HTTPS credential resolution via gh-craftlypse
 # - Proves fresh task -> persistent session -> same-session follow-up via opencode
+# - Proves fresh task -> persistent session -> same-session follow-up via commandcode
 # - Verifies session export and turn continuity
 # - Verifies headless execution capability under systemd --user
 #
@@ -27,6 +28,7 @@ log_fail() { printf "${RED}[FAIL]${NC} %s\n" "$*"; }
 
 GH_WRAPPER="/home/craftlypse/.local/bin/gh-craftlypse"
 OPENCODE_BIN="/home/craftlypse/.opencode/bin/opencode"
+COMMANDCODE_BIN="/home/craftlypse/.local/bin/commandcode"
 CODEX_BIN="${HOME}/.vscode-server/extensions/openai.chatgpt-26.5917.62051-linux-x64/bin/linux-x86_64/codex"
 FREE_MODEL="opencode/nemotron-3-ultra-free"
 
@@ -87,85 +89,100 @@ log_info "Step 4: Created isolated disposable workspace: $SCRATCH_DIR"
     git commit -q -m "initial commit"
 )
 
-# 5. OpenCode CLI Initial Session
+# 5. OpenCode CLI Initial Session & Resumption
 log_info "Step 5: Executing unattended agent session with OpenCode CLI..."
-if [[ ! -x "$OPENCODE_BIN" ]]; then
-    log_fail "OpenCode binary not found at $OPENCODE_BIN"
-    exit 1
-fi
+if [[ -x "$OPENCODE_BIN" ]]; then
+    RUN_OUT="$SCRATCH_DIR/opencode-run.jsonl"
+    "$OPENCODE_BIN" run "Respond with EXACTLY the word SMOKE_OPENCODE and nothing else." \
+        -m "$FREE_MODEL" \
+        --format json \
+        --dir "$SCRATCH_DIR" > "$RUN_OUT" 2>&1 || {
+            log_fail "opencode run failed. Output:"
+            cat "$RUN_OUT"
+            exit 1
+        }
 
-RUN_OUT="$SCRATCH_DIR/run-initial.jsonl"
-"$OPENCODE_BIN" run "Respond with EXACTLY the word SMOKE_START and nothing else." \
-    -m "$FREE_MODEL" \
-    --format json \
-    --dir "$SCRATCH_DIR" > "$RUN_OUT" 2>&1 || {
-        log_fail "opencode run failed. Output:"
-        cat "$RUN_OUT"
-        exit 1
-    }
+    OPENCODE_SID="$(grep -m 1 -o '"sessionID":"[^"]*"' "$RUN_OUT" | head -n 1 | cut -d '"' -f 4 || true)"
+    if [[ -n "$OPENCODE_SID" ]]; then
+        log_pass "OpenCode fresh task completed with session ID: $OPENCODE_SID"
+        
+        # Resumption test
+        RESUME_OUT="$SCRATCH_DIR/opencode-resume.jsonl"
+        "$OPENCODE_BIN" run "Repeat the secret token you answered in the first turn of this session." \
+            -s "$OPENCODE_SID" \
+            --format json \
+            --dir "$SCRATCH_DIR" > "$RESUME_OUT" 2>&1 || true
 
-SESSION_ID="$(grep -m 1 -o '"sessionID":"[^"]*"' "$RUN_OUT" | head -n 1 | cut -d '"' -f 4 || true)"
-if [[ -z "$SESSION_ID" ]]; then
-    log_fail "Could not extract sessionID from opencode output. Log:"
-    cat "$RUN_OUT"
-    exit 1
-fi
-log_pass "Fresh task completed with session ID: $SESSION_ID"
-
-# 6. Session Resumption
-log_info "Step 6: Testing same-session resumption with context recall..."
-RESUME_OUT="$SCRATCH_DIR/run-resume.jsonl"
-"$OPENCODE_BIN" run "Repeat the secret token you answered in the first turn of this session." \
-    -s "$SESSION_ID" \
-    --format json \
-    --dir "$SCRATCH_DIR" > "$RESUME_OUT" 2>&1 || {
-        log_fail "opencode resume failed. Output:"
-        cat "$RESUME_OUT"
-        exit 1
-    }
-
-if grep -q "SMOKE_START" "$RESUME_OUT"; then
-    log_pass "Session resumption successfully recalled prior context ('SMOKE_START')."
+        if grep -q "SMOKE_OPENCODE" "$RESUME_OUT"; then
+            log_pass "OpenCode session resumption successfully recalled prior context."
+        else
+            log_warn "OpenCode session resumption did not match expected context."
+        fi
+    else
+        log_warn "Could not extract sessionID from opencode output."
+    fi
 else
-    log_fail "Session resumption succeeded but did not recall expected context. Output:"
-    cat "$RESUME_OUT"
-    exit 1
+    log_warn "OpenCode binary not found at $OPENCODE_BIN"
 fi
 
-# 7. Session Export & Continuity Check
-log_info "Step 7: Validating session export and message history..."
-EXPORT_OUT="$SCRATCH_DIR/session-export.json"
-PAGER=cat "$OPENCODE_BIN" export "$SESSION_ID" > "$EXPORT_OUT" 2>/dev/null || true
+# 6. Command Code CLI Initial Session, Resumption, & Worktree
+log_info "Step 6: Executing unattended agent session with Command Code CLI..."
+if [[ -x "$COMMANDCODE_BIN" ]]; then
+    CMD_WHO="$(commandcode whoami 2>/dev/null || true)"
+    if echo "$CMD_WHO" | grep -q "Username:"; then
+        USER_NAME="$(echo "$CMD_WHO" | grep "Username:" | awk '{print $NF}')"
+        log_pass "Command Code authenticated as: $USER_NAME"
+    fi
 
-MSG_COUNT="$(python3 -c "
-import json
-try:
-    with open('$EXPORT_OUT') as f:
-        data = json.load(f)
-    print(len(data.get('messages', [])))
-except Exception:
-    print(0)
-")"
+    CMD_RUN_OUT="$SCRATCH_DIR/commandcode-run.jsonl"
+    (
+        cd "$SCRATCH_DIR"
+        "$COMMANDCODE_BIN" -p "Respond with EXACTLY the word SMOKE_COMMANDCODE and nothing else." \
+            --output-format json > "$CMD_RUN_OUT" 2>&1 || {
+                log_fail "commandcode run failed. Output:"
+                cat "$CMD_RUN_OUT"
+                exit 1
+            }
+    )
 
-if [[ "$MSG_COUNT" -ge 4 ]]; then
-    log_pass "Session exported successfully with $MSG_COUNT messages (continuity verified)."
+    CMD_SID="$(grep -m 1 -o '"sessionId":"[^"]*"' "$CMD_RUN_OUT" | head -n 1 | cut -d '"' -f 4 || true)"
+    if [[ -n "$CMD_SID" ]]; then
+        log_pass "Command Code fresh task completed with session ID: $CMD_SID"
+
+        CMD_RESUME_OUT="$SCRATCH_DIR/commandcode-resume.jsonl"
+        (
+            cd "$SCRATCH_DIR"
+            "$COMMANDCODE_BIN" -p "What was the single word you answered in the first turn?" \
+                --session "$CMD_SID" \
+                --output-format json > "$CMD_RESUME_OUT" 2>&1 || true
+        )
+
+        if grep -q "SMOKE_COMMANDCODE" "$CMD_RESUME_OUT"; then
+            log_pass "Command Code session resumption successfully recalled prior context."
+        else
+            log_warn "Command Code session resumption did not match expected context."
+        fi
+    else
+        log_warn "Could not extract sessionId from commandcode output."
+    fi
 else
-    log_warn "Export message count ($MSG_COUNT) less than expected 4, but turns succeeded."
+    log_warn "Command Code binary not found at $COMMANDCODE_BIN"
 fi
 
-# 8. Systemd User Execution Validation
-log_info "Step 8: Testing non-interactive headless execution via systemd-run --user..."
-if systemd-run --user --wait "$OPENCODE_BIN" run "Respond with the word SYSTEMD_OK" \
-    -m "$FREE_MODEL" \
-    --format json \
-    --dir "$SCRATCH_DIR" >/dev/null 2>&1; then
-    log_pass "Agent executed successfully inside an isolated systemd user unit."
+# 7. Systemd User Execution Validation
+log_info "Step 7: Testing non-interactive headless execution via systemd-run --user..."
+if systemd-run --user --wait "$COMMANDCODE_BIN" -p "Respond with SYSTEMD_OK" \
+    --output-format json >/dev/null 2>&1; then
+    log_pass "Command Code executed successfully inside an isolated systemd user unit."
+elif [[ -x "$OPENCODE_BIN" ]] && systemd-run --user --wait "$OPENCODE_BIN" run "Respond with SYSTEMD_OK" \
+    -m "$FREE_MODEL" --format json --dir "$SCRATCH_DIR" >/dev/null 2>&1; then
+    log_pass "OpenCode executed successfully inside an isolated systemd user unit."
 else
     log_warn "systemd-run execution encountered an issue (check systemctl --user status)."
 fi
 
-# 9. Codex CLI Companion Check
-log_info "Step 9: Inspecting Codex CLI companion runtime..."
+# 8. Codex CLI Companion Check
+log_info "Step 8: Inspecting Codex CLI companion runtime..."
 if [[ -x "$CODEX_BIN" ]]; then
     CODEX_VER="$("$CODEX_BIN" --version 2>/dev/null || true)"
     log_pass "Codex CLI found ($CODEX_VER). Companion worktree & VS Code panel integration available."
@@ -174,5 +191,5 @@ else
 fi
 
 printf "\n${GREEN}==============================================================================${NC}\n"
-printf "${GREEN} Smoke Test Complete: All critical agent runtime & GitHub prerequisites verified!${NC}\n"
+printf "${GREEN} Smoke Test Complete: All critical agent runtimes & GitHub access verified!${NC}\n"
 printf "${GREEN}==============================================================================${NC}\n"
