@@ -21,11 +21,16 @@ jobs:
       # uv is the single source of tool versions: it installs the interpreter,
       # Ruff and pre-commit from the committed uv.lock, so CI cannot drift from
       # a developer's `uv sync --locked` environment.
+      # The interpreter version is pinned explicitly, in addition to the lock:
+      # uv.lock pins *packages* resolved for `requires-python`, not the Python
+      # minor version itself. `.python-version` (3.12, matching the verified VM)
+      # makes local `uv sync` reproducible; this pins CI to the same version.
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+          python-version-file: .python-version
 
       # `--locked` fails if uv.lock is out of date with pyproject.toml, so a
       # dependency change without a refreshed lock is rejected here rather than

@@ -36,7 +36,34 @@ log_ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
 log_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 log_fail() { printf "${RED}[FAIL]${NC} %s\n" "$*" >&2; }
 
+# Print the configured GitHub wrapper command (the approved credential helper),
+# or nothing when it cannot be determined. The TOML is parsed by Python with the
+# path passed as an argv element, so configuration text is never interpreted as
+# shell code — the same rule cmd_status() follows.
+resolve_wrapper() {
+    [[ -f "$CONFIG_PATH" ]] || return 0
+    python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
+import sys, tomllib
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        cfg = tomllib.load(fh)
+except Exception:
+    sys.exit(0)
+
+command = cfg.get("github", {}).get("command", "")
+if command:
+    print(command)
+PY
+}
+
 usage() {
+    local wrapper
+    wrapper="$(resolve_wrapper)"
+    if [[ -z "$wrapper" ]]; then
+        wrapper="<configured-wrapper>   # github.command in $CONFIG_PATH"
+    fi
+
     cat <<EOF
 Usage: $0 [--install | --status | --uninstall | --help]
 
@@ -46,17 +73,29 @@ Usage: $0 [--install | --status | --uninstall | --help]
 
 Canonical uv workflow (see docs/operations.md):
 
-  # first-time setup of the runtime environment
-  uv sync --locked --no-dev
+  # shared development/deployment checkout (the usual case): keep the dev group
+  uv sync --locked
   mkdir -p ~/.local/bin
   ln -sf $REPO_ROOT/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch
 
-  # upgrade an existing deployment (state, config and logs are untouched)
-  git pull
-  uv sync --locked --no-dev
+  # upgrade an existing deployment (state, config and logs are untouched).
+  # Update the checkout with the APPROVED wrapper-backed Git procedure first --
+  # a bare 'git pull' does not guarantee the approved credential helper is used
+  # on this VM (see docs/architecture.md 2.4). The reset entry is what stops an
+  # ambient unapproved helper from being queried first:
+  set +H   # '!' would otherwise trigger bash history expansion
+  git -c credential.https://github.com.helper= \\
+      -c credential.https://github.com.helper="!$wrapper auth git-credential" \\
+      pull --ff-only
+  uv sync --locked
   systemctl --user restart agent-dispatch.service
 
-The unit invokes the installed executable directly and never \`uv run\`, so a
+  # a DEDICATED deployment checkout (not used for development) may instead use
+  # 'uv sync --locked --no-dev' -- but do not run that in a checkout where you
+  # develop: it writes the same .venv and removes Ruff/pre-commit, breaking the
+  # commit hook. Do not install the hook in a --no-dev checkout.
+
+The unit invokes the installed executable directly and never 'uv run', so a
 restart cannot trigger a dependency sync.
 
 Environment:

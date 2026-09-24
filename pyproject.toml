@@ -22,8 +22,10 @@ dependencies = []
 agent-dispatch = "agent_dispatch.cli:main"
 
 # Development tooling only — never installed into the deployment environment
-# (`uv sync --locked --no-dev`). Versions are resolved and pinned in uv.lock so
-# the VM and CI run the same Ruff and pre-commit.
+# (`uv sync --locked --no-dev`). Tool versions are resolved and pinned in
+# uv.lock so the VM and CI run the same Ruff and pre-commit. Note that uv.lock
+# pins *packages*, not the Python minor version; that is pinned by
+# `.python-version` (3.12) instead.
 [dependency-groups]
 dev = [
     "pre-commit>=4.2.0",

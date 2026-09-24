@@ -9,16 +9,27 @@ worktrees, push branches or open PRs** (Issues #4/#5).
 ## 1. Install
 
 The service has **no third-party dependencies** (stdlib `tomllib`, `sqlite3`,
-`fcntl`). The project is managed with **uv**: the same tool installs the
-development environment and the deployable runtime, so there is exactly one
-environment to reason about and no ad-hoc `pip install`.
+`fcntl`). The project is managed with **uv**: the same tool installs both the
+development environment and the deployable runtime, so there is no second
+toolchain and no ad-hoc `pip install`.
 
-### Enclosing checkout
+Two things are pinned, and they are not the same thing:
+
+| What | Pinned by | Guarantee |
+|---|---|---|
+| Package/tool versions (Ruff, pre-commit) | `uv.lock` | exact resolved versions; `--locked` refuses any drift |
+| Python minor version | `.python-version` (`3.12`) | `uv` selects 3.12 locally and in CI |
+
+`uv.lock` pins **packages** resolved against `requires-python = ">=3.11"` — it does
+**not** by itself pin the Python minor version. `.python-version` does that, and CI
+passes it to `setup-uv`. On this VM uv reuses the system 3.12.3 rather than
+downloading an interpreter, so the pin costs nothing.
+
+### Which sync mode to use
 
 ```bash
-cd /home/craftlypse/code/agent-dispatch
-uv sync --locked                 # developer environment (includes Ruff/pre-commit)
-uv sync --locked --no-dev        # runtime-only environment (deployment)
+uv sync --locked           # developer environment (includes Ruff/pre-commit)
+uv sync --locked --no-dev  # runtime-only environment (deployment)
 ```
 
 `--locked` refuses to resolve anything not already recorded in the committed
@@ -26,8 +37,21 @@ uv sync --locked --no-dev        # runtime-only environment (deployment)
 library version. The project is installed into `.venv` as an editable install,
 and `.venv/bin/agent-dispatch` is the CLI.
 
-There is **no need to put `uv` on the service's execution path**: the systemd
-unit invokes the installed executable directly.
+> **These are alternative modes, not sequential setup steps.** Both write the
+> **same `.venv`**. Running `--no-dev` after a developer sync *removes* Ruff and
+> pre-commit from that environment, so an already-installed commit hook stops
+> working and `uv run --no-sync ruff …` fails with `Failed to spawn: ruff`.
+> Pick one mode per checkout — never both in the same one.
+
+| Checkout | Sync mode | Hooks |
+|---|---|---|
+| **Shared development/deployment checkout** (the default here) | `uv sync --locked` | install and keep them |
+| **Dedicated deployment checkout** | `uv sync --locked --no-dev` | do not install or expect them |
+
+For the shared checkout, a bare `uv sync --locked` is the correct choice: the dev
+group costs one environment and keeps the hook commands usable, while the service
+still needs no `uv` on its execution path because systemd invokes the installed
+executable directly.
 
 ### Declared testing unit
 
@@ -38,14 +62,17 @@ systemctl --user restart agent-dispatch.service
 
 ### A checkout dedicated to deployment
 
-If the source checkout is only used to run the service (not to develop it), the
-runtime environment should be installed without the dev group and the unit should
-point at that environment's absolute path:
+Use this only when the source checkout is **not** used for development. Install
+the runtime environment without the dev group:
 
 ```bash
 uv sync --locked --no-dev
-# -> .venv/bin/agent-dispatch
+# -> .venv/bin/agent-dispatch, and no Ruff/pre-commit present
 ```
+
+Do **not** install the commit hook in that checkout — the hook invokes the locked
+Ruff through `uv run --no-sync`, which `--no-dev` deliberately removes. Keep it a
+pure runtime environment.
 
 `./scripts/install-service.sh --install` resolves the executable on `PATH`. Link
 it once and the unit needs no further edits:
@@ -59,22 +86,40 @@ ln -sf ~/code/agent-dispatch/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatc
 
 The old layout installed into `~/.local/share/agent-dispatch/venv` with `pip`.
 Upgrading does **not** require touching configuration, the SQLite queue or logs —
-all of those live outside the environment. The safe sequence is:
+all of those live outside the environment.
+
+**First, update the checkout with the approved wrapper-backed Git procedure.**
+A bare `git pull` is not sufficient on this VM: the ambient credential-helper
+chain queries the **unapproved** raw `gh` helper before `gh-craftlypse`, and that
+ordering is incidental rather than guaranteed (see
+[`docs/architecture.md` §2.4](architecture.md)). Reset the inherited helper list,
+then set the configured wrapper — the wrapper's own `github.command` and
+`github.credential_helper_reset`/`credential_helper` values are the source of
+truth:
 
 ```bash
 cd ~/code/agent-dispatch
-git pull
-uv sync --locked --no-dev                       # build the uv-managed environment
+set +H   # '!' would otherwise trigger bash history expansion
+git -c credential.https://github.com.helper= \
+    -c credential.https://github.com.helper='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential' \
+    pull --ff-only
+```
+
+Then rebuild the environment and restart the service:
+
+```bash
+uv sync --locked                                # keep Ruff/pre-commit usable here
 mkdir -p ~/.local/bin
 ln -sf "$PWD/.venv/bin/agent-dispatch" ~/.local/bin/agent-dispatch
 systemctl --user restart agent-dispatch.service # unit keeps using the same ~/.local/bin path
 ```
 
-Then confirm before removing anything:
+Confirm before removing anything:
 
 ```bash
 ~/.local/bin/agent-dispatch doctor
 ~/.local/bin/agent-dispatch status --no-sync
+uv run --no-sync ruff --version                 # proves the dev tooling still works
 ```
 
 Only after that has been verified, the superseded environment may be deleted:

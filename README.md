@@ -38,7 +38,7 @@ than stubbed.
 asking what the queue contains cannot change it.
 
 ```bash
-uv sync --locked --no-dev                # one locked environment, no third-party deps
+uv sync --locked                         # one locked environment, no third-party runtime deps
 mkdir -p ~/.local/bin
 ln -sf "$PWD/.venv/bin/agent-dispatch" ~/.local/bin/agent-dispatch
 
@@ -47,12 +47,16 @@ agent-dispatch dry-run     # one poll that writes nothing to disk or GitHub
 ```
 
 **uv owns the environment.** The same tool and the same committed `uv.lock`
-produce the development environment and the deployable one (`--no-dev`); `uv run`
-is never used by the service unit, so a restart cannot sync or download packages.
-See **[`docs/operations.md`](docs/operations.md)** for install, configuration,
-the `systemd --user` unit, pause/unpause/retry semantics, log locations, the
-migration recipe from the pre-uv virtualenv, and the release's explicit
-limitations.
+produce the environment; `uv run` is never used by the service unit, so a restart
+cannot sync or download packages.
+
+`uv sync --locked --no-dev` is an **alternative for a dedicated deployment
+checkout, not a follow-up step** — it writes the same `.venv` and removes Ruff and
+pre-commit, which would break the commit hook if run in a checkout you develop in.
+See **[`docs/operations.md`](docs/operations.md)** for the mode table, install,
+configuration, the `systemd --user` unit, pause/unpause/retry semantics, log
+locations, the migration recipe from the pre-uv virtualenv, and the release's
+explicit limitations.
 
 ---
 
@@ -68,8 +72,8 @@ limitations.
 
 ## Development
 
-One locked environment provides the interpreter, Ruff and pre-commit; there is no
-second, independently versioned tool copy to drift out of sync.
+One locked environment provides Ruff and pre-commit; there is no second,
+independently versioned tool copy to drift out of sync.
 
 ```bash
 uv sync --locked                          # create/update the environment
