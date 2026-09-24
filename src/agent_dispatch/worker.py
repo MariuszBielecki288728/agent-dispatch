@@ -53,11 +53,23 @@ class PollOutcome:
 class Worker:
     """Discovery/reconciliation loop over an explicit store."""
 
-    def __init__(self, config: Config, store: Store, log: Logger, *, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        config: Config,
+        store: Store,
+        log: Logger,
+        *,
+        reconcile: bool = True,
+    ) -> None:
         self.config = config
         self.store = store
         self.log = log
-        self.dry_run = dry_run
+        #: ``reconcile=False`` means "simulate only": the poll still computes every
+        #: decision, but it must be handed a scratch store so nothing durable is
+        #: written. It does **not** disable store writes by itself — the read-only
+        #: store is the guarantee. Previously named ``dry_run``, which implied a
+        #: safety it did not provide on its own.
+        self.reconcile = reconcile
         self._stop = False
 
     # -------------------------------------------------------------- the loop
@@ -72,7 +84,7 @@ class Worker:
             interval_seconds=interval,
             trigger_label=self.config.github.trigger_label,
             max_concurrent_tasks=self.config.worker.max_concurrent_tasks,
-            dry_run=self.dry_run,
+            reconcile=self.reconcile,
         )
 
         while not self._stop:
@@ -141,7 +153,7 @@ class Worker:
             dispatchable=len(dispatchable),
         )
 
-        if dispatchable and self.store.active_task_count() == 0 and not self.dry_run:
+        if dispatchable and self.store.active_task_count() == 0 and self.reconcile:
             # Truthful statement of scope: this release queues, it does not execute.
             self.log.info(
                 "dispatch_deferred",
@@ -149,7 +161,7 @@ class Worker:
                 tasks=",".join(dispatchable[:10]),
             )
 
-        if not self.dry_run:
+        if self.reconcile:
             try:
                 removed = prune(self.config.worker.run_log_dir, self.config.worker.run_log_keep)
                 if removed:

@@ -189,6 +189,21 @@ class Store:
         """A scratch store used by ``dry-run`` so nothing touches the disk."""
         return cls(":memory:")
 
+    @classmethod
+    def open_read_only(cls, db_path: Path | str) -> "Store":
+        """Open the state database for reading without being able to write it.
+
+        Read paths (``status``, ``dry-run``) must not create, migrate or modify the
+        state file, and must not become a second, unsynchronised writer competing
+        with the worker that owns the lock. When the database does not exist yet
+        this returns an empty scratch store rather than creating one, so an
+        observability command stays free of side effects.
+        """
+        path = Path(db_path)
+        if not path.is_file():
+            return cls.in_memory()
+        return cls(path, read_only=True)
+
     def fork_to_memory(self) -> "Store":
         """Copy this database into a scratch in-memory store and return it.
 

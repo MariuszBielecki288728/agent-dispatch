@@ -32,6 +32,10 @@ implementation. Branch/worktree creation, sessions, pushes and PRs are #4, and
 the `agent:fix` review loop is #5. Those are documented as future work rather
 than stubbed.
 
+**The worker is the only command that writes durable state.** `status` and
+`dry-run` read a read-only snapshot and simulate the poll in scratch memory, so
+asking what the queue contains cannot change it.
+
 ```bash
 python3 -m venv ~/.local/share/agent-dispatch/venv
 ~/.local/share/agent-dispatch/venv/bin/pip install .

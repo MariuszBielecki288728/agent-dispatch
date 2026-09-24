@@ -21,7 +21,9 @@ stubbed with a fake success.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
@@ -33,7 +35,7 @@ from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
 from .runlogs import prune
 from .store import Store, phase_summary
-from .worker import Worker
+from .worker import PollOutcome, Worker
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -183,27 +185,48 @@ def _cmd_doctor(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
 
 def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Show queue state. **Never writes durable state.**
+
+    ``status`` is an observability command: it must not create or migrate the state
+    database and must not become a second, unsynchronised writer alongside the
+    worker that owns the single-instance lock (which it does not take). It
+    therefore always reads a read-only snapshot:
+
+    * ``--no-sync`` reads the on-disk state directly and makes no API calls;
+    * the default reads the on-disk state, performs one poll against a scratch copy,
+      and displays what that poll *would* produce — persisting nothing.
+    """
     if args.repo is not None:
         config.repo(args.repo)  # allowlist check
 
-    store = Store(config.worker.state_db)
+    # The store that will be displayed. `--no-sync` reads the on-disk state
+    # directly; the default polls a scratch copy and displays that instead. Either
+    # way the on-disk file is only ever opened read-only.
+    on_disk = Store.open_read_only(config.worker.state_db)
+    view: Store = on_disk
     try:
         if not args.no_sync:
-            worker = Worker(config, store, log, dry_run=True)
-            outcome = worker.poll_once()
-            if not outcome.ok:
-                log.warning("status_sync_incomplete", detail=outcome.error or "one or more repositories failed")
+            poll = _poll_snapshot(config, on_disk, log)
+            if poll.outcome.ok:
+                on_disk.close()
+                view = poll.store
+            else:
+                log.warning(
+                    "status_sync_incomplete",
+                    detail=poll.outcome.error or "one or more repositories were inaccessible",
+                    note="showing on-disk state only; nothing was persisted",
+                )
+                poll.close()
 
-        tasks = store.list_tasks(args.repo)
-        counts = store.count_by_phase()
+        tasks = view.list_tasks(args.repo)
+        counts = view.count_by_phase()
+        active = view.active_task_count()
 
         if args.json:
-            import json
-
             payload = {
                 "config": str(config.source_path),
                 "phases": counts,
-                "active_tasks": store.active_task_count(),
+                "active_tasks": active,
                 "max_concurrent_tasks": config.worker.max_concurrent_tasks,
                 "tasks": [
                     {
@@ -235,9 +258,13 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
         print(f"agent-dispatch {__version__} — status")
         print(f"config: {config.source_path}")
+        if not args.no_sync:
+            print("view  : read-only snapshot + simulated poll (nothing was persisted)")
+        else:
+            print("view  : on-disk state only (no API calls)")
         print(f"phases: {phase_summary(counts)}")
         print(
-            f"active tasks: {store.active_task_count()} / {config.worker.max_concurrent_tasks} "
+            f"active tasks: {active} / {config.worker.max_concurrent_tasks} "
             "(agent execution arrives in Issue #4)"
         )
         print()
@@ -261,61 +288,88 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print("  Note: no task is promoted to `running` in this release; queueing is not implementation.")
         return EXIT_OK
     finally:
-        store.close()
+        view.close()
 
 
 # ------------------------------------------------------------------- dry-run
 
 
+@dataclass
+class SnapshotPoll:
+    """A poll simulated against a scratch copy of the state database."""
+
+    store: Store
+    outcome: PollOutcome
+    dispatchable: list[str]
+
+    def close(self) -> None:
+        self.store.close()
+
+
+def _poll_snapshot(config: Config, base: Store, log: Logger) -> SnapshotPoll:
+    """Run one poll against a scratch copy of ``base``.
+
+    Shared by ``status`` and ``dry-run`` so both make identical decisions while the
+    real state file is opened read-only and never written. The caller always gets a
+    snapshot back — including an incomplete one — so it can report honestly what
+    happened instead of pretending the poll succeeded.
+
+    The poll logs through a ``simulated`` logger: its decisions are real but its
+    writes are not, so an operator reading the journal is never told that an Issue
+    was queued when nothing durable happened.
+    """
+    scratch = base.fork_to_memory()
+    simulated_log = Logger(fmt=log.fmt, stream=log.stream, verbose=log.verbose, simulated=True)
+    outcome = Worker(config, scratch, simulated_log, reconcile=False).poll_once()
+    tasks = scratch.list_tasks()
+    dispatchable = [task.ref for task in tasks if task.dispatchability()[0]]
+    return SnapshotPoll(store=scratch, outcome=outcome, dispatchable=dispatchable)
+
+
 def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
     """One poll with identical decisions, persisting nothing.
 
-    The real database is mirrored into scratch memory read-only, so the simulated
-    result matches a real poll while the state file is never opened for writing —
-    and GitHub is only ever read.
+    The state database is opened read-only and mirrored into scratch memory, so the
+    simulated result matches a real poll while the state file is never opened for
+    writing — and GitHub is only ever read.
 
     ``--no-sync`` keeps the same "persist nothing" guarantee but skips the poll
     entirely, so it makes **no API calls at all**. Without it, running the flag as
     documented would still execute the configured GitHub wrapper.
     """
-    scratch = Store.in_memory()
-    source = "empty (no state database yet)"
-    if config.worker.state_db.is_file():
-        existing = Store(config.worker.state_db, read_only=True)
-        try:
-            scratch.close()
-            scratch = existing.fork_to_memory()
-        finally:
-            existing.close()
-        source = str(config.worker.state_db)
-
+    base = Store.open_read_only(config.worker.state_db)
     try:
-        tasks = scratch.list_tasks()
-        before = scratch.count_by_phase()
+        if not config.worker.state_db.is_file():
+            log.info("dry_run_state_empty", source=str(config.worker.state_db))
 
         if args.no_sync:
             log.info("dry_run_no_sync", note="local state only; the GitHub wrapper is not invoked")
             print()
             print("dry-run summary (local state only — no API calls, nothing written)")
-            print(f"  state : {source}")
-            print(f"  phases: {phase_summary(before)}")
+            print(f"  state : {config.worker.state_db}")
+            print(f"  phases: {phase_summary(base.count_by_phase())}")
             print("  dispatchable now: suppressed (requires a poll to prove)")
             print("  result: OK (no sync requested)")
             return EXIT_OK
 
-        worker = Worker(config, scratch, log, dry_run=True)
-        outcome = worker.poll_once()
-        after = scratch.count_by_phase()
-        dispatchable = outcome.dispatchable
+        before = base.count_by_phase()
+        poll = _poll_snapshot(config, base, log)
     finally:
-        scratch.close()
+        base.close()
+
+    try:
+        after = poll.store.count_by_phase()
+        dispatchable = poll.dispatchable
+        result = poll.outcome
+    finally:
+        poll.close()
 
     print()
     print("dry-run summary (nothing was written to disk or GitHub)")
-    print(f"  before: {phase_summary(outcome.before)}")
+    print(f"  before: {phase_summary(before)}")
     print(f"  after : {phase_summary(after)}")
-    if outcome.result is not None:
-        for repo_outcome in outcome.result.repos:
+    if result.result is not None:
+        for repo_outcome in result.result.repos:
             if repo_outcome.failed:
                 print(f"  {repo_outcome.slug}: FAILED ({repo_outcome.error_kind}) {repo_outcome.error}")
                 continue
@@ -330,8 +384,8 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
     for ref in dispatchable[:10]:
         print(f"      {ref}")
 
-    if not outcome.ok:
-        print(f"  result: FAILED — {outcome.error or 'one or more repositories were inaccessible'}")
+    if not result.ok:
+        print(f"  result: FAILED — {result.error or 'one or more repositories were inaccessible'}")
         return EXIT_FAILURE
     print("  result: OK")
     return EXIT_OK

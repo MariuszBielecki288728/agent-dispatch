@@ -146,6 +146,23 @@ decisions, prints the result, and persists nothing — it will not even create
 at all**: it reports local state only and skips the poll. Use it when GitHub is
 unreachable or you deliberately want to avoid touching the API.
 
+**`status` is observability, and never writes.** It does not create or migrate the
+state database, and it does not become a second, unsynchronised writer competing
+with the worker that owns the single-instance lock (which `status` does not take).
+
+| Command | Reads | Makes API calls | Persists |
+|---|---|---|---|
+| `status --no-sync` | on-disk state directly | no | nothing |
+| `status` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing |
+| `dry-run --no-sync` | on-disk state | no | nothing |
+| `dry-run` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing |
+| `worker` | — | yes | **yes** — the only command that does |
+
+So `status` and `dry-run` show what the queue *would* look like; the on-disk state
+they report only advances when the worker (or an explicit `enqueue`/`pause`/
+`unpause`/`retry`) runs. If a sync is incomplete, `status` says so and falls back to
+showing on-disk state rather than presenting a partial poll as authoritative.
+
 **`enqueue` is not a shortcut around the rules.** It addresses one Issue by number
 and applies exactly the same decision the poll applies, so it refuses a PR number,
 a closed Issue, an unlabelled Issue, or an Issue that already has a PR. Re-running
@@ -244,11 +261,13 @@ would schedule a duplicate implementation of work someone already did.
 ## 9. Verifying this release
 
 ```bash
-./scripts/test-offline.sh      # 82 tests, deterministic, no network, no model credits
+./scripts/test-offline.sh      # 88 tests, deterministic, no network, no model credits
 ./scripts/smoke-runtime.sh --mock
 agent-dispatch doctor          # live capability report for this VM
+agent-dispatch status --no-sync    # on-disk state only, no API calls, writes nothing
 agent-dispatch dry-run         # live read-only poll
 agent-dispatch dry-run --no-sync   # local state only, no API calls
+agent-dispatch status          # read-only snapshot + simulated poll
 ```
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was

@@ -23,10 +23,22 @@ _REDACT_KEYS = {"token", "gh_token", "github_token", "password", "secret", "auth
 
 
 class Logger:
-    def __init__(self, *, fmt: str = "text", stream: TextIO | None = None, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fmt: str = "text",
+        stream: TextIO | None = None,
+        verbose: bool = False,
+        simulated: bool = False,
+    ) -> None:
         self.fmt = fmt
         self.stream = stream if stream is not None else sys.stderr
         self.verbose = verbose
+        #: When true, event names are prefixed with ``simulated_`` and every line
+        #: carries ``simulated=true``. A poll that is being simulated against a
+        #: scratch store must not log ``issue_queued`` as if durable state changed,
+        #: or an operator tailing the journal would be misled.
+        self.simulated = simulated
 
     def _emit(self, level: str, event: str, **fields: Any) -> None:
         if level == "debug" and not self.verbose:
@@ -36,12 +48,15 @@ class Logger:
             for key, value in fields.items()
             if value is not None
         }
+        name = f"simulated_{event}" if self.simulated else event
+        if self.simulated:
+            safe = {"simulated": True, **safe}
         if self.fmt == "json":
-            payload = {"level": level, "event": event, **safe}
+            payload = {"level": level, "event": name, **safe}
             line = json.dumps(payload, sort_keys=False, default=str)
         else:
             rendered = " ".join(f"{key}={_render(value)}" for key, value in safe.items())
-            line = f"{level.upper():<7} {event}" + (f" {rendered}" if rendered else "")
+            line = f"{level.upper():<7} {name}" + (f" {rendered}" if rendered else "")
         print(line, file=self.stream, flush=True)
 
     def debug(self, event: str, **fields: Any) -> None:
@@ -64,5 +79,5 @@ def _render(value: Any) -> str:
     return text
 
 
-def make_logger(fmt: str = "text", *, verbose: bool = False) -> Logger:
-    return Logger(fmt=fmt, verbose=verbose)
+def make_logger(fmt: str = "text", *, verbose: bool = False, simulated: bool = False) -> Logger:
+    return Logger(fmt=fmt, verbose=verbose, simulated=simulated)

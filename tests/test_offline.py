@@ -242,7 +242,7 @@ class BaseCase(unittest.TestCase):
         self.addCleanup(os.environ.pop, "FAKE_GH_WORLD", None)
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
 
-    def worker(self, *, dry_run: bool = False, store: Store | None = None, env_overrides: dict[str, str] | None = None):
+    def worker(self, *, reconcile: bool = True, store: Store | None = None, env_overrides: dict[str, str] | None = None):
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
         os.environ.pop("FAKE_GH_PAD_FULL_PAGES", None)
         for key, value in (env_overrides or {}).items():
@@ -257,7 +257,7 @@ class BaseCase(unittest.TestCase):
         store = store or Store(config.worker.state_db)
         if owned:
             self.addCleanup(store.close)
-        return Worker(config, store, log, dry_run=dry_run), store, config
+        return Worker(config, store, log, reconcile=reconcile), store, config
 
     def task(self, store: Store, number: int):
         task = store.get_task(self.slug, number)
@@ -1418,6 +1418,112 @@ class DryRunNoSyncTests(BaseCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("queued=1", result.stdout)
         self.assertNotIn("local state only", result.stdout)
+
+
+class StatusIsReadOnlyTests(BaseCase):
+    """Re-review follow-up: `status` is observability and must not write state.
+
+    The worker does not take the single-instance lock for read paths, so a
+    status command that persisted would be a second, unsynchronised writer
+    competing with the service — and would surprise an operator who only asked
+    what the queue contains.
+    """
+
+    def test_status_does_not_create_the_state_database(self) -> None:
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        result = self.world.run_cli("status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(
+            self.world.load_config().worker.state_db.exists(),
+            "`status` must not create the state database",
+        )
+
+    def test_status_does_not_insert_rows_for_a_discovered_issue(self) -> None:
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        result = self.world.run_cli("status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # It must still *report* what the poll sees, without persisting it.
+        self.assertIn("queued=1", result.stdout)
+
+        db = self.world.load_config().worker.state_db
+        self.assertFalse(db.exists(), "no row may be written by `status`")
+
+    def test_status_does_not_advance_a_phase(self) -> None:
+        # Establish real state with a mutating poll first.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        self.assertEqual(self.world.run_cli("worker", "--once").returncode, 0)
+        db = self.world.load_config().worker.state_db
+        before = Store(db)
+        try:
+            snapshot_before = [(t.issue_number, t.phase) for t in before.list_tasks()]
+            updated_before = {t.issue_number: t.updated_at for t in before.list_tasks()}
+        finally:
+            before.close()
+
+        # Withdraw the label on GitHub, then ask for status: the on-disk phase must
+        # not change until the *worker* reconciles it.
+        self.set_issues(issue(1, "Labelled", labels=[]))
+        self.assertEqual(self.world.run_cli("status").returncode, 0)
+
+        after = Store(db)
+        try:
+            self.assertEqual(
+                [(t.issue_number, t.phase) for t in after.list_tasks()],
+                snapshot_before,
+                "`status` must not change a task phase",
+            )
+            self.assertEqual(
+                {t.issue_number: t.updated_at for t in after.list_tasks()},
+                updated_before,
+                "`status` must not touch updated_at",
+            )
+        finally:
+            after.close()
+
+    def test_status_no_sync_does_not_create_the_database(self) -> None:
+        result = self.world.run_cli("status", "--no-sync")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.world.load_config().worker.state_db.exists())
+
+    def test_status_reports_unpersisted_state_and_is_idempotent(self) -> None:
+        # Running it repeatedly must be a no-op on disk.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        for _ in range(3):
+            self.assertEqual(self.world.run_cli("status").returncode, 0)
+        self.assertFalse(
+            self.world.load_config().worker.state_db.exists(),
+            "repeated `status` invocations must still write nothing",
+        )
+
+    def test_status_fails_honestly_when_the_wrapper_is_unavailable(self) -> None:
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        self.world.write_config(github_overrides={"command": f"{self.tmp}/nope"})
+        result = self.world.run_cli("status")
+        # It reports the problem and still shows the (empty) on-disk state.
+        self.assertIn("config", result.stdout)
+        self.assertFalse(self.world.load_config().worker.state_db.exists())
+
+    def test_simulated_poll_logs_are_labelled_as_simulated(self) -> None:
+        # A read-only status whose log says "issue_queued" would mislead an operator
+        # tailing the journal into thinking durable state changed.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        result = self.world.run_cli("status")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("simulated_issue_queued", result.stderr)
+        self.assertIn("simulated=True", result.stderr)
+        # The unqualified event name must not appear at the start of a log line.
+        for line in result.stderr.splitlines():
+            if "issue_queued" not in line:
+                continue
+            self.assertIn("simulated_", line, f"unlabelled queue event in: {line}")
+
+    def test_worker_logs_are_not_labelled_simulated(self) -> None:
+        # The real worker must keep its unqualified event names.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        result = self.world.run_cli("worker", "--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("issue_queued", result.stderr)
+        self.assertNotIn("simulated", result.stderr)
 
 
 class LabelSetupTests(BaseCase):
