@@ -142,6 +142,15 @@ state database into scratch memory, performs the same GitHub reads and the same
 decisions, prints the result, and persists nothing — it will not even create
 `state.db`. It never starts an agent.
 
+`dry-run --no-sync` keeps the "persist nothing" guarantee and **makes no API calls
+at all**: it reports local state only and skips the poll. Use it when GitHub is
+unreachable or you deliberately want to avoid touching the API.
+
+**`enqueue` is not a shortcut around the rules.** It addresses one Issue by number
+and applies exactly the same decision the poll applies, so it refuses a PR number,
+a closed Issue, an unlabelled Issue, or an Issue that already has a PR. Re-running
+it on an already-queued Issue is a success that reuses the existing row.
+
 ### Pause semantics (important)
 
 There are two distinct reasons a task can be `paused`, and they behave differently
@@ -174,6 +183,22 @@ A task is **dispatchable** only when all of these hold: the Issue is open, it
 still carries `take-it`, no relevant PR already exists for it, and its phase is
 `queued`. Otherwise `status` prints the specific blocker.
 
+### Observed PR vs. owned PR
+
+Two different facts are recorded separately, and conflating them would be a real
+bug once #4 runs agents:
+
+| Column | Meaning | Written by |
+|---|---|---|
+| `observed_state.linked_pr_number` | a PR that *already exists* for this Issue — a human's PR, or an earlier one | discovery, every poll |
+| `tasks.pr_number` | the PR **this worker's own run created** | only the #4 PR workflow |
+
+Discovery **never** writes `tasks.pr_number`, not even when the PR sits on a
+`dispatch/issue-N-...` branch. A branch name is a strong hint, not proof of
+ownership, and a review round acting on a PR this worker did not create is exactly
+the failure this separation prevents. An Issue with an observed PR is recorded as
+`awaiting_review` and stays non-dispatchable.
+
 ---
 
 ## 7. Logs and state
@@ -204,20 +229,26 @@ completed:
 | Repository not in the credential's permitted set | reported as `denied_repo`; existing task rows are left exactly as they were |
 | Auth failure, rate limit, network error, timeout | reported with its kind; the task keeps its phase and is retried on the next poll |
 | Wrapper returns unparseable output | treated as a hard error, not as an empty (silently successful) result |
+| PR listing truncated (page cap reached) | reported as `incomplete_scan`; **nothing is queued** and no observation is cleared, because a pre-existing PR may sit on a page that was never read |
 | Issue or PR deleted mid-poll | the task is left unchanged and reported; nothing is guessed |
 
 A failed poll never marks a task `finished`, and the worker never silently
 switches identity or model.
+
+The "cannot prove a negative" rule is applied consistently: an unreadable or
+incomplete PR listing is never reported as "no PR exists", because that is what
+would schedule a duplicate implementation of work someone already did.
 
 ---
 
 ## 9. Verifying this release
 
 ```bash
-./scripts/test-offline.sh      # 65 tests, deterministic, no network, no model credits
+./scripts/test-offline.sh      # 82 tests, deterministic, no network, no model credits
 ./scripts/smoke-runtime.sh --mock
 agent-dispatch doctor          # live capability report for this VM
 agent-dispatch dry-run         # live read-only poll
+agent-dispatch dry-run --no-sync   # local state only, no API calls
 ```
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was

@@ -58,13 +58,22 @@ HANDOFF = "agent:fix"
 class FakeWorld:
     """Builds the fake wrapper's world file and the matching TOML config."""
 
-    def __init__(self, root: Path, repos: dict[str, dict], *, labels: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        repos: dict[str, dict],
+        *,
+        labels: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
+    ) -> None:
         self.root = root
         self.world_path = root / "world.json"
         self.state_dir = root / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.repo_path = root / "checkout"
         (self.repo_path / ".git").mkdir(parents=True, exist_ok=True)
+        #: Extra environment for the fake wrapper, e.g. to force a truncated scan.
+        self.env_overrides: dict[str, str] = dict(env_overrides or {})
 
         payload: dict[str, object] = {"identity": "fake-user", "repos": {}}
         for slug, repo in repos.items():
@@ -166,6 +175,9 @@ max_turns = 40
         env = dict(os.environ)
         env["FAKE_GH_WORLD"] = str(self.world_path)
         env["PYTHONPATH"] = str(SRC)
+        # Clear any padding left over from another test, then apply overrides.
+        env.pop("FAKE_GH_PAD_FULL_PAGES", None)
+        env.update(self.env_overrides)
         return env
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -230,8 +242,14 @@ class BaseCase(unittest.TestCase):
         self.addCleanup(os.environ.pop, "FAKE_GH_WORLD", None)
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
 
-    def worker(self, *, dry_run: bool = False, store: Store | None = None):
+    def worker(self, *, dry_run: bool = False, store: Store | None = None, env_overrides: dict[str, str] | None = None):
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        os.environ.pop("FAKE_GH_PAD_FULL_PAGES", None)
+        for key, value in (env_overrides or {}).items():
+            os.environ[key] = value
+        if env_overrides:
+            for key in env_overrides:
+                self.addCleanup(os.environ.pop, key, None)
         config = self.world.load_config()
         log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
         self.addCleanup(log.stream.close)
@@ -594,7 +612,9 @@ class PreExistingPullRequestTests(BaseCase):
         self.assertIsNone(adopted.pr_number, "an adopted pre-existing PR is not owned by this worker")
 
         # #4 records ownership of the PR it will use for this task.
-        store.record_pr_adopted(adopted.id, 42, "own PR recorded")
+        # `record_pr_ownership` is the #4-only entry point: discovery must never
+        # call it, and the tests call it explicitly to stand in for #4.
+        store.record_pr_ownership(adopted.id, 42, "own PR recorded")
         owned = self.task(store, 1)
         self.assertEqual(owned.pr_number, 42)
         updated_at = owned.updated_at
@@ -1149,8 +1169,9 @@ class CliSurfaceTests(BaseCase):
     def test_enqueue_refuses_an_unlabelled_issue(self) -> None:
         self.set_issues(issue(4, "No label yet"))
         result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "4")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("label_missing", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("does not carry", result.stdout)
+        self.assertIn(TRIGGER, result.stdout)
         # And it must not silently apply the label.
         labels = self.world.read_world()["repos"][self.slug]["issues"][0]["labels"]
         self.assertEqual(labels, [])
@@ -1166,6 +1187,237 @@ class CliSurfaceTests(BaseCase):
         store = Store(self.world.load_config().worker.state_db)
         self.addCleanup(store.close)
         self.assertEqual(len(store.list_tasks(self.slug)), 1)
+
+
+# ==============================================================================
+# Regression tests for PR #10 review findings
+#
+# Each test below pins a specific defect found in review, so the behaviour cannot
+# silently regress. The names state the invariant, not the implementation.
+# ==============================================================================
+
+
+class EnqueueSharesPollRulesTests(BaseCase):
+    """Finding 1: manual `enqueue` must not have looser rules than a poll."""
+
+    def test_enqueue_refuses_an_issue_that_already_has_a_pr(self) -> None:
+        self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
+        self.set_pulls(pull(42, "human/branch", body="Closes #1"))
+
+        result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("PR #42", result.stdout)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # Recorded as an observation so the maintainer can see why, but never
+        # queued as new implementation work and never claimed as owned.
+        self.assertEqual(task.phase, "awaiting_review")
+        self.assertEqual(task.linked_pr_number, 42)
+        self.assertIsNone(task.pr_number, "a foreign PR must never be recorded as owned")
+        self.assertFalse(task.dispatchability()[0])
+
+    def test_enqueue_refuses_a_pull_request_number(self) -> None:
+        # A PR number is a valid GitHub "issue" number. The single-object endpoint
+        # answers for both, so enqueue must reject the PR object explicitly.
+        self.set_issues(issue(7, "A real issue", labels=[TRIGGER]))
+        self.set_pulls(pull(8, "feature/thing", body=""))
+
+        result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "8")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is a pull request, not an Issue", result.stdout)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.get_task(self.slug, 8), "a PR must never get a task row")
+
+    def test_enqueue_refuses_a_closed_issue(self) -> None:
+        self.set_issues(issue(3, "Closed", labels=[TRIGGER], state="closed"))
+        result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "3")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is closed", result.stdout)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.get_task(self.slug, 3))
+
+    def test_enqueue_does_not_clear_a_previously_observed_linked_pr(self) -> None:
+        # Poll first (records the PR observation), then enqueue: the earlier
+        # observation must survive and the Issue must stay unqueueable.
+        self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
+        self.set_pulls(pull(42, "human/branch", body="Closes #1"))
+
+        worker, store, _ = self.worker()
+        worker.poll_once()
+        before = self.task(store, 1)
+        self.assertEqual(before.linked_pr_number, 42)
+
+        result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(after.linked_pr_number, 42, "enqueue must not clear a known PR link")
+        self.assertIsNone(after.pr_number)
+        self.assertEqual(after.phase, "awaiting_review")
+
+    def test_enqueue_and_poll_agree_on_a_plain_labelled_issue(self) -> None:
+        self.set_issues(issue(5, "Plain", labels=[TRIGGER]))
+        result = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "5")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("queued", result.stdout)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 5)
+        self.assertEqual(task.phase, "queued")
+        self.assertTrue(task.dispatchability()[0], "a poll would queue this, so enqueue must too")
+
+    def test_enqueue_is_idempotent_and_reuses_the_row(self) -> None:
+        self.set_issues(issue(6, "Plain", labels=[TRIGGER]))
+        first = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "6")
+        second = self.world.run_cli("enqueue", "--repo", self.slug, "--issue", "6")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        # Re-enqueueing an already-queued Issue is a success, not an error.
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("already queued (row reused)", second.stdout)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(len(store.list_tasks(self.slug)), 1)
+
+
+class ForeignPrOwnershipTests(BaseCase):
+    """Finding 2: a foreign PR must never be recorded as the worker's own."""
+
+    def test_foreign_pr_stays_unowned_across_many_polls(self) -> None:
+        self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
+        self.set_pulls(pull(42, "human/branch", body="Closes #1"))
+
+        worker, store, _ = self.worker()
+        for poll in range(4):
+            worker.poll_once()
+            task = self.task(store, 1)
+            self.assertIsNone(
+                task.pr_number,
+                f"poll {poll + 1}: a foreign PR became owned; #4 could act on someone else's PR",
+            )
+            self.assertEqual(task.linked_pr_number, 42)
+            self.assertFalse(task.dispatchability()[0], f"poll {poll + 1}: must stay non-dispatchable")
+
+    def test_owned_pr_and_a_second_linked_pr_keep_ownership(self) -> None:
+        # The task owns PR 10; a *different* PR 20 also references the Issue. The
+        # recorded owner must not be overwritten by the discovered foreign one.
+        self.set_issues(issue(1, "Two PRs", labels=[TRIGGER]))
+        self.set_pulls(pull(10, "dispatch/issue-1-slug"), pull(20, "human/branch", body="Closes #1"))
+
+        worker, store, _ = self.worker()
+        worker.poll_once()
+
+        # `record_pr_ownership` is the #4-only entry point: discovery must never
+        # call it, and the tests call it explicitly to stand in for #4.
+        store.record_pr_ownership(self.task(store, 1).id, 10, "own PR recorded")
+        owned = self.task(store, 1)
+        self.assertEqual(owned.pr_number, 10)
+
+        # A poll that sees the (higher-numbered, open) foreign PR 20 must not take
+        # ownership away from PR 10.
+        worker.poll_once()
+        after = self.task(store, 1)
+        self.assertEqual(after.pr_number, 10, "ownership must not be reassigned by a poll")
+
+    def test_poll_does_not_assign_ownership_even_when_pr_matches_the_dispatch_branch(self) -> None:
+        # A PR on the deterministic dispatch branch is a strong signal, but still
+        # not proof that *this* task created it. Ownership stays with #4.
+        self.set_issues(issue(1, "Looks like ours", labels=[TRIGGER]))
+        self.set_pulls(pull(11, "dispatch/issue-1-anything"))
+
+        worker, store, _ = self.worker()
+        for _ in range(3):
+            worker.poll_once()
+        task = self.task(store, 1)
+        self.assertIsNone(task.pr_number)
+        self.assertEqual(task.linked_pr_number, 11)
+        self.assertEqual(task.phase, "awaiting_review")
+
+
+class TruncatedPrScanTests(BaseCase):
+    """Finding 3: an incomplete PR listing must fail closed, not queue."""
+
+    def test_truncated_pr_scan_queues_nothing_and_creates_no_rows(self) -> None:
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        # Pages 1..N come back exactly full, so the client paginates to its cap.
+        worker, store, _ = self.worker(env_overrides={"FAKE_GH_PAD_FULL_PAGES": "60"})
+        outcome = worker.poll_once()
+
+        self.assertFalse(outcome.ok, "a truncated PR listing must be reported as a failure")
+        repo_outcome = outcome.result.repos[0]  # type: ignore[union-attr]
+        self.assertEqual(repo_outcome.error_kind, "incomplete_scan")
+        self.assertIn("page cap", repo_outcome.error or "")
+        self.assertIsNone(store.get_task(self.slug, 1), "must not queue when PR state is unprovable")
+
+    def test_truncated_scan_preserves_a_previously_recorded_pr_observation(self) -> None:
+        self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
+        self.set_pulls(pull(42, "human/branch", body="Closes #1"))
+
+        worker, store, _ = self.worker()
+        worker.poll_once()
+        before = self.task(store, 1)
+        self.assertEqual(before.linked_pr_number, 42)
+
+        # Now the PR listing becomes unreadable due to truncation.
+        worker, _store, _ = self.worker(
+            store=store, env_overrides={"FAKE_GH_PAD_FULL_PAGES": "60"}
+        )
+        outcome = worker.poll_once()
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.result.repos[0].error_kind, "incomplete_scan")  # type: ignore[union-attr]
+
+        after = self.task(store, 1)
+        self.assertEqual(after.linked_pr_number, 42, "a truncated scan must not clear the observation")
+        self.assertEqual(after.phase, before.phase)
+        self.assertEqual(after.updated_at, before.updated_at, "task state must be left untouched")
+
+    def test_normal_pr_pagination_is_not_reported_as_truncated(self) -> None:
+        # A listing that legitimately ends must not be mistaken for truncation.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        self.set_pulls(*(pull(number, f"branch/{number}", body="") for number in range(1, 150)))
+
+        worker, store, _ = self.worker()
+        outcome = worker.poll_once()
+        self.assertTrue(outcome.ok, outcome.error)
+        self.assertEqual(self.task(store, 1).phase, "queued")
+
+
+class DryRunNoSyncTests(BaseCase):
+    """Finding 4: `dry-run --no-sync` must not call the GitHub wrapper."""
+
+    def test_dry_run_no_sync_makes_no_api_calls(self) -> None:
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        # Any wrapper invocation is a hard failure, so a call cannot slip through.
+        self.world.world["failures"] = {  # type: ignore[index]
+            "user": {"stderr": "wrapper must not be called", "exit": 1},
+            f"{self.slug}:issues": {"stderr": "wrapper must not be called", "exit": 1},
+        }
+        self.world.write_world()
+
+        result = self.world.run_cli("dry-run", "--no-sync")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("local state only", result.stdout)
+        self.assertNotIn("FAILED", result.stdout)
+
+    def test_dry_run_no_sync_still_persists_nothing(self) -> None:
+        result = self.world.run_cli("dry-run", "--no-sync")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.world.load_config().worker.state_db.exists())
+
+    def test_dry_run_without_no_sync_still_polls(self) -> None:
+        # The default must keep performing the real read-only poll.
+        self.set_issues(issue(1, "Labelled", labels=[TRIGGER]))
+        result = self.world.run_cli("dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("queued=1", result.stdout)
+        self.assertNotIn("local state only", result.stdout)
 
 
 class LabelSetupTests(BaseCase):

@@ -464,9 +464,20 @@ class Store:
             (note, utcnow_iso(), task_id),
         )
 
-    def record_pr_adopted(self, task_id: int, pr_number: int, note: str) -> None:
+    def record_pr_ownership(self, task_id: int, pr_number: int, note: str | None = None) -> None:
+        """Record that this worker's own run owns ``pr_number``.
+
+        **Only the #4 PR-creation/adoption workflow may call this**, after it has
+        verified that the PR was produced by this task. Discovery must never call
+        it: the mere existence of a PR linked to an Issue — a human's PR, or an
+        earlier unrelated one — is not evidence that this worker created it, and
+        treating it as owned would let a later review round act on someone else's
+        pull request.
+
+        If ``note`` is given it is stored as the task's last error/message.
+        """
         self._conn.execute(
-            "UPDATE tasks SET pr_number = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            "UPDATE tasks SET pr_number = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE id = ?",
             (pr_number, note, utcnow_iso(), task_id),
         )
 

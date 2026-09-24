@@ -68,7 +68,8 @@ approved wrapper. It covers discovery and pagination, Issue-vs-PR filtering,
 allowlist enforcement, missing auth/wrapper/label handling, repeated polls,
 restarts with previously labelled Issues, `take-it` removal and re-add, a
 pre-existing PR for the same Issue, failure/retry paths that must never mark a
-task complete, single-instance lock contention, the global concurrency limit of
+task complete, a truncated PR listing failing closed, `enqueue` sharing the poll's
+exact rules, single-instance lock contention, the global concurrency limit of
 one, `dry-run` writing nothing, and state/log placement outside every repository.
 
 ---

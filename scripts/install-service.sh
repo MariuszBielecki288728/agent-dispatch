@@ -81,9 +81,11 @@ cmd_install() {
 
     local bin
     if ! bin="$(command -v agent-dispatch)"; then
-        log_fail "agent-dispatch is not on PATH. Install it first, e.g.:"
+        log_fail "agent-dispatch is not on PATH. Install it first (see docs/operations.md):"
         log_fail "  python3 -m venv ~/.local/share/agent-dispatch/venv"
-        log_fail "  ~/.local/share/agent-dispatch/venv/bin/pip install --user $REPO_ROOT"
+        log_fail "  ~/.local/share/agent-dispatch/venv/bin/pip install $REPO_ROOT"
+        log_fail "  mkdir -p ~/.local/bin"
+        log_fail "  ln -sf ~/.local/share/agent-dispatch/venv/bin/agent-dispatch ~/.local/bin/agent-dispatch"
         exit 1
     fi
 
@@ -126,25 +128,38 @@ cmd_status() {
     systemctl --user status "$UNIT_NAME" --no-pager || true
     echo
     log_info "lock file:"
+    # Read worker.lock_file from the TOML and expand ~ / $VARS for display only.
+    # The expansion happens inside Python on a value passed as an argv element, so
+    # configuration text is never interpreted as shell code.
     local lock_file
-    lock_file="$(python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
-import sys, tomllib
+    if ! lock_file="$(python3 - "$CONFIG_PATH" <<'PY'
+import os, sys, tomllib
+
 try:
     with open(sys.argv[1], "rb") as fh:
         cfg = tomllib.load(fh)
-    print(cfg.get("worker", {}).get("lock_file", ""))
 except Exception:
-    print("")
+    sys.exit(0)
+
+raw = cfg.get("worker", {}).get("lock_file", "")
+if raw:
+    print(os.path.expanduser(os.path.expandvars(raw)))
 PY
-)"
-    if [[ -n "$lock_file" ]]; then
+)"; then
+        log_warn "could not read worker.lock_file from $CONFIG_PATH"
+        return 0
+    fi
+
+    if [[ -z "$lock_file" ]]; then
+        log_warn "worker.lock_file is not set in $CONFIG_PATH"
+        return 0
+    fi
+
+    if [[ -f "$lock_file" ]]; then
         # The worker lock records only pid/timestamp/command — never credentials.
-        eval "lock_file=\"$lock_file\"" 2>/dev/null || true
-        if [[ -f "$lock_file" ]]; then
-            cat "$lock_file"
-        else
-            log_warn "no lock file at $lock_file (worker not running?)"
-        fi
+        cat "$lock_file"
+    else
+        log_warn "no lock file at $lock_file (worker not running?)"
     fi
     echo
     log_info "recent polls:"

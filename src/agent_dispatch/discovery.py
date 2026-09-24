@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .config import Config, RepoConfig
-from .github import MAX_PAGES, GitHubClient, GitHubError, Issue, PullRequest
+from .github import MAX_PAGES, ErrorKind, GitHubClient, GitHubError, Issue, PullRequest
 from .logging_setup import Logger
 from .store import Store, Task
 
@@ -46,10 +46,108 @@ class RepoDiscovery:
     error: str | None = None
     error_kind: str | None = None
     notes: list[str] = field(default_factory=list)
+    #: Issue number -> why it was not queued. Populated for every labelled Issue
+    #: the poll deliberately refused, so `enqueue` can report the same verdict the
+    #: poll reached instead of re-deriving one.
+    rejections: dict[int, str] = field(default_factory=dict)
+    #: Issue numbers for which this poll created the task row. Lets `enqueue`
+    #: distinguish "just queued" from "was already known" without guessing.
+    queued_issue_numbers: set[int] = field(default_factory=set)
 
     @property
     def failed(self) -> bool:
         return self.error is not None
+
+
+@dataclass(frozen=True)
+class IssueVerdict:
+    """Whether one Issue may be queued, and why not when it may not."""
+
+    queueable: bool
+    reason: str
+    message: str
+
+
+@dataclass(frozen=True)
+class RecordOutcome:
+    """What one :meth:`Discovery.evaluate_and_record` call decided and did.
+
+    ``action`` is a small closed set so callers count outcomes without matching on
+    log prose: ``queued``, ``requeued``, ``own_pr_reconciled``, ``observed_pr``,
+    ``needs_attention`` and ``unchanged``.
+    """
+
+    verdict: IssueVerdict
+    action: str
+    note: str | None = None
+
+
+#: Actions returned in :attr:`RecordOutcome.action`.
+ACTION_QUEUED = "queued"
+ACTION_REQUEUED = "requeued"
+ACTION_ALREADY_QUEUED = "already_queued"
+ACTION_OWN_PR_RECONCILED = "own_pr_reconciled"
+ACTION_OBSERVED_PR = "observed_pr"
+ACTION_NEEDS_ATTENTION = "needs_attention"
+ACTION_UNCHANGED = "unchanged"
+
+#: Actions meaning the Issue is (or remains) queued for dispatch. `enqueue`
+#: reports these as success; the poll treats them as ordinary progress.
+ACCEPTED_ACTIONS = frozenset({ACTION_QUEUED, ACTION_REQUEUED, ACTION_ALREADY_QUEUED})
+
+
+class RejectionReason:
+    """Stable reason codes, so callers never match on prose."""
+
+    PULL_REQUEST_OBJECT = "pull_request_object"
+    ISSUE_CLOSED = "issue_closed"
+    TRIGGER_LABEL_MISSING = "trigger_label_missing"
+    PRE_EXISTING_PR = "pre_existing_pr"
+    QUEUEABLE = "queueable"
+
+
+def evaluate_issue(
+    *,
+    issue: Issue,
+    trigger_label: str,
+    linked_pr: PullRequest | None,
+) -> IssueVerdict:
+    """The single decision used to decide whether an Issue may be queued.
+
+    Shared deliberately: the polling worker and the explicit ``enqueue`` command
+    must not each grow their own eligibility rules, because a divergence between
+    them is how duplicate implementation work gets scheduled (#4 consumes this
+    queue). This function decides only; see
+    :meth:`Discovery.evaluate_and_record` for the matching persistence.
+    """
+    if issue.is_pull_request:
+        return IssueVerdict(
+            False,
+            RejectionReason.PULL_REQUEST_OBJECT,
+            f"#{issue.number} is a pull request, not an Issue: GitHub's issues endpoint "
+            "answers for both, and a PR must never be queued as an Issue",
+        )
+    if issue.state == "closed":
+        return IssueVerdict(
+            False,
+            RejectionReason.ISSUE_CLOSED,
+            f"#{issue.number} is closed ({issue.url}); closed Issues are not queued",
+        )
+    if not issue.has_label(trigger_label):
+        return IssueVerdict(
+            False,
+            RejectionReason.TRIGGER_LABEL_MISSING,
+            f"#{issue.number} does not carry '{trigger_label}'; add the label first — "
+            "this service does not apply it silently",
+        )
+    if linked_pr is not None:
+        return IssueVerdict(
+            False,
+            RejectionReason.PRE_EXISTING_PR,
+            f"#{issue.number} already has PR #{linked_pr.number} ({_pr_state(linked_pr)}): "
+            "no new implementation task is created",
+        )
+    return IssueVerdict(True, RejectionReason.QUEUEABLE, f"#{issue.number} may be queued")
 
 
 @dataclass
@@ -78,8 +176,41 @@ class Discovery:
         """One full discovery pass over the allowlist."""
         result = DiscoveryResult()
         for slug in sorted(self.config.repos):
-            result.repos.append(self._poll_repo(self.config.repo(slug)))
+            result.repos.append(self.poll_repo(slug))
         return result
+
+    def poll_repo(self, slug: str) -> RepoDiscovery:
+        """Poll one allowlisted repository. Refuses unlisted slugs."""
+        return self._poll_repo(self.config.repo(slug))
+
+    def inspect_issue(self, repo: RepoConfig, issue_number: int) -> RecordOutcome:
+        """Address one Issue **by number** and record the decision.
+
+        Needed because the poll enumerates only *labelled* Issues: an operator
+        asking about a specific number may name a PR, a closed Issue, or an
+        unlabelled one, and each deserves its real reason rather than silence.
+
+        The PR link is resolved only when the Issue itself is otherwise eligible,
+        which avoids spending an extra listing on something already refused — and
+        ensures a refusal never clears a previously observed PR link.
+        """
+        issue = self.client.open_issue(repo.slug, issue_number)
+        trigger = self.config.github.trigger_label
+
+        if issue.is_pull_request or issue.state == "closed" or not issue.has_label(trigger):
+            return self.evaluate_and_record(repo, issue, None, linked_pr_known=False)
+
+        pulls = self.client.list_pulls(repo.slug)
+        if self.client.pr_scan_truncated:
+            # Fail closed, exactly as the poll does. `enqueue` must never queue an
+            # Issue whose pre-existing PR could not be ruled out.
+            raise GitHubError(
+                f"PR listing for {repo.slug} stopped at the {MAX_PAGES}-page cap, so a "
+                f"pre-existing PR for #{issue_number} cannot be ruled out",
+                kind=ErrorKind.INCOMPLETE_SCAN,
+            )
+        linked = _linked_pr(pulls, repo.slug, issue_number)
+        return self.evaluate_and_record(repo, issue, linked, linked_pr_known=True)
 
     # ------------------------------------------------------------ per-repo
 
@@ -112,12 +243,23 @@ class Discovery:
                 return outcome
 
             if self.client.pr_scan_truncated:
-                outcome.notes.append(
-                    f"{repo.slug}: PR listing hit the {MAX_PAGES}-page cap, so a pre-existing PR for a "
-                    "labelled Issue may not have been detected. Reduce the repository's open/closed PR "
-                    "volume or raise the per-page size; the worker will not guess."
+                # Fail closed. A truncated PR listing means a pre-existing PR for a
+                # labelled Issue may sit on a page we never read, so queueing now
+                # could duplicate existing work. Report and leave every task row
+                # exactly as it was — including previously observed PR links.
+                self._report_repo_failure(
+                    outcome,
+                    repo,
+                    GitHubError(
+                        f"PR listing for {repo.slug} stopped at the {MAX_PAGES}-page cap, so a "
+                        "pre-existing PR for a labelled Issue may not have been seen. No Issues "
+                        "were queued and no task state was changed. Reduce the repository's pull "
+                        "request volume (or raise the wrapper's page size) and let the next poll "
+                        "retry.",
+                        kind=ErrorKind.INCOMPLETE_SCAN,
+                    ),
                 )
-                self.log.warning("pr_scan_truncated", repo=repo.slug, pages=MAX_PAGES)
+                return outcome
 
         self._log_pagination_note(repo, issues, pulls)
 
@@ -125,104 +267,10 @@ class Discovery:
 
         for issue in sorted(issues, key=lambda item: item.number):
             linked = _linked_pr(pulls, repo.slug, issue.number)
-            adopted = self.store.get_task(repo.slug, issue.number)
-            # A PR recorded against this task is the one a future #4 run created;
-            # anything else is pre-existing work that must not be scheduled again.
-            is_own_pr = task_has_own_pr(adopted, linked)
-            if linked is not None and is_own_pr:
-                # This task already owns the PR (recorded by a future #4 run):
-                # refresh the observation and leave the task row untouched.
-                outcome.own_pr_reconciled += 1
-                self.store.record_observation(
-                    adopted.id,  # type: ignore[union-attr]
-                    trigger_present=True,
-                    issue_state=issue.state,
-                    linked_pr_number=linked.number,
-                    linked_pr_state=_pr_state(linked),
-                )
-                continue
-            if linked is not None and not is_own_pr:
-                # Pre-existing work: do not schedule an implementation task.
-                if adopted is None:
-                    created = self.store.upsert_discovered(
-                        repo=repo.slug,
-                        issue_number=issue.number,
-                        title=issue.title,
-                        base_branch=repo.base_branch,
-                        runtime_driver=repo.runtime.driver,
-                        runtime_model=repo.runtime.model,
-                        runtime_effort=repo.runtime.effort,
-                        permission_mode=repo.runtime.permission_mode,
-                        trigger_present=True,
-                        issue_state=issue.state,
-                        linked_pr_number=linked.number,
-                        linked_pr_state=_pr_state(linked),
-                        phase="awaiting_review",
-                        status_error=(
-                            f"pre-existing PR #{linked.number} ({_pr_state(linked)}) already exists for this "
-                            "Issue: no new implementation task was created"
-                        ),
-                    )
-                    if created:
-                        outcome.skipped_has_pr += 1
-                        self.log.info(
-                            "existing_pr_adopted",
-                            repo=repo.slug,
-                            issue=issue.number,
-                            pr=linked.number,
-                            pr_state=_pr_state(linked),
-                        )
-                else:
-                    if adopted.pr_number != linked.number:
-                        self.store.record_pr_adopted(
-                            adopted.id,
-                            linked.number,
-                            f"pre-existing PR #{linked.number} ({_pr_state(linked)}) detected for this Issue",
-                        )
-                    outcome.adopted += 1
-                continue
-
-            task = self.store.get_task(repo.slug, issue.number)
-            before_phase = task.phase if task is not None else None
-
-            created = self.store.upsert_discovered(
-                repo=repo.slug,
-                issue_number=issue.number,
-                title=issue.title,
-                base_branch=repo.base_branch,
-                runtime_driver=repo.runtime.driver,
-                runtime_model=repo.runtime.model,
-                runtime_effort=repo.runtime.effort,
-                permission_mode=repo.runtime.permission_mode,
-                trigger_present=True,
-                issue_state=issue.state,
-                linked_pr_number=None,
-                linked_pr_state=None,
+            record = self.evaluate_and_record(
+                repo, issue, linked, linked_pr_known=True
             )
-            if created:
-                outcome.queued += 1
-                self.log.info(
-                    "issue_queued",
-                    repo=repo.slug,
-                    issue=issue.number,
-                    title=_short(issue.title),
-                    phase="queued",
-                )
-            elif before_phase == "paused" and self.store.release_label_withdrawn_pause(task.id):
-                # The label came back and the task had been suspended by *this*
-                # rule (not by a maintainer pause), so it becomes dispatchable
-                # again using the existing row, branch and worktree.
-                outcome.requeued += 1
-                self.log.info(
-                    "trigger_restored",
-                    repo=repo.slug,
-                    issue=issue.number,
-                    phase="queued",
-                )
-            elif before_phase == "needs_attention":
-                outcome.notes.append(
-                    f"#{issue.number}: already recorded as needs_attention; leaving it for the maintainer"
-                )
+            self._count(outcome, issue, record)
 
         # Known tasks whose Issue is no longer returned by the trigger-label query
         # need their label state checked before anything is decided.
@@ -231,6 +279,182 @@ class Discovery:
             self._reconcile_withdrawn(repo, task, outcome)
 
         return outcome
+
+    def _count(self, outcome: RepoDiscovery, issue: Issue, record: RecordOutcome) -> None:
+        """Tally one decision into the repository outcome and log it."""
+        action = record.action
+        if action == ACTION_QUEUED:
+            outcome.queued += 1
+            outcome.queued_issue_numbers.add(issue.number)
+            self.log.info("issue_queued", issue=issue.number, title=_short(issue.title), phase="queued")
+        elif action == ACTION_REQUEUED:
+            outcome.requeued += 1
+            self.log.info("trigger_restored", issue=issue.number, phase="queued")
+        elif action == ACTION_ALREADY_QUEUED:
+            # Re-discovered on a later poll; already waiting for a dispatcher.
+            pass
+        elif action == ACTION_OWN_PR_RECONCILED:
+            outcome.own_pr_reconciled += 1
+        elif action == ACTION_OBSERVED_PR:
+            outcome.skipped_has_pr += 1
+            outcome.rejections[issue.number] = record.verdict.message
+        elif action == ACTION_NEEDS_ATTENTION:
+            outcome.notes.append(record.note or record.verdict.message)
+        elif record.note is not None:
+            outcome.notes.append(record.note)
+
+    # ------------------------------------------------------- shared recording
+
+    def evaluate_and_record(
+        self,
+        repo: RepoConfig,
+        issue: Issue,
+        linked_pr: PullRequest | None,
+        *,
+        linked_pr_known: bool = True,
+    ) -> RecordOutcome:
+        """Decide eligibility for one Issue **and** persist the decision.
+
+        This is the one implementation of "what happens to this Issue", used by
+        both the polling worker (``linked_pr_known=True``, having resolved the PR
+        link from a single listing) and the explicit ``enqueue`` command.
+
+        ``linked_pr_known=False`` means "the PR link was not resolved", which is
+        what an unlabelled or closed Issue looks like when addressed directly by
+        number. The verdict is then still a refusal, but it is derived from the
+        Issue itself rather than from an unresolved PR lookup, so the reported
+        reason is truthful instead of a guess.
+
+        Ownership is never taken here: ``tasks.pr_number`` is written only by the
+        #4 PR-creation/adoption workflow via ``Store.record_pr_ownership``. A PR
+        that merely references the Issue is stored as an *observation*, so a later
+        review round cannot act on someone else's pull request.
+        """
+        trigger = self.config.github.trigger_label
+
+        if not linked_pr_known:
+            verdict = evaluate_issue(issue=issue, trigger_label=trigger, linked_pr=None)
+            if verdict.queueable:
+                # Guard against a silent no-op: this mode exists to explain a
+                # refusal, and must not be used for an Issue that a PR lookup was
+                # supposed to have been performed for.
+                raise ValueError(
+                    "evaluate_and_record(linked_pr_known=False) requires an Issue that is "
+                    "already ineligible; resolve the PR link with linked_pr_known=True"
+                )
+            return RecordOutcome(verdict, ACTION_UNCHANGED, note=verdict.message)
+
+        existing = self.store.get_task(repo.slug, issue.number)
+        is_own_pr = task_has_own_pr(existing, linked_pr)
+
+        if linked_pr is not None and is_own_pr:
+            # This task already owns the PR (recorded by #4): refresh the
+            # observation and leave the task row itself untouched.
+            self.store.record_observation(
+                existing.id,  # type: ignore[union-attr]
+                trigger_present=issue.has_label(trigger),
+                issue_state=issue.state,
+                linked_pr_number=linked_pr.number,
+                linked_pr_state=_pr_state(linked_pr),
+            )
+            verdict = evaluate_issue(issue=issue, trigger_label=trigger, linked_pr=None)
+            return RecordOutcome(verdict, ACTION_OWN_PR_RECONCILED)
+
+        if linked_pr is not None:
+            verdict = evaluate_issue(issue=issue, trigger_label=trigger, linked_pr=linked_pr)
+            if existing is None:
+                self.store.upsert_discovered(
+                    repo=repo.slug,
+                    issue_number=issue.number,
+                    title=issue.title,
+                    base_branch=repo.base_branch,
+                    runtime_driver=repo.runtime.driver,
+                    runtime_model=repo.runtime.model,
+                    runtime_effort=repo.runtime.effort,
+                    permission_mode=repo.runtime.permission_mode,
+                    trigger_present=issue.has_label(trigger),
+                    issue_state=issue.state,
+                    linked_pr_number=linked_pr.number,
+                    linked_pr_state=_pr_state(linked_pr),
+                    phase="awaiting_review",
+                    status_error=verdict.message,
+                )
+                self.log.info(
+                    "existing_pr_adopted",
+                    repo=repo.slug,
+                    issue=issue.number,
+                    pr=linked_pr.number,
+                    pr_state=_pr_state(linked_pr),
+                )
+            else:
+                self.store.record_observation(
+                    existing.id,
+                    trigger_present=issue.has_label(trigger),
+                    issue_state=issue.state,
+                    linked_pr_number=linked_pr.number,
+                    linked_pr_state=_pr_state(linked_pr),
+                )
+            return RecordOutcome(verdict, ACTION_OBSERVED_PR)
+
+        verdict = evaluate_issue(issue=issue, trigger_label=trigger, linked_pr=None)
+        if not verdict.queueable:
+            # Closed, or the trigger label is gone. `enqueue` reaches this path;
+            # the poll normally does not, because it only enumerates labelled
+            # Issues. No row is created for an Issue that may not be queued.
+            return RecordOutcome(verdict, ACTION_UNCHANGED, note=verdict.message)
+
+        before_phase = existing.phase if existing is not None else None
+        created = self.store.upsert_discovered(
+            repo=repo.slug,
+            issue_number=issue.number,
+            title=issue.title,
+            base_branch=repo.base_branch,
+            runtime_driver=repo.runtime.driver,
+            runtime_model=repo.runtime.model,
+            runtime_effort=repo.runtime.effort,
+            permission_mode=repo.runtime.permission_mode,
+            trigger_present=True,
+            issue_state=issue.state,
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        if created:
+            return RecordOutcome(verdict, ACTION_QUEUED)
+
+        if before_phase == "paused" and self.store.release_label_withdrawn_pause(existing.id):  # type: ignore[union-attr]
+            # The label came back and the task had been suspended by *this* rule
+            # (not by a maintainer pause), so it becomes dispatchable again using
+            # the existing row, branch and worktree.
+            return RecordOutcome(verdict, ACTION_REQUEUED)
+
+        if before_phase == "awaiting_review":
+            # The PR that previously blocked this Issue is no longer visible. Say
+            # so instead of quietly re-queueing: a human decided the earlier state.
+            pr = existing.pr_number or existing.linked_pr_number  # type: ignore[union-attr]
+            return RecordOutcome(
+                verdict,
+                ACTION_NEEDS_ATTENTION,
+                note=(
+                    f"#{issue.number}: previously recorded awaiting_review with PR #{pr}, but no "
+                    "linked PR is visible now; left unchanged for the maintainer"
+                ),
+            )
+
+        if before_phase == "needs_attention":
+            return RecordOutcome(
+                verdict,
+                ACTION_NEEDS_ATTENTION,
+                note=f"#{issue.number}: already recorded as needs_attention; left for the maintainer",
+            )
+
+        if before_phase == "queued":
+            # Idempotent: the row exists and is already waiting for a dispatcher.
+            # This is a success for an explicit `enqueue`, not a rejection.
+            return RecordOutcome(verdict, ACTION_ALREADY_QUEUED)
+
+        return RecordOutcome(verdict, ACTION_UNCHANGED, note=f"#{issue.number}: already recorded as {before_phase}")
+
+    # ------------------------------------------------------------ per-repo
 
     def _reconcile_withdrawn(self, repo: RepoConfig, task: Task, outcome: RepoDiscovery) -> None:
         """Handle a known task whose Issue no longer carries the trigger label.

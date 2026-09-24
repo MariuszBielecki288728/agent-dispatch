@@ -173,8 +173,17 @@ def main(argv: list[str]) -> int:
     if endpoint is None:
         die("fake wrapper: no endpoint", 2)
 
+    # A configurable cap models a listing that ends before the data does, which is
+    # how a truncated scan is simulated: every page up to the cap comes back full.
     page = int(fields.get("page", "1"))
     per_page = int(fields.get("per_page", "100"))
+
+    # `FAKE_GH_PAD_FULL_PAGES=N` makes pages 1..N return exactly `per_page`
+    # synthetic entries, so the client always believes there is another page and
+    # runs until its own page cap — the only way to simulate a truncated listing
+    # without inventing thousands of real fixtures.
+    pad_pages = int(os.environ.get("FAKE_GH_PAD_FULL_PAGES", "0") or 0)
+
 
     if endpoint == "user":
         spec = consume_failure(world, "user")
@@ -263,7 +272,33 @@ def main(argv: list[str]) -> int:
             fail_with(spec)
         for issue in repo.get("issues", []):
             if int(issue["number"]) == number:
-                emit(issue, jq)
+                # GitHub's single-object endpoint answers for pull requests too,
+                # marking them with a `pull_request` field. A number that exists
+                # only in `pulls` is served here as such.
+                payload = dict(issue)
+                if number in {int(pr["number"]) for pr in repo.get("pulls", [])}:
+                    payload["pull_request"] = {
+                        "url": f"https://api.github.com/repos/{slug}/pulls/{number}"
+                    }
+                emit(payload, jq)
+                return 0
+        for pr in repo.get("pulls", []):
+            if int(pr["number"]) == number:
+                # A pull request is returned by the issues endpoint with the PR
+                # marker set and no labels, exactly as GitHub does.
+                emit(
+                    {
+                        "number": number,
+                        "title": pr.get("title", f"PR {number}"),
+                        "state": pr.get("state", "open"),
+                        "html_url": pr.get("html_url", ""),
+                        "labels": [],
+                        "pull_request": {
+                            "url": f"https://api.github.com/repos/{slug}/pulls/{number}"
+                        },
+                    },
+                    jq,
+                )
                 return 0
         die(f"gh: Not Found (HTTP 404) — issue {slug}#{number}", 1)
 
@@ -271,7 +306,26 @@ def main(argv: list[str]) -> int:
         spec = consume_failure(world, f"{slug}:pulls")
         if spec:
             fail_with(spec)
-        emit(paginate(repo.get("pulls", []), page, per_page), jq)
+        items = repo.get("pulls", [])
+        if pad_pages and page <= pad_pages:
+            # Return an exactly-full page so the client keeps paginating and
+            # eventually hits its own cap: a genuinely truncated listing.
+            real = items[:per_page]
+            filler = [
+                {
+                    "number": 900000 + (page - 1) * per_page + index,
+                    "state": "closed",
+                    "merged_at": None,
+                    "head": {"ref": f"noise/{page}-{index}"},
+                    "html_url": f"https://github.com/{slug}/pull/900000",
+                    "title": "unrelated filler",
+                    "body": "",
+                }
+                for index in range(len(real), per_page)
+            ]
+            emit(real + filler, jq)
+            return 0
+        emit(paginate(items, page, per_page), jq)
         return 0
 
     die(f"fake wrapper: unsupported endpoint {endpoint!r}", 2)

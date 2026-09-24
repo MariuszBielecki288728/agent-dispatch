@@ -27,7 +27,8 @@ from pathlib import Path
 from . import __version__
 from .config import Config, ConfigError, load_config
 from .doctor import run_doctor
-from .github import GitHubClient, GitHubError
+from .enqueue import enqueue_issue
+from .github import GitHubClient
 from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
 from .runlogs import prune
@@ -80,8 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", help="machine-readable output")
     status.add_argument("--no-sync", action="store_true", help="read local state only; make no API calls")
 
-    dry = subparsers.add_parser("dry-run", help="poll once and print decisions; writes nothing to disk or GitHub")
-    dry.add_argument("--no-sync", action="store_true", help="simulate against local state only; make no API calls")
+    dry = subparsers.add_parser(
+        "dry-run",
+        help="poll once and print decisions; writes nothing to disk or GitHub",
+    )
+    dry.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="report local state only; make no API calls",
+    )
 
     worker = subparsers.add_parser("worker", help="run the polling worker in the foreground")
     worker.add_argument("--interval", type=int, help="override worker.poll_interval_seconds")
@@ -265,8 +273,13 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
     The real database is mirrored into scratch memory read-only, so the simulated
     result matches a real poll while the state file is never opened for writing —
     and GitHub is only ever read.
+
+    ``--no-sync`` keeps the same "persist nothing" guarantee but skips the poll
+    entirely, so it makes **no API calls at all**. Without it, running the flag as
+    documented would still execute the configured GitHub wrapper.
     """
     scratch = Store.in_memory()
+    source = "empty (no state database yet)"
     if config.worker.state_db.is_file():
         existing = Store(config.worker.state_db, read_only=True)
         try:
@@ -274,11 +287,22 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
             scratch = existing.fork_to_memory()
         finally:
             existing.close()
-        log.info("dry_run_state_loaded", source=str(config.worker.state_db))
-    else:
-        log.info("dry_run_state_empty", source=str(config.worker.state_db))
+        source = str(config.worker.state_db)
 
     try:
+        tasks = scratch.list_tasks()
+        before = scratch.count_by_phase()
+
+        if args.no_sync:
+            log.info("dry_run_no_sync", note="local state only; the GitHub wrapper is not invoked")
+            print()
+            print("dry-run summary (local state only — no API calls, nothing written)")
+            print(f"  state : {source}")
+            print(f"  phases: {phase_summary(before)}")
+            print("  dispatchable now: suppressed (requires a poll to prove)")
+            print("  result: OK (no sync requested)")
+            return EXIT_OK
+
         worker = Worker(config, scratch, log, dry_run=True)
         outcome = worker.poll_once()
         after = scratch.count_by_phase()
@@ -360,53 +384,20 @@ def _cmd_worker(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
 
 def _cmd_enqueue(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Queue one Issue using the same decision path as the polling worker.
+
+    Deliberately not a second, simpler eligibility check: `enqueue` runs the real
+    discovery pass and reports its verdict, so it cannot queue an Issue that a poll
+    would refuse (a PR number, a closed Issue, a missing label, or an Issue that
+    already has a PR).
+    """
     repo = config.repo(args.repo)
     client = GitHubClient(config.github.command)
     store = Store(config.worker.state_db)
     try:
-        try:
-            issue = client.open_issue(repo.slug, args.issue)
-        except GitHubError as exc:
-            log.error("issue_unreadable", repo=repo.slug, issue=args.issue, kind=exc.kind, error=str(exc))
-            return EXIT_FAILURE
-
-        if issue.state == "closed":
-            log.error("issue_closed", repo=repo.slug, issue=args.issue, detail="closed Issues are not queued")
-            return EXIT_FAILURE
-
-        trigger = config.github.trigger_label
-        if not issue.has_label(trigger):
-            log.error(
-                "label_missing",
-                repo=repo.slug,
-                issue=args.issue,
-                label=trigger,
-                detail="add the trigger label first; this service does not apply it silently",
-            )
-            return EXIT_FAILURE
-
-        created = store.upsert_discovered(
-            repo=repo.slug,
-            issue_number=issue.number,
-            title=issue.title,
-            base_branch=repo.base_branch,
-            runtime_driver=repo.runtime.driver,
-            runtime_model=repo.runtime.model,
-            runtime_effort=repo.runtime.effort,
-            permission_mode=repo.runtime.permission_mode,
-            trigger_present=True,
-            issue_state=issue.state,
-            linked_pr_number=None,
-            linked_pr_state=None,
-        )
-        log.info(
-            "issue_enqueued" if created else "issue_already_queued",
-            repo=repo.slug,
-            issue=issue.number,
-            title=issue.title,
-        )
-        print(f"{repo.slug}#{issue.number}: {'queued' if created else 'already queued (row reused)'}")
-        return EXIT_OK
+        outcome = enqueue_issue(config, store, log, repo, args.issue, client=client)
+        print(outcome.message)
+        return EXIT_OK if outcome.accepted else EXIT_FAILURE
     finally:
         store.close()
 

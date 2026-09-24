@@ -57,6 +57,9 @@ class ErrorKind:
     NETWORK = "network"
     TIMEOUT = "timeout"
     MALFORMED = "malformed_response"
+    #: A listing was cut short by :data:`MAX_PAGES`, so an absence of results
+    #: cannot be proved. Treated as a failure rather than as "nothing found".
+    INCOMPLETE_SCAN = "incomplete_scan"
     UNKNOWN = "unknown"
 
 
@@ -81,6 +84,10 @@ class Issue:
     state: str
     url: str
     labels: tuple[str, ...] = ()
+    #: GitHub's issues endpoint returns pull requests too, distinguished only by a
+    #: ``pull_request`` marker. It is captured here because discarding it is how a
+    #: PR number gets mistaken for an Issue (see ``open_issue``).
+    is_pull_request: bool = False
 
     def has_label(self, label: str) -> bool:
         return label in self.labels
@@ -337,6 +344,13 @@ class GitHubClient:
         return pulls
 
     def open_issue(self, slug: str, issue_number: int) -> Issue:
+        """Fetch one object by number, flagging it when it is actually a PR.
+
+        ``GET /repos/{slug}/issues/{n}`` answers for **both** Issues and pull
+        requests, so the ``pull_request`` marker is preserved on the returned
+        :class:`Issue`. Callers must refuse ``is_pull_request`` objects rather
+        than treating a PR number as an Issue.
+        """
         raw = self._run_json(["api", f"repos/{slug}/issues/{issue_number}"])
         if not isinstance(raw, dict):
             raise GitHubError(
@@ -374,6 +388,7 @@ class GitHubClient:
                 )
             collected.extend(data)
             if len(data) < self.per_page:
+                # A short page proves the listing ended.
                 break
             page += 1
         else:
@@ -457,6 +472,7 @@ def _to_issue(raw: dict[str, Any]) -> Issue:
         state=str(raw.get("state") or "unknown"),
         url=str(raw.get("html_url") or ""),
         labels=labels,
+        is_pull_request="pull_request" in raw,
     )
 
 
