@@ -337,6 +337,10 @@ class Orchestrator:
             repo_slug=repo.slug,
             credential_helper=self.config.github.credential_helper,
             write_repo_local_config=self.config.worker.write_repo_local_credentials,
+            commit_identity=(
+                self.config.worker.commit_identity_name,
+                self.config.worker.commit_identity_email,
+            ),
         )
 
         try:
@@ -914,6 +918,10 @@ class Orchestrator:
                 repo_slug=repo.slug,
                 credential_helper=self.config.github.credential_helper,
                 write_repo_local_config=self.config.worker.write_repo_local_credentials,
+                commit_identity=(
+                    self.config.worker.commit_identity_name,
+                    self.config.worker.commit_identity_email,
+                ),
             )
             state = manager.inspect(Path(task.worktree_path), task.branch)
             detail = (

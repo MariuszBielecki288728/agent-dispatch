@@ -602,6 +602,7 @@ completed:
 | Issue or PR deleted mid-poll | the task is left unchanged and reported; nothing is guessed |
 | Runtime binary missing | `dispatch_unavailable` once, per poll; **no task is claimed**, so a queued Issue is not consumed by a configuration fault |
 | Push failed | the branch is re-checked on the remote before the failure is believed, so an already-pushed branch (a crash window) is not reported as a push failure |
+| Dispatcher's own commit failed | the run is still recorded as successful, and the reason is logged; the branch then has no new commits, so the produced-work evaluation is what decides whether a PR is opened |
 | PR lookup failed after a push | the branch is kept, the task becomes `needs_attention`, and the next `run` adopts or creates the PR without re-running the agent |
 | PR creation failed | recorded as a recoverable intent; the next `run` adopts the PR if GitHub did create it |
 
@@ -639,6 +640,25 @@ operator action, not a side effect of a task ending.
 ---
 
 ## 12. Credentials and security posture
+
+### Commits the dispatcher makes itself
+
+When the agent leaves its work uncommitted, the dispatcher commits it so the branch
+can be pushed. That commit is made with an **explicit** identity
+(`worker.commit_identity_name`/`commit_identity_email`, applied as `git -c`), never
+the ambient `user.email`:
+
+```toml
+commit_identity_name = "agent-dispatch"
+commit_identity_email = "agent-dispatch@localhost"
+```
+
+This is not cosmetic. A machine with no configured Git identity fails the commit
+with exit 128 (`Author identity unknown`), so the finished work never reaches the
+branch — and because a development VM usually *does* have `user.email` set, the
+failure appears only somewhere else, such as CI. Point the email at your GitHub
+noreply address if you want those commits attributed to you; leaving it as the
+default keeps the honesty that they were made by the service, not by you.
 
 ### The credential ordering is not optional
 

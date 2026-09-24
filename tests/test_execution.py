@@ -645,6 +645,140 @@ class EndToEndExecutionTests(ExecutionCase):
         self.assertEqual(show.returncode, 0, show.stderr)
         self.assertEqual(show.stdout.strip(), "done")
 
+    def test_the_dispatchers_commit_does_not_depend_on_ambient_git_identity(self) -> None:
+        """The dispatcher must be able to commit on a machine with no Git identity.
+
+        This is a regression test for a CI-only failure. This dev VM happens to have
+        `user.email` set globally, so `git commit` worked here, while a clean runner
+        has none and the commit failed with exit 128 ("Author identity unknown"). The
+        finished work then never reached the branch: a silent, environment-dependent
+        failure of the entire PR step, invisible on the machine it was written on.
+
+        Git config is isolated from every level (system, global, repo), `HOME` and
+        `XDG_CONFIG_HOME` point at an empty directory, and the
+        `GIT_AUTHOR_*`/`GIT_COMMITTER_*` variables are cleared, so the subprocess
+        environment faithfully resembles the runner that exposed this.
+        """
+        bare_home = self.tmp / "bare-home"
+        bare_home.mkdir()
+        self.world.env_overrides.update(
+            {
+                "HOME": str(bare_home),
+                "XDG_CONFIG_HOME": str(bare_home / ".config"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(bare_home / "no-such-gitconfig"),
+                "GIT_CONFIG_SYSTEM": str(bare_home / "no-such-system-gitconfig"),
+            }
+        )
+        # Deliberately REMOVED rather than set to "": an empty GIT_AUTHOR_NAME is an
+        # identity override that outranks `-c user.name`, so setting it would make the
+        # commit fail with "empty ident name" for a reason unrelated to this bug.
+        for variable in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ):
+            self.world.env_overrides[variable] = None
+        self.set_issues(issue(1, "No identity anywhere", labels=[TRIGGER]))
+        result = self.run_cli("run")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "awaiting_review")
+
+        # The work really reached the branch, committed under the configured identity
+        # rather than a failing ambient lookup.
+        import subprocess
+
+        show = subprocess.run(
+            ["git", "-C", str(self.remote), "show", f"{task.branch}:impl.txt"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+        author = subprocess.run(
+            ["git", "-C", str(self.remote), "log", "-1", "--format=%an <%ae>", task.branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(author.stdout.strip(), "agent-dispatch <agent-dispatch@localhost>")
+
+    def test_a_commit_with_no_identity_configured_anywhere_still_succeeds(self) -> None:
+        # The narrow unit-level version of the above: Git is given nothing ambient
+        # to fall back on, so only the explicit -c identity can make this commit work.
+        from agent_dispatch.gitcmd import Git
+        from agent_dispatch.worktree import WorktreeManager
+
+        bare_home = self.tmp / "no-git-identity-home"
+        bare_home.mkdir()
+        git = Git(
+            env={
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(bare_home / "nonexistent-gitconfig"),
+            }
+        )
+        # Prove the environment really has no usable identity before asserting that
+        # the manager can commit anyway, so this cannot pass for the wrong reason.
+        probe = git.run(["var", "GIT_AUTHOR_IDENT"], cwd=self.source)
+        self.assertFalse(probe.ok, "the probe environment must have no Git identity")
+        self.assertIn(
+            "identity",
+            probe.stderr.lower(),
+            "the probe must fail for an *absent* identity, not some other reason",
+        )
+
+        manager = WorktreeManager(
+            git,
+            source_path=self.source,
+            worktree_root=self.tmp / "identity-worktrees",
+            base_branch="main",
+            repo_slug=self.slug,
+            commit_identity=("agent-dispatch", "agent-dispatch@localhost"),
+        )
+        outcome = manager.ensure(issue_number=9, title="Identity test")
+        (outcome.state.path / "new-file.txt").write_text("work\n", encoding="utf-8")
+
+        committed, note = manager.commit_all(outcome.state.path, outcome.state.branch, "msg")
+        self.assertTrue(committed, note)
+        subject = git.run(["log", "-1", "--format=%an <%ae>"], cwd=outcome.state.path)
+        self.assertEqual(subject.stdout.strip(), "agent-dispatch <agent-dispatch@localhost>")
+
+    def test_a_commit_without_a_configured_identity_fails_loudly(self) -> None:
+        # The counterpart: when the operator clears the identity, the failure is
+        # reported rather than swallowed, so the cause is visible instead of the
+        # work silently not reaching the branch.
+        from agent_dispatch.gitcmd import Git
+        from agent_dispatch.worktree import WorktreeManager
+
+        bare_home = self.tmp / "no-git-identity-home-2"
+        bare_home.mkdir()
+        git = Git(
+            env={
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(bare_home / "nonexistent-gitconfig"),
+            }
+        )
+        manager = WorktreeManager(
+            git,
+            source_path=self.source,
+            worktree_root=self.tmp / "identity-worktrees-2",
+            base_branch="main",
+            repo_slug=self.slug,
+        )
+        outcome = manager.ensure(issue_number=10, title="No identity")
+        (outcome.state.path / "new-file.txt").write_text("work\n", encoding="utf-8")
+
+        committed, note = manager.commit_all(outcome.state.path, outcome.state.branch, "msg")
+        self.assertFalse(committed)
+        self.assertIn("commit failed", note)
+
     def _remote_branches(self) -> list[str]:
         import subprocess
 

@@ -64,6 +64,21 @@ run_log_dir = "~/.local/state/agent-dispatch/runs"
 # Bounded retention for run logs (count-based pruning).
 run_log_keep = 50
 
+# Author identity for commits the ORCHESTRATOR makes itself — specifically when the
+# agent leaves its changes uncommitted and the dispatcher commits them so the branch
+# can be pushed.
+#
+# Applied per-invocation with `git -c`, so it neither depends on nor writes to your
+# ambient Git config. That independence is the point: a machine with no `user.email`
+# configured fails such a commit with exit 128 ("Author identity unknown"), and the
+# finished work then silently never reaches the branch — a failure that only shows
+# up on a machine other than the one it was written on.
+#
+# These commits are machine work, so the defaults say so. Set the email to your
+# GitHub noreply address if you would rather they be attributed to you.
+commit_identity_name = "agent-dispatch"
+commit_identity_email = "agent-dispatch@localhost"
+
 # Single-process lock; prevents accidentally running two workers.
 lock_file = "~/.local/state/agent-dispatch/worker.lock"
 

@@ -104,6 +104,7 @@ class WorktreeManager:
         repo_slug: str,
         credential_helper: str | None = None,
         write_repo_local_config: bool = False,
+        commit_identity: tuple[str, str] | None = None,
     ) -> None:
         self.git = git
         self.source_path = Path(source_path)
@@ -111,6 +112,11 @@ class WorktreeManager:
         self.base_branch = base_branch
         self.repo_slug = repo_slug
         self.credential_helper = credential_helper
+        #: Identity for commits this manager makes itself, applied per-invocation
+        #: with ``-c`` so it neither depends on nor modifies ambient Git config.
+        #: Relying on ambient ``user.email`` is how a correct commit silently fails
+        #: on a fresh machine with exit 128, stranding finished work off the branch.
+        self.commit_identity = commit_identity
         #: OFF by default. Writing the reset-then-wrapper sequence into the clone's
         #: config also edits the *shared* Git common config of every worktree that
         #: clone owns — which is fine for a dedicated orchestrator clone and not
@@ -323,6 +329,10 @@ class WorktreeManager:
             return False, f"git add -A failed: {staged.stderr.strip()}"
 
         message_path = None
+        identity: list[str] = []
+        if self.commit_identity:
+            name, email = self.commit_identity
+            identity = ["-c", f"user.name={name}", "-c", f"user.email={email}"]
         try:
             import tempfile
 
@@ -331,7 +341,7 @@ class WorktreeManager:
             ) as handle:
                 handle.write(message if message.endswith("\n") else message + "\n")
                 message_path = handle.name
-            commit = self.git.run(["commit", "-F", message_path], cwd=path)
+            commit = self.git.run([*identity, "commit", "-F", message_path], cwd=path)
         finally:
             if message_path:
                 Path(message_path).unlink(missing_ok=True)

@@ -67,7 +67,7 @@ class FakeWorld:
         repos: dict[str, dict],
         *,
         labels: list[str] | None = None,
-        env_overrides: dict[str, str] | None = None,
+        env_overrides: dict[str, str | None] | None = None,
     ) -> None:
         self.root = root
         self.world_path = root / "world.json"
@@ -76,7 +76,9 @@ class FakeWorld:
         self.repo_path = root / "checkout"
         (self.repo_path / ".git").mkdir(parents=True, exist_ok=True)
         #: Extra environment for the fake wrapper, e.g. to force a truncated scan.
-        self.env_overrides: dict[str, str] = dict(env_overrides or {})
+        #: A value of ``None`` REMOVES the variable from the child environment; a
+        #: value of "" sets it to empty, which is a different thing entirely.
+        self.env_overrides: dict[str, str | None] = dict(env_overrides or {})
 
         payload: dict[str, object] = {"identity": "fake-user", "repos": {}}
         for slug, repo in repos.items():
@@ -193,7 +195,14 @@ max_turns = 40
         env["PYTHONPATH"] = str(SRC)
         # Clear any padding left over from another test, then apply overrides.
         env.pop("FAKE_GH_PAD_FULL_PAGES", None)
-        env.update(self.env_overrides)
+        for key, value in self.env_overrides.items():
+            if value is None:
+                # Unset, not blank. A variable set to "" is an *override* to a child
+                # process (an empty GIT_AUTHOR_NAME outranks `-c user.name`), so a
+                # test that needs a variable gone must be able to remove it.
+                env.pop(key, None)
+            else:
+                env[key] = value
         return env
 
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:

@@ -72,6 +72,8 @@ class WorkerConfig:
     lock_file: Path
     commandcode_path: str | None
     write_repo_local_credentials: bool
+    commit_identity_name: str
+    commit_identity_email: str
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,15 @@ def _build(raw: dict[str, Any], source_path: Path) -> Config:
         # its clone's common config and that may be a personal checkout. The
         # credential env pairs cover orchestrator and agent Git without it.
         write_repo_local_credentials=bool(worker_raw.get("write_repo_local_credentials", False)),
+        # Identity for commits the ORCHESTRATOR makes itself (committing what the
+        # agent left uncommitted). Passed per-invocation with `-c`, so it never
+        # depends on — or writes to — ambient Git config. Without this, a machine
+        # with no `user.email` configured fails the commit with exit 128 and the
+        # finished work never reaches the branch. Defaults are honest about being
+        # machine commits; point them at your GitHub noreply address if you want
+        # them attributed to you.
+        commit_identity_name=worker_raw.get("commit_identity_name", "agent-dispatch"),
+        commit_identity_email=worker_raw.get("commit_identity_email", "agent-dispatch@localhost"),
     )
 
     github = GithubConfig(
