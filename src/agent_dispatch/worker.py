@@ -6,18 +6,20 @@ task total** (``docs/architecture.md`` §3, §8). The loop:
 ```
 reconcile + discover: take-it Issues for every allowlisted repo
 persist queue state (idempotent)
-report what is queued and why nothing is dispatched
+if a task is eligible and nothing is running: execute it through to one PR   (#4)
 sleep(poll_interval_seconds)
 ```
 
-Issue #3 is explicit that discovery and queueing **do not** dispatch anything.
-The phases this release can produce are ``queued``, ``paused``, ``finished`` and
-``needs_attention``; ``running``/``awaiting_review`` belong to #4, and ``status``
-says so rather than implying an implementation exists.
+Issue #3 established that discovery alone queues nothing to GitHub and never
+executes. Issue #4 adds execution, but keeps the two responsibilities separate:
+this module still owns polling and reporting, while every decision about *running*
+an agent lives in :class:`~agent_dispatch.orchestrator.Orchestrator` — including
+the atomic claim, so a stale poll can never authorize a run.
 
-The worker does not own the lock or the store: the caller (CLI or tests) does.
-That keeps the loop testable and makes "two workers cannot share one lock"
-provable without a second loop implementation.
+``reconcile=False`` (used by ``dry-run``/``status``) performs the poll and reports
+what *would* be dispatched, but never starts an agent. That guarantee comes from
+the read-only scratch store, not from this flag: the flag decides whether to ask
+for execution at all, while the store makes the write impossible.
 """
 
 from __future__ import annotations
@@ -30,7 +32,9 @@ from .config import Config
 from .discovery import Discovery, DiscoveryResult
 from .github import GitHubClient, GitHubError
 from .logging_setup import Logger
+from .orchestrator import DispatchOutcome, Orchestrator
 from .runlogs import prune
+from .runtime import CommandCodeDriver, RuntimeSpawnError
 from .store import Store, phase_summary
 
 
@@ -44,6 +48,8 @@ class PollOutcome:
     before: dict[str, int] = field(default_factory=dict)
     after: dict[str, int] = field(default_factory=dict)
     dispatchable: list[str] = field(default_factory=list)
+    #: Set only when this poll actually executed a task (never in a simulated poll).
+    dispatch: DispatchOutcome | None = None
 
     @property
     def ok(self) -> bool:
@@ -60,6 +66,8 @@ class Worker:
         log: Logger,
         *,
         reconcile: bool = True,
+        execute: bool = False,
+        client: GitHubClient | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -70,6 +78,13 @@ class Worker:
         #: store is the guarantee. Previously named ``dry_run``, which implied a
         #: safety it did not provide on its own.
         self.reconcile = reconcile
+        #: Whether an eligible task may actually be executed. **OFF by default**, so
+        #: that discovering, testing or embedding this loop cannot spend model
+        #: credits or mutate GitHub as a side effect of a poll. The operator-facing
+        #: ``worker`` command turns it on explicitly, which is where the intent to
+        #: run an agent is actually expressed.
+        self.execute = execute and reconcile
+        self._client = client
         self._stop = False
 
     # -------------------------------------------------------------- the loop
@@ -102,10 +117,10 @@ class Worker:
         return 0
 
     def poll_once(self) -> PollOutcome:
-        """A single discovery + reconcile cycle. Never starts an agent."""
+        """A single discovery + reconcile cycle, then at most one agent run."""
         started = time.monotonic()
         before = self.store.count_by_phase()
-        client = GitHubClient(self.config.github.command, timeout_seconds=60.0)
+        client = self._client or GitHubClient(self.config.github.command, timeout_seconds=60.0)
 
         # Preflight the one thing that can be verified locally and cheaply: the
         # wrapper exists and is executable. A missing wrapper is a configuration
@@ -153,13 +168,29 @@ class Worker:
             dispatchable=len(dispatchable),
         )
 
-        if dispatchable and self.store.active_task_count() == 0 and self.reconcile:
-            # Truthful statement of scope: this release queues, it does not execute.
+        if dispatchable and self.store.active_task_count() == 0 and not self.reconcile:
+            # A simulated poll reports what it would do; it never does it.
             self.log.info(
-                "dispatch_deferred",
-                reason="agent execution is Issue #4 scope; this service only queues",
+                "dispatch_simulated",
+                reason="simulated poll: no agent is started and no state is written",
                 tasks=",".join(dispatchable[:10]),
             )
+
+        dispatch: DispatchOutcome | None = None
+        if self.execute and dispatchable and self.store.active_task_count() == 0:
+            # A missing runtime is a *configuration* fault, exactly like a missing
+            # GitHub wrapper: it is reported once and touches no task state. Without
+            # this check the first task would be claimed and marked `failed` for a
+            # reason that is not about the task at all.
+            runtime_problem = self._runtime_preflight()
+            if runtime_problem:
+                self.log.error("dispatch_unavailable", detail=runtime_problem)
+            else:
+                # The decision to run belongs to the orchestrator, which re-validates
+                # against GitHub and claims the task under a conditional transition.
+                # This list is only a hint that something *might* be runnable.
+                dispatch = Orchestrator(self.config, self.store, client, self.log).dispatch_next()
+                self.log.info("dispatch_result", action=dispatch.action, detail=dispatch.summary())
 
         if self.reconcile:
             try:
@@ -169,7 +200,33 @@ class Worker:
             except OSError as exc:  # pragma: no cover - retention is best effort
                 self.log.debug("run_log_prune_failed", error=str(exc))
 
-        return PollOutcome(result=result, before=before, after=after, dispatchable=dispatchable)
+        return PollOutcome(
+            result=result,
+            before=before,
+            after=self.store.count_by_phase(),
+            dispatchable=dispatchable,
+            dispatch=dispatch,
+        )
+
+    def _runtime_preflight(self) -> str | None:
+        """Why the agent runtime cannot be started right now, or ``None``.
+
+        Uses the driver's own resolved binary rather than a bare ``which``, so this
+        check cannot disagree with what an actual run would try to spawn.
+        """
+        try:
+            CommandCodeDriver(
+                next(iter(self.config.repos.values())).runtime,
+                run_log_dir=self.config.worker.run_log_dir,
+                repo="preflight",
+                issue_number=0,
+                binary=self.config.worker.commandcode_path or "commandcode",
+            ).check_available()
+        except RuntimeSpawnError as exc:
+            return str(exc)
+        except StopIteration:  # pragma: no cover - configuration forbids zero repos
+            return "no repositories configured"
+        return None
 
     # ------------------------------------------------------------- signals
 

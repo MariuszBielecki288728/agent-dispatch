@@ -143,7 +143,8 @@ def _check_wrapper(
         report.add(
             "credential_helper",
             "ok",
-            "reset-then-wrapper ordering configured (used by #4 for Git operations; not exercised here)",
+            "reset-then-wrapper ordering configured (applied via inherited GIT_CONFIG_* "
+            "pairs to orchestrator Git and to the agent subprocess)",
         )
 
     if skip_github:
@@ -206,16 +207,14 @@ def _check_runtime_binary(config: Config, report: DoctorReport) -> None:
     configured = config.worker.commandcode_path
     found = shutil.which(configured) if configured else shutil.which("commandcode")
     if found:
-        report.add(
-            "agent_runtime",
-            "ok",
-            f"{found} (present; invocation is Issue #4 scope and is NOT exercised here)",
-        )
+        report.add("agent_runtime", "ok", f"{found} (will be invoked in each owned worktree)")
     else:
         report.add(
             "agent_runtime",
-            "warn",
-            "commandcode not found on PATH; not required for Issue #3, which runs no agent",
+            "fail",
+            "commandcode not found; `run`/`worker` cannot dispatch anything. Set "
+            "worker.commandcode_path or install the runtime. Queueing is unaffected, and a "
+            "missing runtime never marks a task failed.",
         )
 
 

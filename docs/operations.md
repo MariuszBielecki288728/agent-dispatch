@@ -1,8 +1,34 @@
-# agent-dispatch — operations (Issue #3)
+# agent-dispatch — operations (Issues #3–#4)
 
-Operator guide for the MVP foundation: an installable CLI, one polling worker, one
-SQLite queue. **This release queues work; it does not run an agent, create
-worktrees, push branches or open PRs** (Issues #4/#5).
+Operator guide for the MVP loop: an installable CLI, one polling worker, one
+SQLite queue, and **one Command Code run per task in a task-owned Git worktree,
+ending in exactly one pull request**. The `agent:fix` review loop is Issue #5 and
+is not implemented here (§11).
+
+---
+
+## 0. What actually happens to a `take-it` Issue
+
+```
+poll finds a labelled Issue            -> task row, phase `queued`
+claim (conditional SQL transition)     -> phase `running`, branch + worktree recorded
+Command Code runs in the worktree      -> session ID pinned to the row
+run validated                          -> blocked tools / bad session / timeout all FAIL
+changes committed if the agent left them uncommitted
+branch pushed with the approved credential helper
+one PR created (or an existing one adopted)  -> phase `awaiting_review`
+```
+
+Three things a reader should not assume:
+
+* **`--yolo` is a trust choice, not a sandbox.** The agent runs as your user with
+  broad file and shell access. A worktree is Git isolation only — see §12.
+* **A `subtype=success` exit is not proof of work.** A run whose tool calls were
+  refused still reports success with exit 0. `agent-dispatch` scans for the
+  `tool_hook_blocked` event and fails the run (§9).
+* **An interrupted run is not resumable.** Command Code writes a session
+  transcript only on a clean completion, so a retry starts a *fresh* session in the
+  same worktree with the existing edits preserved (§7).
 
 ---
 
@@ -254,7 +280,68 @@ allowlist are accepted, and nothing outside them is ever modified.
 agent-dispatch worker                      # polls every worker.poll_interval_seconds
 agent-dispatch worker --interval 60        # override the interval
 agent-dispatch worker --once               # a single poll, then exit
+agent-dispatch worker --once --no-execute  # diagnose the queue without running an agent
 ```
+
+**`worker` executes an eligible task.** That is the point of this release: the
+poll both discovers work and dispatches it. Two ways to keep it queue-only:
+
+* `--no-execute` — discover, queue and report, but start no agent;
+* `dry-run` / `status` — read-only, and they never execute at all.
+
+A missing `commandcode` binary is reported once as `dispatch_unavailable` and
+**touches no task state**; it is a configuration fault, not a task failure, so a
+queued Issue is not consumed by it.
+
+### One task at a time, globally
+
+The MVP allows **one active task across all repositories**. Two mechanisms enforce
+it, and only both together are sufficient:
+
+1. the single-instance `flock` — a second worker (or `agent-dispatch run`) exits 3
+   (`EXIT_BUSY`) rather than starting a competing agent;
+2. the claim itself — a conditional SQL `UPDATE ... WHERE phase = 'queued'`, so
+   even within one process only one task can move to `running`.
+
+### `run` — execute one task now
+
+```bash
+agent-dispatch run                                   # poll, then execute the oldest eligible task
+agent-dispatch run --skip-poll                       # use the existing queue state
+agent-dispatch run --repo owner/name --issue 12      # target one task (still re-validated)
+```
+
+`run` takes the same lock as the worker, polls first unless `--skip-poll` is given,
+repairs crash-interrupted state, and then dispatches **at most one** task.
+`--repo/--issue` selects a task; it does not bypass eligibility — a paused, failed,
+closed or already-owned task is refused with its real reason.
+
+Exit codes: `0` success or a legitimate refusal with a reason, `1` a failed run,
+`2` usage error, `3` the lock is held by another process.
+
+### `open` — inspect a task by hand
+
+```bash
+agent-dispatch open --repo owner/name --issue 12
+```
+
+Prints the phase, owned branch/worktree, owned PR vs. observed PR, pinned
+runtime, attempt count, session ID, whether that session is resumable, and each
+recorded run with its outcome and log path. It is read-only (it opens the state
+database without write access), so it can never create or migrate it.
+
+To inspect or resume a session interactively, copy the two lines it prints:
+
+```bash
+cd <worktree_path>
+commandcode --session <session_id>
+```
+
+Do this in the integrated terminal of a VS Code Remote SSH window if you want the
+session in a GUI; no native VS Code Chat handoff is claimed, and the CLI session
+is the supported interface. **Do not resume a session that `open` reports as not
+resumable** — an interrupted run has no transcript and the resume will fail with
+`neither an existing .jsonl transcript nor a known session-id prefix`.
 
 ### systemd --user (recommended; no VS Code window needed)
 
@@ -290,10 +377,13 @@ released, and the process exits 0.
 ## 6. Day-to-day commands
 
 ```bash
-agent-dispatch status                 # poll, then show every task and why it is/ isn't dispatchable
+agent-dispatch status                 # poll, then show every task and why it is/isn't dispatchable
 agent-dispatch status --no-sync       # local state only (no API calls)
 agent-dispatch status --json          # machine-readable
 agent-dispatch dry-run                # one poll that writes NOTHING to disk or GitHub
+agent-dispatch run                    # execute one queued task through to a PR
+agent-dispatch run --repo owner/name --issue 12
+agent-dispatch open --repo owner/name --issue 12
 agent-dispatch enqueue --repo owner/name --issue 12
 agent-dispatch pause   --repo owner/name --issue 12
 agent-dispatch unpause --repo owner/name --issue 12
@@ -313,24 +403,33 @@ unreachable or you deliberately want to avoid touching the API.
 **`status` is observability, and never writes.** It does not create or migrate the
 state database, and it does not become a second, unsynchronised writer competing
 with the worker that owns the single-instance lock (which `status` does not take).
+Neither `status` nor `dry-run` can start an agent: they poll against a **scratch
+copy** of the database, and the only object that can execute a task is the
+orchestrator holding a writable store.
 
-| Command | Reads | Makes API calls | Persists |
-|---|---|---|---|
-| `status --no-sync` | on-disk state directly | no | nothing |
-| `status` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing |
-| `dry-run --no-sync` | on-disk state | no | nothing |
-| `dry-run` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing |
-| `worker` | — | yes | **yes** — the only command that does |
+| Command | Reads | Makes API calls | Persists | Runs an agent |
+|---|---|---|---|---|
+| `status --no-sync` | on-disk state directly | no | nothing | no |
+| `status` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing | no |
+| `dry-run --no-sync` | on-disk state | no | nothing | no |
+| `dry-run` | on-disk state, then a poll against a scratch copy | yes (read-only) | nothing | no |
+| `open` | on-disk state (read-only connection) | no | nothing | no |
+| `worker --once --no-execute` | — | yes | **yes** | no |
+| `enqueue` / `pause` / `unpause` / `retry` | — | yes (`enqueue` only) | **yes** | no |
+| `worker` | — | yes | **yes** | **yes** |
+| `run` | — | yes | **yes** | **yes** |
 
 So `status` and `dry-run` show what the queue *would* look like; the on-disk state
 they report only advances when the worker (or an explicit `enqueue`/`pause`/
 `unpause`/`retry`) runs. If a sync is incomplete, `status` says so and falls back to
 showing on-disk state rather than presenting a partial poll as authoritative.
 
-**`enqueue` is not a shortcut around the rules.** It addresses one Issue by number
-and applies exactly the same decision the poll applies, so it refuses a PR number,
-a closed Issue, an unlabelled Issue, or an Issue that already has a PR. Re-running
-it on an already-queued Issue is a success that reuses the existing row.
+**`enqueue` is not a shortcut around the rules, and it never executes.** It
+addresses one Issue by number and applies exactly the same decision the poll
+applies, so it refuses a PR number, a closed Issue, an unlabelled Issue, or an Issue
+that already has a PR. Re-running it on an already-queued Issue is a success that
+reuses the existing row. It is the safe way to put a task in the queue ahead of the
+next poll, or to test eligibility without spending a model call.
 
 ### Pause semantics (important)
 
@@ -353,32 +452,52 @@ refused with a clear message rather than silently doing nothing.
 
 ## 7. What `status` means
 
-Phases this release can produce: `queued`, `paused`, `finished`, `needs_attention`.
+Phases: `queued`, `running`, `awaiting_review`, `paused`, `failed`,
+`needs_attention`, `finished`. (`feedback_queued` arrives with #5.)
 
-**No task is promoted to `running`.** Discovery and queueing are not evidence that
-anything was implemented; `status` states this explicitly rather than implying an
-agent ran. `running`, `awaiting_review` and `feedback_queued` become reachable in
-#4/#5.
+A task is **dispatchable** only when the Issue is open, it still carries `take-it`,
+no relevant PR already exists for it, this worker does not already own a PR for it,
+and its phase is `queued`. Otherwise `status` prints the specific blocker.
 
-A task is **dispatchable** only when all of these hold: the Issue is open, it
-still carries `take-it`, no relevant PR already exists for it, and its phase is
-`queued`. Otherwise `status` prints the specific blocker.
+That check is a cheap **local** pre-check for reporting. It is deliberately not what
+authorizes a run: ranking a task and starting it are different decisions, and a
+`status` snapshot can be a whole poll interval stale. Immediately before claiming,
+the orchestrator re-reads the Issue and the PR list from GitHub, then performs the
+claim as a conditional SQL transition. A label that was withdrawn in between loses
+the race rather than starting an agent.
 
 ### Observed PR vs. owned PR
 
-Two different facts are recorded separately, and conflating them would be a real
-bug once #4 runs agents:
+Two different facts are recorded separately, and conflating them would let a review
+round act on someone else's pull request:
 
 | Column | Meaning | Written by |
 |---|---|---|
 | `observed_state.linked_pr_number` | a PR that *already exists* for this Issue — a human's PR, or an earlier one | discovery, every poll |
-| `tasks.pr_number` | the PR **this worker's own run created** | only the #4 PR workflow |
+| `tasks.pr_number` | the PR **this worker's own run created** (or adopted on its own branch) | only the #4 publish workflow |
 
 Discovery **never** writes `tasks.pr_number`, not even when the PR sits on a
-`dispatch/issue-N-...` branch. A branch name is a strong hint, not proof of
-ownership, and a review round acting on a PR this worker did not create is exactly
-the failure this separation prevents. An Issue with an observed PR is recorded as
-`awaiting_review` and stays non-dispatchable.
+`dispatch/issue-N-...` branch — a branch name is a strong hint, not proof of
+ownership. `status` therefore prints `own#N` for an owned PR and `obs#N` for an
+observed one, so the distinction is visible at a glance. An Issue with an observed
+PR is recorded as `awaiting_review` and stays non-dispatchable.
+
+### Ownership of branches and worktrees
+
+`tasks.branch` and `tasks.worktree_path` are the owned artifacts. They are recorded
+before a run starts and reused afterwards, so a restart finds the *existing* branch
+instead of deriving a new name. Layout:
+
+```
+<worktree_root>/<owner>__<name>/issue-<N>/     branch: dispatch/issue-<N>-<kebab-title>
+<run_log_dir>/<owner>__<name>/issue-<N>/<run-id>.ndjson
+```
+
+A directory that exists at the expected path but is **not** a registered Git
+worktree of the configured source is never adopted and never deleted: the task moves
+to `needs_attention` and says so. "Dirty" is not used as a proxy for anything — a
+clean worktree may contain successful commits, and a dirty one is expected after an
+interrupted run.
 
 ---
 
@@ -387,19 +506,88 @@ the failure this separation prevents. An Issue with an observed PR is recorded a
 | What | Where |
 |---|---|
 | State database | `worker.state_db` (default `~/.local/state/agent-dispatch/state.db`) |
-| Run logs (NDJSON, written by #4) | `worker.run_log_dir`, retained to `worker.run_log_keep` files per task |
+| Raw NDJSON run logs | `worker.run_log_dir`, retained to `worker.run_log_keep` files per task |
+| Runtime stderr per run | `<run-id>.stderr.txt` beside the NDJSON file |
 | Worker lock | `worker.lock_file` (pid + start time + command; never credentials) |
 | Service logs | `journalctl --user -u agent-dispatch -f` |
 
 `--log-format json` emits one JSON object per line for journald/CI capture.
 
-Run logs live **outside** every repository and worktree by design, and their
-contents are never printed to CI or pasted into GitHub. `status` reports log
-*paths*, never contents.
+Run logs live **outside** every repository and worktree by design — a log written
+inside the worktree could be swept into a commit by `git add -A` and would leak a
+raw agent transcript into the PR. The offline suite asserts this placement after a
+real run. Log *contents* are never printed to CI, pasted into GitHub, or echoed by
+`status`/`open`; those report paths only.
+
+Stderr goes to a **sidecar file**, not into the NDJSON stream: that stream is parsed
+as data, and mixing free-form stderr into it would make a failed run look like a
+malformed one.
 
 ---
 
-## 9. Behaviour when GitHub is unavailable
+## 9. How a run is judged (and what fails it)
+
+A run is accepted **only if every one** of these holds:
+
+| Check | Why it exists |
+|---|---|
+| The process spawned and exited `0` | a missing binary refuses before the task is claimed; exit `8` is the turn cap and is a bounded failure |
+| A `result` line with `subtype=success` exists | a truncated or crashed stream must not read as success |
+| A non-empty `session_id` was captured | without it the task cannot be pinned or later resumed |
+| On a resume, the returned ID **equals** the pinned one | otherwise the task's conversation is not the one that ran |
+| **Zero `tool_hook_blocked` events** | the false-success guard — see below |
+| The run finished inside the wall-clock timeout | the watchdog kills the process group at the deadline |
+
+Produced work is evaluated separately, and deliberately does **not** require a
+dirty tree: commits count, uncommitted edits count, and a successful run that
+changed nothing is recorded as such and escalated to `needs_attention` rather than
+opening an empty PR.
+
+### The silent false-success hazard
+
+A run whose tool calls were **all refused** still reports:
+
+```json
+{"type":"result","subtype":"success","stopReason":"end_turn","sessionId":"…"}
+```
+
+with exit code 0 and no `isError` anywhere in the stream. The only reliable signal
+is a dedicated event:
+
+```json
+{"type":"event","event":{"type":"tool_hook_blocked","toolName":"write_file"}}
+```
+
+`agent-dispatch` scans every stream for it and fails the run — regardless of the
+exit code or the reported subtype. `run` prints each check's verdict, so the reason
+is visible rather than inferred from an exit code:
+
+```
+result: owner/name#12: failed — run_failed
+  check spawned: pass
+  check completed_in_time: pass
+  check exit_code_zero: pass
+  check subtype_success: pass
+  check session_id_captured: pass
+  check session_id_matches: pass
+  check no_blocked_tool_events: FAIL
+  run log: ~/.local/state/agent-dispatch/runs/owner__name/issue-12/<run-id>.ndjson
+```
+
+### Retries
+
+`worker.max_attempts` bounds retries (default 3). A failed attempt within budget
+leaves the task `queued` so the next dispatch retries it; when the budget is spent
+the task becomes `failed` and `agent-dispatch retry` is required to restore it.
+
+A retry **preserves** whatever the previous attempt wrote and starts a **fresh**
+session in the same owned worktree. It is never presented as continuing the
+interrupted conversation, because an interrupted first run has no transcript to
+continue. The new session ID is pinned to the task.
+
+---
+
+## 10. Behaviour when GitHub is unavailable
 
 Every GitHub problem is reported honestly, and none of them can mark an Issue as
 completed:
@@ -412,6 +600,10 @@ completed:
 | Wrapper returns unparseable output | treated as a hard error, not as an empty (silently successful) result |
 | PR listing truncated (page cap reached) | reported as `incomplete_scan`; **nothing is queued** and no observation is cleared, because a pre-existing PR may sit on a page that was never read |
 | Issue or PR deleted mid-poll | the task is left unchanged and reported; nothing is guessed |
+| Runtime binary missing | `dispatch_unavailable` once, per poll; **no task is claimed**, so a queued Issue is not consumed by a configuration fault |
+| Push failed | the branch is re-checked on the remote before the failure is believed, so an already-pushed branch (a crash window) is not reported as a push failure |
+| PR lookup failed after a push | the branch is kept, the task becomes `needs_attention`, and the next `run` adopts or creates the PR without re-running the agent |
+| PR creation failed | recorded as a recoverable intent; the next `run` adopts the PR if GitHub did create it |
 
 A failed poll never marks a task `finished`, and the worker never silently
 switches identity or model.
@@ -422,7 +614,94 @@ would schedule a duplicate implementation of work someone already did.
 
 ---
 
-## 10. Verifying this release
+## 11. Crash recovery and intent-before-action
+
+The orchestrator records a side effect as **intended** *before* attempting it and
+**confirmed** only after it succeeded (`operations` table). On restart it repairs
+from evidence instead of repeating the call:
+
+| Crash point | Reconciliation on the next `run`/`worker` |
+|---|---|
+| Process died mid-run | the `running` row is orphaned **by definition** — the single-instance lock proves no other worker is alive — so the open run is closed as `failed`, the worktree is inspected and left untouched, and the task returns to `queued` (or `failed` when the budget is spent) |
+| Branch pushed, PR creation not confirmed | the owned branch is looked up by head; the PR is adopted if it exists, created if it does not, and the **agent is not re-run** because the code already exists |
+| PR created, DB write lost | adoption by exact head-branch match, so `tasks.pr_number` is restored to the real number |
+| Duplicate poll | one task row per `(repo, Issue)`; a task not in `queued` is never dispatched |
+| PR merged or closed externally | no new rounds; the task ends via the normal reconciliation rules |
+| Owned worktree with uncommitted edits | **preserved** and reported; a retry starts a fresh session there rather than discarding the edits |
+
+An orphaned `running` row needs no PID liveness check precisely *because* of the
+single-instance lock: while this process holds the lock, any `running` row it finds
+belongs to a previous process, not a concurrent one.
+
+Nothing is ever deleted to "clean up". Removing a worktree or branch is an explicit
+operator action, not a side effect of a task ending.
+
+---
+
+## 12. Credentials and security posture
+
+### The credential ordering is not optional
+
+`credential.helper` is **multi-valued**, and a bare
+`-c credential.<url>.helper=!<cmd>` **appends** to the inherited list instead of
+replacing it. An ambient helper is then queried first and can answer with a
+different credential.
+
+**Measured on this VM (2026-09-25): the ambient `/usr/bin/gh auth git-credential`
+currently *does* return a real credential for `github.com`.** The reset entry is
+therefore load-bearing, not defensive. It was verified with an instrumented decoy
+helper, and the control case (no reset) confirmed the decoy is otherwise called
+first.
+
+`agent-dispatch` applies the reset-then-wrapper pair two ways:
+
+1. **`GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` in the environment** of every
+   orchestrator Git command *and* of the agent subprocess. These variables are
+   inherited by children, so Git the agent spawns itself also resolves the approved
+   wrapper. This is the primary mechanism.
+2. Optionally, the repository's **local** config
+   (`worker.write_repo_local_credentials = true`). Off by default, because a
+   worktree shares its clone's Git common config — which is why provisioning points
+   at an orchestrator-managed source clone rather than your working checkout.
+
+To verify the effective chain for yourself:
+
+```bash
+cd <owned_worktree>
+GIT_CONFIG_COUNT=2 \
+GIT_CONFIG_KEY_0=credential.https://github.com.helper GIT_CONFIG_VALUE_0= \
+GIT_CONFIG_KEY_1=credential.https://github.com.helper \
+GIT_CONFIG_VALUE_1='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential' \
+  git config --get-all credential.https://github.com.helper
+# -> an empty line first (the reset), then the wrapper
+```
+
+> **Do not run bare `git credential fill` to check this.** It prints the resolved
+> token to your terminal and into your shell transcript. The command above never
+> reveals a credential.
+
+### Stated plainly
+
+* **`--yolo` grants the agent unrestricted shell and file access as your user.**
+  This is a deliberate trust choice on a single-user VM, not isolation.
+* **A Git worktree is not a sandbox.** It is not a filesystem, process, network or
+  credential boundary. An unrestricted agent can read and write outside it.
+* **The wrapper is an operational guardrail, not a hard boundary.** The
+  `gh-craftlypse` credential is scoped to selected repositories and the wrapper
+  injects `GH_TOKEN` only into its own child, but an agent with a shell could
+  attempt to bypass it. A deny from the wrapper is a **visible failure**; the
+  service never switches identity to get around it.
+* **Issue and PR text is untrusted task content.** The instruction fences it and
+  labels it as data, but that does not make it an authorization boundary: the
+  permission flags come from configuration, and anyone who can open an Issue can
+  put text in front of the agent.
+* **The agent's own summary is quoted, not verified.** The PR body labels it
+  explicitly as unverified task output; only the checks the orchestrator observed
+  itself are asserted as facts.
+
+---
+
+## 13. Verifying this release
 
 Everything below is available after `uv sync --locked`. The scripts accept a
 `PYTHON=` override so the suite can run on the uv-managed interpreter, which is
@@ -434,7 +713,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 92 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 152 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -444,8 +723,25 @@ agent-dispatch dry-run --no-sync   # local state only, no API calls
 agent-dispatch status          # read-only snapshot + simulated poll
 ```
 
+The suite covers the #4 execution path end to end with **no model credits and no
+GitHub mutation**: `tests/fake_wrapper.py` serves GitHub and `tests/fake_runtime.py`
+is a real executable standing in for `commandcode`, so the tests drive the real
+`CommandCodeDriver`, worktree creation, NDJSON parsing and process kill rather than
+a mock. The cases most worth knowing about:
+
+| Test | Proves |
+|---|---|
+| `BlockedRunTests` | a `tool_hook_blocked` stream with `subtype=success` and exit 0 **fails** the task and opens no PR |
+| `TimeoutTests` | a hung run is killed at the deadline, recorded as a timeout, and leaves no live process |
+| `RetryTests` | an interrupted run's edits are preserved and the retry starts a **fresh** session |
+| `IdempotencyTests` | restart adopts the existing PR/branch instead of duplicating work |
+| `EligibilityTests` | a withdrawn label, a paused task or a foreign PR prevents the run — even when named explicitly |
+| `CredentialEnvironmentMockedTests` | the agent inherits the reset-then-wrapper ordering, and repo-local config is opt-in |
+| `StatusReadOnlyTests` | `status`/`dry-run`/`open` start no agent and create no state |
+
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
-created inside the checkout.
+created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
+the same for a real run's worktree.
 
 Two failure modes are worth exercising deliberately, because a tooling gate that
 cannot fail is not a gate:
@@ -464,16 +760,25 @@ uv lock                                  # refresh it deliberately
 
 ---
 
-## 11. Not in this release
+## 14. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
-Issues #4/#5/#6 and are **not implemented, not stubbed and not faked**:
+Issues #5/#6 and are **not implemented, not stubbed and not faked**:
 
-- starting a coding agent at all (no `commandcode` invocation exists in this code)
-- worktree creation, branch creation, `git push`, PR creation
-- session IDs, resume, run-log streaming and interrupted-run recovery
-- `agent:fix` review rounds, feedback collection and cursors
+- the `agent:fix` review handoff, feedback collection, grouping and cursors (#5);
+- same-session follow-up rounds after review feedback, and re-arming the label (#5);
 - multi-repo concurrency above one (configuration rejects it), distributed leases,
-  a broker, webhooks, a dashboard, or a plugin system
-- Git credential-helper injection into worktrees (#4 scope; config keys exist and
-  are validated, but no worktree is provisioned here)
+  a broker, webhooks, a dashboard, or a provider-plugin system (#6);
+- automatic merge, automatic approval, Issue closure, or deletion of unknown
+  worktrees — permanently out of scope, not deferred.
+
+Also deliberately absent, because the alternative would be a false claim:
+
+- **No native VS Code Chat session handoff.** Inspect and resume CLI sessions in
+  the integrated terminal of a Remote SSH window; that is the supported interface.
+- **No container or OS sandbox.** `--yolo` plus a worktree is a trust choice on a
+  single-user VM, and §12 says so plainly.
+- **No live end-to-end VM run is claimed by this document.** The offline suite
+  proves the orchestration logic against fakes; an actual Command Code run, real
+  push and real PR are an explicit, opt-in operator action
+  (`agent-dispatch run`) and are only "observed" when someone observes them.

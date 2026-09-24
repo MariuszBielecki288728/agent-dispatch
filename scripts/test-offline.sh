@@ -8,6 +8,9 @@
 #   * no network calls, no model credits, no GitHub mutation,
 #   * no third-party Python packages (stdlib unittest only),
 #   * every GitHub interaction goes through tests/fake_wrapper.py,
+#   * every agent run goes through tests/fake_runtime.py, a real executable that
+#     stands in for `commandcode`, so the driver's spawn/stream/kill paths are
+#     exercised rather than bypassed,
 #   * a repository scan afterwards proves no state, log or secret file leaked
 #     into the working tree.
 #
@@ -41,6 +44,10 @@ log_info "package: agent_dispatch (stdlib only, no third-party imports required)
 
 # The fake wrapper must be executable; it is the single seam the tests replace.
 chmod +x tests/fake_wrapper.py
+# The fake runtime is spawned as a real process by CommandCodeDriver, so it must be
+# executable too. A missing execute bit would make the timeout/kill tests pass for
+# the wrong reason (spawn failure instead of a killed run).
+chmod +x tests/fake_runtime.py
 
 # 1. Syntax/import check of every source file before running the suite, so a
 #    broken module fails with a clear message rather than a wall of test errors.

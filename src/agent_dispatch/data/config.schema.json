@@ -71,6 +71,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Path to the runtime binary. Resolved via PATH when omitted."
+        },
+        "write_repo_local_credentials": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write the reset-then-wrapper Git credential sequence into the source clone's LOCAL config. Off by default because a worktree shares its clone's Git common config, so this edits configuration that may belong to a personal checkout. The GIT_CONFIG_COUNT/KEY/VALUE environment pairs already cover orchestrator Git and Git the agent spawns, so this is optional rather than required."
         }
       }
     },

@@ -53,6 +53,10 @@ FAKE_WRAPPER = REPO_ROOT / "tests" / "fake_wrapper.py"
 TRIGGER = "take-it"
 HANDOFF = "agent:fix"
 
+#: A runtime path that deliberately does not exist. See ``write_config`` for why the
+#: suite pins this instead of leaving ``commandcode_path`` unset.
+MISSING_RUNTIME = "./no-such-commandcode-binary"
+
 
 class FakeWorld:
     """Builds the fake wrapper's world file and the matching TOML config."""
@@ -120,6 +124,17 @@ class FakeWorld:
             "run_log_dir": f"{self.state_dir}/runs",
             "run_log_keep": 5,
             "lock_file": f"{self.state_dir}/worker.lock",
+            # A runtime path that does NOT exist, unless a test opts in.
+            #
+            # This matters for determinism and for safety. The agent runtime is a
+            # paid, network-hitting binary that may well be installed on a
+            # developer's VM; if the test config left this unset, `agent-dispatch
+            # worker --once` would resolve `commandcode` from PATH and spawn a REAL
+            # paid agent against a temp fixture. Pinning a missing path makes the
+            # suite behave identically everywhere, and mirrors the honest
+            # "runtime not installed" case that #3's tests are already about.
+            # #4's execution tests override this with tests/fake_runtime.py.
+            "commandcode_path": MISSING_RUNTIME,
         }
         worker.update(worker_overrides or {})
 
@@ -233,10 +248,11 @@ def pull(
         "number": number,
         "state": state,
         "merged_at": "2026-01-01T00:00:00Z" if merged else None,
-        "head": {"ref": head_ref},
+        "head": {"ref": head_ref, "sha": "0" * 40},
         "html_url": f"https://github.com/example/repo/pull/{number}",
         "title": f"PR {number}",
         "body": body,
+        "base": {"ref": "main"},
     }
 
 
@@ -1156,16 +1172,18 @@ class CliSurfaceTests(BaseCase):
             "status",
             "dry-run",
             "worker",
+            "run",
+            "open",
             "pause",
             "unpause",
             "retry",
             "setup-labels",
         ):
             self.assertIn(command, result.stdout)
-        # Commands that would need #4/#5 are documented as future work, not faked.
-        self.assertNotIn("  open ", result.stdout)
+        # The #5 review loop is documented as future work, not faked.
+        self.assertNotIn("agent:fix handoff", result.stdout)
 
-    def test_status_reports_tasks_and_no_running_claim(self) -> None:
+    def test_status_reports_tasks_without_claiming_a_run(self) -> None:
         self.set_issues(issue(1, "First", labels=[TRIGGER]))
         self.assertEqual(self.world.run_cli("worker", "--once").returncode, 0)
 
@@ -1173,7 +1191,8 @@ class CliSurfaceTests(BaseCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"{self.slug}#1", result.stdout)
         self.assertIn("queued", result.stdout)
-        self.assertIn("no task is promoted to `running`", result.stdout)
+        # `status` must never imply that a run happened; it is a read-only view.
+        self.assertIn("own#N = a PR this worker created", result.stdout)
 
     def test_status_json_is_machine_readable(self) -> None:
         self.set_issues(issue(1, "First", labels=[TRIGGER]))
@@ -1183,6 +1202,9 @@ class CliSurfaceTests(BaseCase):
         self.assertEqual(payload["max_concurrent_tasks"], 1)
         self.assertEqual(payload["tasks"][0]["phase"], "queued")
         self.assertTrue(payload["tasks"][0]["dispatchable"])
+        # Ownership is reported explicitly, and `null` means "no PR owned yet".
+        self.assertIsNone(payload["tasks"][0]["pr_number"])
+        self.assertIn("pr_url", payload["tasks"][0])
 
     def test_pause_unpause_and_retry_round_trip(self) -> None:
         self.set_issues(issue(1, "First", labels=[TRIGGER]))

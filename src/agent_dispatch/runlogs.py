@@ -1,8 +1,7 @@
 """Run-log placement and bounded retention.
 
-Issue #3 does not run an agent, so no run log is produced yet. The *placement*
-contract is implemented and tested here because it is a design requirement that
-is easy to violate later (§4/§6 of ``docs/architecture.md``):
+The *placement* contract is a design requirement that is easy to violate by
+accident (§4/§6 of ``docs/architecture.md``):
 
 * run logs live under ``worker.run_log_dir``, which configuration enforces to be
   **outside every target repository and worktree**, so ``git add -A`` can never

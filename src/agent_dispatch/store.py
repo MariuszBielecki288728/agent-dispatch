@@ -48,6 +48,11 @@ PHASES = (
 PAUSE_LABEL_WITHDRAWN = "label_withdrawn"
 PAUSE_MAINTAINER = "maintainer"
 
+#: Run outcomes recorded in the `runs` table.
+RUN_RUNNING = "running"
+RUN_SUCCEEDED = "succeeded"
+RUN_FAILED = "failed"
+
 #: Phases with no further automatic transitions.
 TERMINAL_PHASES = frozenset({"finished"})
 
@@ -104,11 +109,109 @@ CREATE TABLE IF NOT EXISTS observed_state (
   linked_pr_state   TEXT,                        -- open | merged | closed
   observed_at       TEXT
 );
+
+-- One row per agent run. Why a separate table rather than columns on `tasks`:
+-- a task accumulates runs across retries, and the audit question "which session
+-- IDs were attempted, and how did each end?" must stay answerable. `tasks`
+-- keeps only the *current* identity.
+CREATE TABLE IF NOT EXISTS runs (
+  id                INTEGER PRIMARY KEY,
+  task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  run_id            TEXT    NOT NULL,           -- filename-safe, timestamp-prefixed
+  kind              TEXT    NOT NULL,           -- implementation | retry
+  resumed_from      TEXT,                       -- session this run tried to continue
+  session_id        TEXT,                       -- session the runtime reported
+  outcome           TEXT    NOT NULL,           -- running | succeeded | failed
+  exit_code         INTEGER,
+  subtype           TEXT,
+  tool_hook_blocked INTEGER NOT NULL DEFAULT 0,
+  timed_out         INTEGER NOT NULL DEFAULT 0,
+  produced_work     INTEGER,
+  detail            TEXT,                       -- validated reasons, never a transcript
+  log_path          TEXT,
+  started_at        TEXT    NOT NULL,
+  finished_at       TEXT,
+  UNIQUE (task_id, run_id)
+);
+
+-- Intent-before-action ledger. A side effect that reaches GitHub (a push, a PR)
+-- is recorded as *intended* before it is attempted and *confirmed* only after it
+-- succeeded, so a crash in between leaves a recoverable expectation rather than
+-- a guess — and a restart adopts what exists instead of repeating the call.
+CREATE TABLE IF NOT EXISTS operations (
+  id                INTEGER PRIMARY KEY,
+  task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind              TEXT    NOT NULL,           -- push_branch | create_pr
+  state             TEXT    NOT NULL,           -- intended | confirmed | failed
+  detail            TEXT,
+  external_id       TEXT,                       -- e.g. the created PR number
+  created_at        TEXT    NOT NULL,
+  updated_at        TEXT    NOT NULL
+);
 """
+
+
+#: Session IDs of runs that ended cleanly, and are therefore resumable later.
+#: An interrupted run has no transcript (runtime §2.3.1), so it must never be
+#: offered as a resume target — which is why resumability is a query, not a flag.
+RESUMABLE_RUN_OUTCOMES = frozenset({"succeeded"})
+
+
+@dataclass(frozen=True)
+class Run:
+    """One recorded agent run for a task."""
+
+    id: int
+    task_id: int
+    run_id: str
+    kind: str
+    resumed_from: str | None
+    session_id: str | None
+    outcome: str
+    exit_code: int | None
+    subtype: str | None
+    tool_hook_blocked: bool
+    timed_out: bool
+    produced_work: bool | None
+    detail: str | None
+    log_path: str | None
+    started_at: str
+    finished_at: str | None
+
+    @property
+    def resumable(self) -> bool:
+        """Whether this run's session may be continued by a later round (#5).
+
+        A clean completion is the only thing that writes a transcript, so a run
+        that was killed, blocked or failed is explicitly *not* resumable even
+        though its session ID was captured.
+        """
+        return (
+            self.outcome in RESUMABLE_RUN_OUTCOMES
+            and bool(self.session_id)
+            and not self.tool_hook_blocked
+            and not self.timed_out
+        )
+
+
+@dataclass(frozen=True)
+class Operation:
+    """A recorded intent-before-action side effect."""
+
+    id: int
+    task_id: int
+    kind: str
+    state: str
+    detail: str | None
+    external_id: str | None
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
 class Task:
+    """One ``(repo, Issue)`` task row, joined with its last observed GitHub state."""
+
     id: int
     repo: str
     issue_number: int
@@ -136,6 +239,9 @@ class Task:
     linked_pr_number: int | None
     linked_pr_state: str | None
     observed_at: str | None
+    pr_url: str | None = None
+    pr_created_at: str | None = None
+    dispatched_at: str | None = None
 
     @property
     def ref(self) -> str:
@@ -145,22 +251,35 @@ class Task:
     def is_terminal(self) -> bool:
         return self.phase in TERMINAL_PHASES
 
+    @property
+    def has_own_pr(self) -> bool:
+        """Whether this worker created a PR for the task.
+
+        ``linked_pr_number`` is any PR that *references* the Issue and is only an
+        observation; ownership is this column alone (§4, and the #3 review finding
+        that a second poll must never promote a foreign PR to owned).
+        """
+        return self.pr_number is not None
+
     def dispatchability(self) -> tuple[bool, str]:
         """Whether this task could be dispatched, and why not when it cannot.
 
-        Issue #3 uses this only for reporting: nothing is ever promoted to
-        ``running`` here. It exists so ``status`` and ``dry-run`` tell the truth
-        about which queued Issues would be picked up.
+        Deliberately says nothing about live GitHub state: it is the cheap local
+        pre-check used for reporting, and the authoritative re-check happens
+        immediately before claiming, under a conditional SQL transition. A stale
+        ``status`` preview must never be what authorizes a run.
         """
         if self.issue_state == "closed":
             return False, "Issue is closed"
         if not self.trigger_present:
             return False, "label removed (dispatch intent withdrawn)"
+        if self.has_own_pr:
+            return False, f"this worker already owns PR #{self.pr_number}"
         if self.linked_pr_number is not None:
             return False, f"PR #{self.linked_pr_number} already exists for this Issue"
         if self.phase != "queued":
             return False, f"phase is {self.phase}"
-        return True, "waiting for a dispatcher (#4)"
+        return True, "eligible for dispatch"
 
 
 class Store:
@@ -214,7 +333,7 @@ class Store:
         written. Returns an empty store when this one does not exist yet.
         """
         clone = Store.in_memory()
-        for table in ("tasks", "observed_state"):
+        for table in ("tasks", "observed_state", "runs", "operations"):
             for row in self._conn.execute(f"SELECT * FROM {table}"):
                 columns = list(row.keys())
                 placeholders = ", ".join("?" for _ in columns)
@@ -239,7 +358,13 @@ class Store:
     #: Columns added after the first release, applied to an existing database so
     #: an upgrade does not require deleting state. Deliberately additive only:
     #: nothing is dropped or rewritten, and no row is ever deleted here.
-    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (("tasks", "pause_reason", "TEXT"),)
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("tasks", "pause_reason", "TEXT"),
+        # Issue #4
+        ("tasks", "pr_url", "TEXT"),
+        ("tasks", "pr_created_at", "TEXT"),
+        ("tasks", "dispatched_at", "TEXT"),
+    )
 
     def _add_missing_columns(self) -> None:
         for table, column, column_type in self._ADDED_COLUMNS:
@@ -397,7 +522,10 @@ class Store:
         if task.phase in TERMINAL_PHASES:
             raise ValueError(f"{task.ref} is {task.phase} and cannot be paused")
         if task.phase not in PAUSABLE_PHASES:
-            raise ValueError(f"{task.ref} is {task.phase} and cannot be paused")
+            raise ValueError(
+                f"{task.ref} is {task.phase} and cannot be paused; pause applies to "
+                f"{', '.join(sorted(PAUSABLE_PHASES))} only"
+            )
         self._conn.execute(
             "UPDATE tasks SET phase = 'paused', pause_reason = ?, updated_at = ? WHERE id = ?",
             (PAUSE_MAINTAINER, utcnow_iso(), task.id),
@@ -506,6 +634,228 @@ class Store:
             (pr_number, note, utcnow_iso(), task_id),
         )
 
+    # ------------------------------------------------- issue #4: execution
+
+    def claim_for_run(
+        self, task_id: int, *, branch: str, worktree_path: str, base_branch: str
+    ) -> bool:
+        """Atomically move a task to ``running`` and record its owned paths.
+
+        The phase check is part of the ``UPDATE``'s ``WHERE`` clause rather than a
+        read-then-write, so two callers cannot both believe they claimed the same
+        task: SQLite applies one statement atomically, and ``rowcount == 0`` is a
+        truthful "someone else got it first".
+
+        Eligibility is *also* re-checked against ``observed_state`` in the same
+        statement. A stale ``status`` preview is never what authorizes a run, and a
+        task whose label was withdrawn (or whose Issue closed) between the poll and
+        the claim must lose the race rather than start an agent.
+        """
+        now = utcnow_iso()
+        cursor = self._conn.execute(
+            "UPDATE tasks SET phase = 'running', branch = ?, worktree_path = ?, base_branch = ?, "
+            "dispatched_at = ?, updated_at = ? "
+            "WHERE id = ? AND phase = 'queued' "
+            "AND (SELECT COALESCE(issue_state, 'open') FROM observed_state WHERE task_id = tasks.id) "
+            "     != 'closed' "
+            "AND (SELECT trigger_present FROM observed_state WHERE task_id = tasks.id) = 1",
+            (branch, worktree_path, base_branch, now, now, task_id),
+        )
+        return cursor.rowcount > 0
+
+    def record_runtime_identity(
+        self, task_id: int, *, driver: str, model: str, effort: str | None, permission_mode: str
+    ) -> None:
+        """Pin the runtime identity that a run actually used.
+
+        Written at claim time so a config change between the poll and the run
+        cannot leave the row describing a different model than the one invoked, and
+        so a later resume re-passes the values recorded here rather than whatever
+        the config happens to say at that moment.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET runtime_driver = ?, runtime_model = ?, runtime_effort = ?, "
+            "permission_mode = ?, updated_at = ? WHERE id = ?",
+            (driver, model, effort, permission_mode, utcnow_iso(), task_id),
+        )
+
+    def record_session(self, task_id: int, session_id: str) -> None:
+        """Persist the session ID as soon as the runtime emits it.
+
+        Captured immediately (it arrives on the stream's first line) so an
+        interrupted run is *traceable* — which is not the same as resumable: an
+        interrupted first run has no transcript, so ``runs.outcome`` stays
+        ``failed`` and :meth:`resumable_session` will not offer it.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?",
+            (session_id, utcnow_iso(), task_id),
+        )
+
+    def start_run(
+        self,
+        task_id: int,
+        *,
+        run_id: str,
+        kind: str,
+        resumed_from: str | None,
+        log_path: str,
+    ) -> int:
+        """Open a ``runs`` row in the ``running`` state and return its id."""
+        now = utcnow_iso()
+        cursor = self._conn.execute(
+            "INSERT INTO runs (task_id, run_id, kind, resumed_from, outcome, log_path, started_at) "
+            "VALUES (?, ?, ?, ?, 'running', ?, ?)",
+            (task_id, run_id, kind, resumed_from, log_path, now),
+        )
+        self._conn.execute(
+            "UPDATE tasks SET attempts = attempts + 1, last_run_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, task_id),
+        )
+        return int(cursor.lastrowid)
+
+    def finish_run(
+        self,
+        run_row_id: int,
+        *,
+        outcome: str,
+        session_id: str | None,
+        exit_code: int | None,
+        subtype: str | None,
+        tool_hook_blocked: bool,
+        timed_out: bool,
+        produced_work: bool | None,
+        detail: str | None,
+    ) -> None:
+        """Close a ``runs`` row with the validated outcome.
+
+        ``produced_work`` stays ``None`` when the run never got far enough to
+        evaluate it; that is a different fact from ``False`` ("evaluated, and the
+        worktree was empty"), and collapsing them would hide an interrupted run.
+        """
+        self._conn.execute(
+            "UPDATE runs SET outcome = ?, session_id = COALESCE(?, session_id), exit_code = ?, "
+            "subtype = ?, tool_hook_blocked = ?, timed_out = ?, produced_work = ?, detail = ?, "
+            "finished_at = ? WHERE id = ?",
+            (
+                outcome,
+                session_id,
+                exit_code,
+                subtype,
+                int(tool_hook_blocked),
+                int(timed_out),
+                None if produced_work is None else int(produced_work),
+                detail,
+                utcnow_iso(),
+                run_row_id,
+            ),
+        )
+
+    def run_history(self, task_id: int) -> list[Run]:
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
+    def resumable_session(self, task_id: int) -> str | None:
+        """The session ID a follow-up round may continue, or ``None``.
+
+        Returns a session only from a run that completed **cleanly**. An
+        interrupted run has no transcript, so offering its ID would fail with
+        "neither an existing .jsonl transcript nor a known session-id prefix" —
+        which is why #5 can refuse a handoff with a clear reason instead of
+        silently starting a different conversation.
+        """
+        row = self._conn.execute(
+            "SELECT session_id FROM runs WHERE task_id = ? AND outcome = 'succeeded' "
+            "AND tool_hook_blocked = 0 AND timed_out = 0 AND session_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return str(row["session_id"]) if row is not None else None
+
+    def set_phase(self, task_id: int, phase: str, note: str | None = None) -> None:
+        """Move a task to ``phase``, refusing an unknown value."""
+        if phase not in PHASES:
+            raise ValueError(f"{phase!r} is not a phase in the approved state contract")
+        self._conn.execute(
+            "UPDATE tasks SET phase = ?, last_error = COALESCE(?, last_error), updated_at = ? "
+            "WHERE id = ?",
+            (phase, note, utcnow_iso(), task_id),
+        )
+
+    def set_owned_worktree(
+        self, task_id: int, *, branch: str, worktree_path: str, base_branch: str
+    ) -> None:
+        """Record ownership of a branch/worktree without changing the phase.
+
+        Used when the owned paths are (re)established during reconciliation, so
+        "which branch and directory belong to this task" is always answerable from
+        the row rather than re-derived from a naming convention.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET branch = ?, worktree_path = ?, base_branch = ?, updated_at = ? "
+            "WHERE id = ?",
+            (branch, worktree_path, base_branch, utcnow_iso(), task_id),
+        )
+
+    def record_owned_pr(
+        self,
+        task_id: int,
+        *,
+        pr_number: int,
+        pr_url: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Record a PR this workflow verified as the task's own, plus its URL."""
+        self._conn.execute(
+            "UPDATE tasks SET pr_number = ?, pr_url = ?, pr_created_at = COALESCE(pr_created_at, ?), "
+            "last_error = COALESCE(?, last_error), updated_at = ? WHERE id = ?",
+            (pr_number, pr_url, utcnow_iso(), note, utcnow_iso(), task_id),
+        )
+
+    # ------------------------------------------------- intent-before-action
+
+    def intend_operation(self, task_id: int, *, kind: str, detail: str) -> int:
+        """Record that a GitHub side effect is *about* to be attempted.
+
+        Written before the call, so a crash mid-push or mid-PR-create leaves a
+        recoverable expectation ("we intended to push branch X") instead of an
+        ambiguous state that a restart would have to guess about.
+        """
+        now = utcnow_iso()
+        cursor = self._conn.execute(
+            "INSERT INTO operations (task_id, kind, state, detail, created_at, updated_at) "
+            "VALUES (?, ?, 'intended', ?, ?, ?)",
+            (task_id, kind, detail, now, now),
+        )
+        return int(cursor.lastrowid)
+
+    def confirm_operation(self, operation_id: int, *, external_id: str | None = None) -> None:
+        self._conn.execute(
+            "UPDATE operations SET state = 'confirmed', external_id = ?, updated_at = ? WHERE id = ?",
+            (external_id, utcnow_iso(), operation_id),
+        )
+
+    def fail_operation(self, operation_id: int, *, detail: str) -> None:
+        self._conn.execute(
+            "UPDATE operations SET state = 'failed', detail = ?, updated_at = ? WHERE id = ?",
+            (detail, utcnow_iso(), operation_id),
+        )
+
+    def latest_operation(self, task_id: int, kind: str) -> Operation | None:
+        row = self._conn.execute(
+            "SELECT * FROM operations WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+        return _row_to_operation(row) if row is not None else None
+
+    def operations_for(self, task_id: int) -> list[Operation]:
+        rows = self._conn.execute(
+            "SELECT * FROM operations WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        return [_row_to_operation(row) for row in rows]
+
     def _require(self, repo: str, issue_number: int) -> Task:
         task = self.get_task(repo, issue_number)
         if task is None:
@@ -547,6 +897,44 @@ def _row_to_task(row: Mapping[str, Any]) -> Task:
         linked_pr_number=observed("linked_pr_number", None),
         linked_pr_state=observed("linked_pr_state", None),
         observed_at=observed("observed_at", None),
+        pr_url=observed("pr_url", None),
+        pr_created_at=observed("pr_created_at", None),
+        dispatched_at=observed("dispatched_at", None),
+    )
+
+
+def _row_to_run(row: Mapping[str, Any]) -> Run:
+    produced = row["produced_work"]
+    return Run(
+        id=int(row["id"]),
+        task_id=int(row["task_id"]),
+        run_id=str(row["run_id"]),
+        kind=str(row["kind"]),
+        resumed_from=row["resumed_from"],
+        session_id=row["session_id"],
+        outcome=str(row["outcome"]),
+        exit_code=row["exit_code"],
+        subtype=row["subtype"],
+        tool_hook_blocked=bool(row["tool_hook_blocked"]),
+        timed_out=bool(row["timed_out"]),
+        produced_work=None if produced is None else bool(produced),
+        detail=row["detail"],
+        log_path=row["log_path"],
+        started_at=str(row["started_at"]),
+        finished_at=row["finished_at"],
+    )
+
+
+def _row_to_operation(row: Mapping[str, Any]) -> Operation:
+    return Operation(
+        id=int(row["id"]),
+        task_id=int(row["task_id"]),
+        kind=str(row["kind"]),
+        state=str(row["state"]),
+        detail=row["detail"],
+        external_id=row["external_id"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

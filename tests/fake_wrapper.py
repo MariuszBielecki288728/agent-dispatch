@@ -305,11 +305,83 @@ def main(argv: list[str]) -> int:
                 return 0
         die(f"gh: Not Found (HTTP 404) — issue {slug}#{number}", 1)
 
+    if resource == "branches" and len(tail) == 2:
+        branch = tail[1]
+        spec = consume_failure(world, f"{slug}:branches")
+        if spec:
+            fail_with(spec)
+        if branch not in (repo.get("branches") or []):
+            # Exactly what a missing branch looks like: a real HTTP 404, which is
+            # the only answer the service treats as "absent".
+            die(f"gh: Not Found (HTTP 404) — branch {branch} not found in {slug}", 1)
+        emit({"name": branch, "commit": {"sha": "0" * 40}}, jq)
+        return 0
+
+    if resource == "pulls" and len(tail) == 2:
+        number = int(tail[1])
+        spec = consume_failure(world, f"{slug}:pull:{number}")
+        if spec:
+            fail_with(spec)
+        for pr in repo.get("pulls", []):
+            if int(pr["number"]) == number:
+                emit(pr, jq)
+                return 0
+        die(f"gh: Not Found (HTTP 404) — pull request {slug}#{number}", 1)
+
+    if resource == "pulls" and method == "POST":
+        spec = consume_failure(world, f"{slug}:pull_create")
+        if spec:
+            fail_with(spec)
+        head = fields.get("head", "")
+        existing = [
+            pr
+            for pr in repo.get("pulls", [])
+            if pr.get("head", {}).get("ref") == head and pr.get("state") == "open"
+        ]
+        if existing:
+            # GitHub refuses a second open PR for the same head/base pair. The
+            # service must never rely on this error, but it must not be able to
+            # mistake it for success either.
+            die(
+                'gh: Validation Failed (HTTP 422) {"errors":[{"message":"A pull request '
+                'already exists for this branch"}]}',
+                1,
+            )
+        pulls = repo.setdefault("pulls", [])
+        number = max([int(pr["number"]) for pr in pulls] or [0]) + 1
+        record = {
+            "number": number,
+            "state": "open",
+            "merged_at": None,
+            "head": {"ref": head, "sha": "0" * 40},
+            "html_url": f"https://github.com/{slug}/pull/{number}",
+            "title": fields.get("title", ""),
+            "body": fields.get("body", ""),
+            "base": {"ref": fields.get("base", "main")},
+        }
+        pulls.append(record)
+        save_world(world)
+        emit(record, jq)
+        return 0
+
     if resource == "pulls":
         spec = consume_failure(world, f"{slug}:pulls")
         if spec:
             fail_with(spec)
         items = repo.get("pulls", [])
+        # `head=owner:branch` is how the service looks for the PR belonging to a
+        # branch it owns. Honouring it is what makes the adoption/recovery tests
+        # meaningful rather than accidentally passing on an unfiltered list.
+        head_filter = fields.get("head")
+        if head_filter:
+            wanted = head_filter.split(":", 1)[-1]
+            state_filter = fields.get("state")
+            items = [
+                pr
+                for pr in items
+                if pr.get("head", {}).get("ref") == wanted
+                and (state_filter in (None, "all") or pr.get("state") == state_filter)
+            ]
         if pad_pages and page <= pad_pages:
             # Return an exactly-full page so the client keeps paginating and
             # eventually hits its own cap: a genuinely truncated listing.

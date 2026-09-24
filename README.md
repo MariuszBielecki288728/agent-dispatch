@@ -16,34 +16,52 @@ Built for a single trusted personal development VM. Deliberately small: **simpli
 | Architecture and task state contract | [#2](https://github.com/MariuszBielecki288728/agent-dispatch/issues/2) | ✅ Merged — see [`docs/architecture.md`](docs/architecture.md) |
 | MVP foundation: service, polling, queue | #3 | ✅ Merged — see [`docs/operations.md`](docs/operations.md) |
 | Developer tooling: uv, Ruff, pre-commit | #14 | ✅ Implemented — see [`docs/operations.md` §2](docs/operations.md) |
-| MVP execution: worktree, session, PR | #4 | Planned |
+| MVP execution: worktree, session, PR | [#4](https://github.com/MariuszBielecki288728/agent-dispatch/issues/4) | ✅ Implemented — see [`docs/operations.md` §0–§12](docs/operations.md) |
 | Review loop: feedback collection, handoff | #5 | Planned |
 | Operational release and pilot | #6 | Planned |
 
-**Implemented today: the service queues work; it does not execute it.**
-There is one installable Python package with one CLI entry point, one polling
-loop, one SQLite database, one single-instance lock, and **no third-party
-dependencies** (stdlib `tomllib`/`sqlite3`/`fcntl`). It discovers Issues labelled
-`take-it` in allowlisted repositories through the configured `gh-craftlypse`
-wrapper and maintains an idempotent durable queue.
+**Implemented today: the full one-task loop, Issue → PR.**
+One installable Python package, one CLI entry point, one polling loop, one SQLite
+database, one single-instance lock, and **no third-party dependencies** (stdlib
+`tomllib`/`sqlite3`/`fcntl`). A queued `take-it` Issue is implemented by Command
+Code in a task-owned Git worktree, validated, committed, pushed, and opened as
+exactly one PR owned by that task, then it waits for review.
 
-**Nothing here starts an agent.** No `commandcode` invocation exists in the code
-base yet, and no task is ever promoted to `running`; discovery is not
-implementation. Branch/worktree creation, sessions, pushes and PRs are #4, and
-the `agent:fix` review loop is #5. Those are documented as future work rather
-than stubbed.
+```
+poll -> queue -> claim (conditional SQL) -> worktree + branch
+     -> Command Code run (pinned model/effort/--yolo, bounded turns, wall-clock cap)
+     -> validate the stream -> push -> one PR -> awaiting_review
+```
 
-**The worker is the only command that writes durable state.** `status` and
-`dry-run` read a read-only snapshot and simulate the poll in scratch memory, so
-asking what the queue contains cannot change it.
+What it will **not** do, on purpose:
+
+- **`subtype=success` is not trusted.** A run whose tool calls were refused still
+  reports success with exit 0. The `tool_hook_blocked` event is scanned for and any
+  occurrence fails the task — the single most important correctness rule here.
+- **It never merges, approves, or closes anything.**
+- **It never claims a PR it did not create.** A PR that merely references the Issue
+  is recorded as an observation (`obs#N`), never as owned (`own#N`).
+- **It never resumes an interrupted run.** Command Code writes a transcript only on
+  clean completion, so a retry starts a *fresh* session in the same worktree with
+  the existing edits preserved, and says so.
+
+The `agent:fix` review loop is #5 and is documented as future work rather than
+stubbed.
+
+**`status`, `dry-run` and `open` never write and never start an agent.** They read a
+read-only snapshot, and `status`/`dry-run` simulate the poll in scratch memory, so
+asking what the queue contains cannot change it or spend a model call. `worker` and
+`run` are the only commands that do either.
 
 ```bash
 uv sync --locked                         # one locked environment, no third-party runtime deps
 mkdir -p ~/.local/bin
 ln -sf "$PWD/.venv/bin/agent-dispatch" ~/.local/bin/agent-dispatch
 
-agent-dispatch doctor      # wrapper, allowlist, labels, state placement, systemd
+agent-dispatch doctor      # wrapper, allowlist, labels, state placement, runtime, systemd
 agent-dispatch dry-run     # one poll that writes nothing to disk or GitHub
+agent-dispatch run         # execute one queued task through to exactly one PR
+agent-dispatch open --repo owner/name --issue 12   # branch, worktree, session, PR
 ```
 
 **uv owns the environment.** The same tool and the same committed `uv.lock`

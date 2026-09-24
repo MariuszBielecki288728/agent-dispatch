@@ -71,6 +71,7 @@ class WorkerConfig:
     run_log_keep: int
     lock_file: Path
     commandcode_path: str | None
+    write_repo_local_credentials: bool
 
 
 @dataclass(frozen=True)
@@ -216,6 +217,11 @@ def _build(raw: dict[str, Any], source_path: Path) -> Config:
             worker_raw.get("lock_file", "~/.local/state/agent-dispatch/worker.lock")
         ),
         commandcode_path=worker_raw.get("commandcode_path"),
+        # Default chosen so the common path is the safe one: a clone's own Git
+        # config is NOT edited unless the operator asks, because a worktree shares
+        # its clone's common config and that may be a personal checkout. The
+        # credential env pairs cover orchestrator and agent Git without it.
+        write_repo_local_credentials=bool(worker_raw.get("write_repo_local_credentials", False)),
     )
 
     github = GithubConfig(
