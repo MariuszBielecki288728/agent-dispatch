@@ -1,4 +1,4 @@
-name: CI Smoke Test
+name: CI
 
 on:
   push:
@@ -7,7 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  smoke-test:
+  offline-suite:
+    name: Offline test-suite (deterministic, no network)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -18,6 +19,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run deterministic smoke verification suite
-        run: |
-          ./scripts/smoke-runtime.sh --mock
+      # Issue #3 acceptance requirement: the fixture/fake-wrapper suite covers
+      # discovery, pagination, Issue-vs-PR filtering, allowlist enforcement,
+      # auth/label failures, repeated polls, restarts, label removal/re-add,
+      # pre-existing PRs and failure/retry behaviour — with no paid model calls
+      # and no live GitHub mutation.
+      - name: Run offline dispatch suite
+        run: ./scripts/test-offline.sh
+
+      # The Issue #1/#2 validation suite is kept as a regression gate. It also
+      # runs offline in --mock mode.
+      - name: Run runtime validation suite (mock)
+        run: ./scripts/smoke-runtime.sh --mock

@@ -1,0 +1,36 @@
+[Unit]
+Description=agent-dispatch — GitHub Issue polling and dispatch queue
+Documentation=file:%h/code/agent-dispatch/docs/architecture.md
+# No network requirement is declared: the worker must start even when GitHub is
+# unreachable, report the failure honestly, and leave existing tasks unchanged.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the config path (and the interpreter path if you did not `pipx install`
+# or `pip install --user` the package):
+#   agent-dispatch --config %h/.config/agent-dispatch/config.toml worker
+ExecStart=%h/.local/bin/agent-dispatch --config %h/.config/agent-dispatch/config.toml worker
+
+# The worker holds a single-instance flock; restarting it after a crash is safe
+# because the lock is released by the OS when the process dies.
+Restart=on-failure
+RestartSec=15
+
+# Structured logs land in the user journal:  journalctl --user -u agent-dispatch -f
+StandardOutput=journal
+StandardError=journal
+
+# Modest hardening that does NOT break the required behaviour:
+#  * the worker writes only to its state dir under $HOME,
+#  * it must keep running with no VS Code window attached (see Linger below).
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Do not let a hung poll block shutdown forever.
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
