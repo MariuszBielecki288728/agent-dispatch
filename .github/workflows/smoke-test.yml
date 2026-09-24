@@ -21,22 +21,39 @@ jobs:
       # uv is the single source of tool versions: it installs the interpreter,
       # Ruff and pre-commit from the committed uv.lock, so CI cannot drift from
       # a developer's `uv sync --locked` environment.
-      # The interpreter version is pinned explicitly, in addition to the lock:
-      # uv.lock pins *packages* resolved for `requires-python`, not the Python
-      # minor version itself. `.python-version` (3.12, matching the verified VM)
-      # makes local `uv sync` reproducible; this pins CI to the same version.
+      # The interpreter minor version is pinned by the committed `.python-version`,
+      # which uv reads natively — so there is ONE source of truth rather than the
+      # version being repeated here where it could drift.
+      #
+      # Note: `uv.lock` pins *packages* resolved against `requires-python`, not the
+      # Python minor version itself. A step below asserts the resolved minor
+      # version, so the pin is verified rather than merely assumed.
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
-          python-version-file: .python-version
 
       # `--locked` fails if uv.lock is out of date with pyproject.toml, so a
       # dependency change without a refreshed lock is rejected here rather than
       # silently resolving something different from what developers installed.
       - name: Sync the locked environment
         run: uv sync --locked
+
+      # Fail loudly if the interpreter is not the pinned minor version, instead of
+      # trusting that `.python-version` was honoured.
+      - name: Verify the pinned Python version
+        run: |
+          uv run --no-sync python - <<'PY'
+          import pathlib, sys, tomllib
+
+          pinned = pathlib.Path(".python-version").read_text().strip()
+          actual = f"{sys.version_info.major}.{sys.version_info.minor}"
+          print(f".python-version={pinned}  interpreter={actual}  ({sys.version})")
+          assert actual == pinned, f"expected Python {pinned}, got {actual}"
+          requires = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["requires-python"]
+          print(f"requires-python={requires}  OK")
+          PY
 
       # Issue #14: one lint/format gate, run from the locked environment.
       # E4/E7/E9/F/I; see [tool.ruff] in pyproject.toml for the rationale.

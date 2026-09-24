@@ -18,12 +18,16 @@ Two things are pinned, and they are not the same thing:
 | What | Pinned by | Guarantee |
 |---|---|---|
 | Package/tool versions (Ruff, pre-commit) | `uv.lock` | exact resolved versions; `--locked` refuses any drift |
-| Python minor version | `.python-version` (`3.12`) | `uv` selects 3.12 locally and in CI |
+| Python minor version | `.python-version` (`3.12`) | uv selects 3.12 locally; CI asserts the resolved version |
 
 `uv.lock` pins **packages** resolved against `requires-python = ">=3.11"` — it does
-**not** by itself pin the Python minor version. `.python-version` does that, and CI
-passes it to `setup-uv`. On this VM uv reuses the system 3.12.3 rather than
-downloading an interpreter, so the pin costs nothing.
+**not** by itself pin the Python minor version. `.python-version` does that, and uv
+honours it natively (no CI-specific plumbing needed). CI runs an explicit check
+that the resolved interpreter matches the pin, so a drift fails the build instead
+of going unnoticed.
+
+On this VM uv reuses the system 3.12.3 rather than downloading an interpreter, so
+the pin costs nothing.
 
 ### Which sync mode to use
 
