@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -43,12 +42,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
+from agent_dispatch import runlogs  # noqa: E402
 from agent_dispatch.config import ConfigError, build_config, load_config  # noqa: E402
 from agent_dispatch.lockfile import LockBusyError, WorkerLock  # noqa: E402
 from agent_dispatch.logging_setup import Logger  # noqa: E402
 from agent_dispatch.store import Store  # noqa: E402
 from agent_dispatch.worker import Worker  # noqa: E402
-from agent_dispatch import runlogs  # noqa: E402
 
 FAKE_WRAPPER = REPO_ROOT / "tests" / "fake_wrapper.py"
 TRIGGER = "take-it"
@@ -92,7 +91,9 @@ class FakeWorld:
     # ------------------------------------------------------------------ files
 
     def write_world(self) -> None:
-        self.world_path.write_text(json.dumps(self.world, indent=2, sort_keys=True), encoding="utf-8")
+        self.world_path.write_text(
+            json.dumps(self.world, indent=2, sort_keys=True), encoding="utf-8"
+        )
 
     def read_world(self) -> dict:
         return json.loads(self.world_path.read_text(encoding="utf-8"))
@@ -203,7 +204,14 @@ def _toml_value(value: object) -> str:
     return json.dumps(str(value))
 
 
-def issue(number: int, title: str, *, labels: list[str] | None = None, state: str = "open", is_pr: bool = False) -> dict:
+def issue(
+    number: int,
+    title: str,
+    *,
+    labels: list[str] | None = None,
+    state: str = "open",
+    is_pr: bool = False,
+) -> dict:
     payload = {
         "number": number,
         "title": title,
@@ -212,11 +220,15 @@ def issue(number: int, title: str, *, labels: list[str] | None = None, state: st
         "labels": [{"name": name} for name in (labels or [])],
     }
     if is_pr:
-        payload["pull_request"] = {"url": f"https://api.github.com/repos/example/repo/pulls/{number}"}
+        payload["pull_request"] = {
+            "url": f"https://api.github.com/repos/example/repo/pulls/{number}"
+        }
     return payload
 
 
-def pull(number: int, head_ref: str, *, state: str = "open", merged: bool = False, body: str = "") -> dict:
+def pull(
+    number: int, head_ref: str, *, state: str = "open", merged: bool = False, body: str = ""
+) -> dict:
     return {
         "number": number,
         "state": state,
@@ -242,7 +254,13 @@ class BaseCase(unittest.TestCase):
         self.addCleanup(os.environ.pop, "FAKE_GH_WORLD", None)
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
 
-    def worker(self, *, reconcile: bool = True, store: Store | None = None, env_overrides: dict[str, str] | None = None):
+    def worker(
+        self,
+        *,
+        reconcile: bool = True,
+        store: Store | None = None,
+        env_overrides: dict[str, str] | None = None,
+    ):
         os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
         os.environ.pop("FAKE_GH_PAD_FULL_PAGES", None)
         for key, value in (env_overrides or {}).items():
@@ -331,7 +349,9 @@ class DiscoveryTests(BaseCase):
 
     def test_pagination_collects_every_page(self) -> None:
         # per_page is 100 in production; 250 labelled issues forces 3 pages.
-        self.set_issues(*(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 251)))
+        self.set_issues(
+            *(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 251))
+        )
         worker, store, _ = self.worker()
         worker.poll_once()
 
@@ -340,7 +360,9 @@ class DiscoveryTests(BaseCase):
         self.assertEqual({task.issue_number for task in tasks}, set(range(1, 251)))
 
     def test_pagination_is_stable_across_repeated_polls(self) -> None:
-        self.set_issues(*(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 251)))
+        self.set_issues(
+            *(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 251))
+        )
         worker, store, _ = self.worker()
         worker.poll_once()
         worker.poll_once()
@@ -429,7 +451,9 @@ class IdempotencyTests(BaseCase):
 
         tasks = store2.list_tasks(self.slug)
         self.assertEqual(len(tasks), 2)
-        self.assertEqual(self.task(store2, 1).created_at, created_at, "the row must be reused, not recreated")
+        self.assertEqual(
+            self.task(store2, 1).created_at, created_at, "the row must be reused, not recreated"
+        )
 
     def test_cli_worker_once_is_idempotent_across_processes(self) -> None:
         self.set_issues(issue(1, "First", labels=[TRIGGER]))
@@ -558,7 +582,9 @@ class PreExistingPullRequestTests(BaseCase):
         worker.poll_once()
 
         task = self.task(store, 1)
-        self.assertEqual(task.phase, "awaiting_review", "a pre-existing PR must not create implementation work")
+        self.assertEqual(
+            task.phase, "awaiting_review", "a pre-existing PR must not create implementation work"
+        )
         self.assertEqual(task.linked_pr_number, 42)
         dispatchable, reason = task.dispatchability()
         self.assertFalse(dispatchable)
@@ -609,7 +635,9 @@ class PreExistingPullRequestTests(BaseCase):
         worker.poll_once()
         adopted = self.task(store, 1)
         self.assertEqual(adopted.linked_pr_number, 42)
-        self.assertIsNone(adopted.pr_number, "an adopted pre-existing PR is not owned by this worker")
+        self.assertIsNone(
+            adopted.pr_number, "an adopted pre-existing PR is not owned by this worker"
+        )
 
         # #4 records ownership of the PR it will use for this task.
         # `record_pr_ownership` is the #4-only entry point: discovery must never
@@ -842,7 +870,9 @@ class ConcurrencyTests(BaseCase):
         return tomllib.loads(self.world.config_path.read_text(encoding="utf-8"))
 
     def test_active_task_count_never_exceeds_one(self) -> None:
-        self.set_issues(*(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 12)))
+        self.set_issues(
+            *(issue(number, f"Issue {number}", labels=[TRIGGER]) for number in range(1, 12))
+        )
         worker, store, _ = self.worker()
         worker.poll_once()
 
@@ -941,7 +971,9 @@ class PlacementTests(BaseCase):
 
     def test_run_log_paths_live_under_the_configured_state_dir(self) -> None:
         config = self.world.load_config()
-        path = runlogs.run_log_path(config.worker.run_log_dir, self.slug, 7, "20260101T000000Z-run1")
+        path = runlogs.run_log_path(
+            config.worker.run_log_dir, self.slug, 7, "20260101T000000Z-run1"
+        )
         self.assertTrue(
             str(path).startswith(str(self.world.state_dir)),
             "run logs must live under the configured state directory",
@@ -1008,7 +1040,10 @@ class ConfigTests(BaseCase):
         self.assertIsNotNone(task, "existing rows must survive the migration")
         self.assertEqual(task.title, "Legacy row")
         self.assertIsNone(task.pause_reason, "the new column is added as NULL")
-        self.assertIn("pause_reason", {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")})
+        self.assertIn(
+            "pause_reason",
+            {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")},
+        )
 
         # And the new semantics work on the migrated database.
         store.pause_for_withdrawn_label(task.id, "withdrawn")
@@ -1062,7 +1097,9 @@ class ConfigTests(BaseCase):
 
     def test_unknown_key_is_rejected(self) -> None:
         text = self.world.config_path.read_text(encoding="utf-8")
-        text = text.replace("poll_interval_seconds = 20", "poll_interval_seconds = 20\nsurprise_key = true")
+        text = text.replace(
+            "poll_interval_seconds = 20", "poll_interval_seconds = 20\nsurprise_key = true"
+        )
         self.world.config_path.write_text(text, encoding="utf-8")
 
         with self.assertRaises(ConfigError) as ctx:
@@ -1089,7 +1126,9 @@ class ConfigTests(BaseCase):
 
     def test_non_empty_credential_helper_reset_is_rejected(self) -> None:
         text = self.world.config_path.read_text(encoding="utf-8")
-        text = text.replace('credential_helper_reset = ""', 'credential_helper_reset = "!/usr/bin/gh"')
+        text = text.replace(
+            'credential_helper_reset = ""', 'credential_helper_reset = "!/usr/bin/gh"'
+        )
         self.world.config_path.write_text(text, encoding="utf-8")
         with self.assertRaises(ConfigError):
             load_config(self.world.config_path)
@@ -1112,7 +1151,16 @@ class CliSurfaceTests(BaseCase):
     def test_help_lists_the_documented_commands(self) -> None:
         result = self.world.run_cli("--help")
         self.assertEqual(result.returncode, 0)
-        for command in ("doctor", "status", "dry-run", "worker", "pause", "unpause", "retry", "setup-labels"):
+        for command in (
+            "doctor",
+            "status",
+            "dry-run",
+            "worker",
+            "pause",
+            "unpause",
+            "retry",
+            "setup-labels",
+        ):
             self.assertIn(command, result.stdout)
         # Commands that would need #4/#5 are documented as future work, not faked.
         self.assertNotIn("  open ", result.stdout)
@@ -1303,13 +1351,17 @@ class ForeignPrOwnershipTests(BaseCase):
                 f"poll {poll + 1}: a foreign PR became owned; #4 could act on someone else's PR",
             )
             self.assertEqual(task.linked_pr_number, 42)
-            self.assertFalse(task.dispatchability()[0], f"poll {poll + 1}: must stay non-dispatchable")
+            self.assertFalse(
+                task.dispatchability()[0], f"poll {poll + 1}: must stay non-dispatchable"
+            )
 
     def test_owned_pr_and_a_second_linked_pr_keep_ownership(self) -> None:
         # The task owns PR 10; a *different* PR 20 also references the Issue. The
         # recorded owner must not be overwritten by the discovered foreign one.
         self.set_issues(issue(1, "Two PRs", labels=[TRIGGER]))
-        self.set_pulls(pull(10, "dispatch/issue-1-slug"), pull(20, "human/branch", body="Closes #1"))
+        self.set_pulls(
+            pull(10, "dispatch/issue-1-slug"), pull(20, "human/branch", body="Closes #1")
+        )
 
         worker, store, _ = self.worker()
         worker.poll_once()
@@ -1354,7 +1406,9 @@ class TruncatedPrScanTests(BaseCase):
         repo_outcome = outcome.result.repos[0]  # type: ignore[union-attr]
         self.assertEqual(repo_outcome.error_kind, "incomplete_scan")
         self.assertIn("page cap", repo_outcome.error or "")
-        self.assertIsNone(store.get_task(self.slug, 1), "must not queue when PR state is unprovable")
+        self.assertIsNone(
+            store.get_task(self.slug, 1), "must not queue when PR state is unprovable"
+        )
 
     def test_truncated_scan_preserves_a_previously_recorded_pr_observation(self) -> None:
         self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
@@ -1366,15 +1420,15 @@ class TruncatedPrScanTests(BaseCase):
         self.assertEqual(before.linked_pr_number, 42)
 
         # Now the PR listing becomes unreadable due to truncation.
-        worker, _store, _ = self.worker(
-            store=store, env_overrides={"FAKE_GH_PAD_FULL_PAGES": "60"}
-        )
+        worker, _store, _ = self.worker(store=store, env_overrides={"FAKE_GH_PAD_FULL_PAGES": "60"})
         outcome = worker.poll_once()
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.result.repos[0].error_kind, "incomplete_scan")  # type: ignore[union-attr]
 
         after = self.task(store, 1)
-        self.assertEqual(after.linked_pr_number, 42, "a truncated scan must not clear the observation")
+        self.assertEqual(
+            after.linked_pr_number, 42, "a truncated scan must not clear the observation"
+        )
         self.assertEqual(after.phase, before.phase)
         self.assertEqual(after.updated_at, before.updated_at, "task state must be left untouched")
 
@@ -1547,13 +1601,39 @@ class LabelSetupTests(BaseCase):
         second = self.world.run_cli("setup-labels", "--repo", self.slug, "--yes")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("already present", second.stdout)
-        names_after = {label["name"] for label in self.world.read_world()["repos"][self.slug]["labels"]}
+        names_after = {
+            label["name"] for label in self.world.read_world()["repos"][self.slug]["labels"]
+        }
         self.assertEqual(names_after, {TRIGGER, HANDOFF}, "a second run must not duplicate labels")
 
     def test_setup_labels_refuses_non_allowlisted_repos(self) -> None:
         result = self.world.run_cli("setup-labels", "--repo", "nobody/other", "--yes")
         self.assertEqual(result.returncode, 1)
         self.assertIn("allowlist", result.stderr)
+
+    def test_setup_labels_reports_a_label_read_failure_honestly(self) -> None:
+        # The failure path in `_cmd_setup_labels` references GitHubError; if that
+        # name is not imported the handler raises NameError instead of reporting
+        # the GitHub problem, which is worse than the original error.
+        self.inject_failure(f"{self.slug}:labels", stderr="rate limit exceeded")
+
+        result = self.world.run_cli("setup-labels", "--repo", self.slug, "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("NameError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("label_read_failed", result.stderr)
+
+    def test_setup_labels_reports_a_label_create_failure_honestly(self) -> None:
+        # Same NameError trap on the create path.
+        self.world.world["repos"][self.slug]["labels"] = []  # type: ignore[index]
+        self.world.write_world()
+        self.inject_failure(f"{self.slug}:label_create", stderr="could not create label")
+
+        result = self.world.run_cli("setup-labels", "--repo", self.slug, "--yes")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("NameError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("label_create_failed", result.stderr)
 
 
 if __name__ == "__main__":

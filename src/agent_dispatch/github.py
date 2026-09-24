@@ -125,7 +125,10 @@ class PullRequest:
                 return True
 
         for url_match in _ISSUE_URL_RE.finditer(text):
-            if url_match.group("repo").lower() == repo.lower() and int(url_match.group("num")) == issue_number:
+            if (
+                url_match.group("repo").lower() == repo.lower()
+                and int(url_match.group("num")) == issue_number
+            ):
                 return True
         return False
 
@@ -264,7 +267,9 @@ class GitHubClient:
         data = self._run_json(["api", f"repos/{slug}"])
         if isinstance(data, dict) and data.get("full_name"):
             return str(data["full_name"])
-        raise GitHubError(f"GitHub returned no data for repository {slug}", kind=ErrorKind.MALFORMED)
+        raise GitHubError(
+            f"GitHub returned no data for repository {slug}", kind=ErrorKind.MALFORMED
+        )
 
     def list_labels(self, slug: str) -> set[str]:
         names: set[str] = set()
@@ -317,9 +322,7 @@ class GitHubClient:
         it were an Issue.
         """
         issues: list[Issue] = []
-        for raw in self._paginate(
-            f"repos/{slug}/issues", {"state": "open", "labels": label}
-        ):
+        for raw in self._paginate(f"repos/{slug}/issues", {"state": "open", "labels": label}):
             if not isinstance(raw, dict):
                 continue
             if "pull_request" in raw:
@@ -510,22 +513,37 @@ def _classify_failure(returncode: int, stderr: str, argv: Sequence[str]) -> GitH
             kind=ErrorKind.RATE_LIMIT,
             detail=text,
         )
-    if "no such host" in lowered or "connection refused" in lowered or "dial tcp" in lowered \
-            or "network is unreachable" in lowered or "tls handshake" in lowered \
-            or "could not resolve host" in lowered:
+    if (
+        "no such host" in lowered
+        or "connection refused" in lowered
+        or "dial tcp" in lowered
+        or "network is unreachable" in lowered
+        or "tls handshake" in lowered
+        or "could not resolve host" in lowered
+    ):
         return GitHubError(
             f"network error contacting GitHub for {hint}: {text}",
             kind=ErrorKind.NETWORK,
             detail=text,
         )
-    if "bad credentials" in lowered or "http 401" in lowered or "authentication" in lowered \
-            or "token" in lowered and "invalid" in lowered:
+    if (
+        "bad credentials" in lowered
+        or "http 401" in lowered
+        or "authentication" in lowered
+        or "token" in lowered
+        and "invalid" in lowered
+    ):
         return GitHubError(
             f"GitHub authentication failed for {hint}: {text}",
             kind=ErrorKind.AUTH,
             detail=text,
         )
-    if "http 404" in lowered or "not found" in lowered or "http 403" in lowered or "forbidden" in lowered:
+    if (
+        "http 404" in lowered
+        or "not found" in lowered
+        or "http 403" in lowered
+        or "forbidden" in lowered
+    ):
         return GitHubError(
             f"GitHub denied access for {hint}: {text}",
             kind=ErrorKind.DENIED_REPO,

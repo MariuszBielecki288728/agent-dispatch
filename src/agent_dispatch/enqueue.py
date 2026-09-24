@@ -23,7 +23,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import Config, RepoConfig
-from .discovery import ACCEPTED_ACTIONS, ACTION_ALREADY_QUEUED, ACTION_OBSERVED_PR, ACTION_OWN_PR_RECONCILED, Discovery
+from .discovery import (
+    ACCEPTED_ACTIONS,
+    ACTION_ALREADY_QUEUED,
+    ACTION_OBSERVED_PR,
+    ACTION_OWN_PR_RECONCILED,
+    Discovery,
+)
 from .github import GitHubClient, GitHubError
 from .logging_setup import Logger
 from .store import Store, Task
@@ -90,7 +96,9 @@ def enqueue_issue(
 
     if record.action in {ACTION_OWN_PR_RECONCILED, ACTION_OBSERVED_PR}:
         log.error("enqueue_rejected", repo=repo.slug, issue=issue_number, detail=verdict.message)
-        return EnqueueOutcome(False, task, f"{repo.slug}#{issue_number}: {verdict.message}", reason=verdict.reason)
+        return EnqueueOutcome(
+            False, task, f"{repo.slug}#{issue_number}: {verdict.message}", reason=verdict.reason
+        )
 
     detail = record.note or verdict.message
     if task is None:
@@ -98,4 +106,6 @@ def enqueue_issue(
     else:
         detail += f" (existing row kept as {task.phase}; existing work is not duplicated)"
     log.error("enqueue_rejected", repo=repo.slug, issue=issue_number, detail=detail)
-    return EnqueueOutcome(False, task, f"{repo.slug}#{issue_number}: {detail}", reason=verdict.reason)
+    return EnqueueOutcome(
+        False, task, f"{repo.slug}#{issue_number}: {detail}", reason=verdict.reason
+    )

@@ -12,6 +12,9 @@
 #     timer on top would schedule a second, competing mechanism.
 #   * The service is installed for the current user only; nothing is written into
 #     any target repository.
+#   * The unit calls the uv-installed executable directly, never `uv run`, so a
+#     restart cannot trigger a dependency sync. Upgrading is an explicit
+#     `uv sync --locked --no-dev` followed by a restart (see docs/operations.md).
 #
 #   ./scripts/install-service.sh --install     # install + enable + start
 #   ./scripts/install-service.sh --status      # unit + lock + last polls
@@ -40,6 +43,21 @@ Usage: $0 [--install | --status | --uninstall | --help]
   --install    Render the unit, enable and start agent-dispatch.service.
   --status     Show unit state, lock holder and recent poll log lines.
   --uninstall  Stop, disable and delete the user unit.
+
+Canonical uv workflow (see docs/operations.md):
+
+  # first-time setup of the runtime environment
+  uv sync --locked --no-dev
+  mkdir -p ~/.local/bin
+  ln -sf $REPO_ROOT/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch
+
+  # upgrade an existing deployment (state, config and logs are untouched)
+  git pull
+  uv sync --locked --no-dev
+  systemctl --user restart agent-dispatch.service
+
+The unit invokes the installed executable directly and never \`uv run\`, so a
+restart cannot trigger a dependency sync.
 
 Environment:
   AGENT_DISPATCH_CONFIG  config path written into the unit (default: $CONFIG_PATH)
@@ -81,11 +99,19 @@ cmd_install() {
 
     local bin
     if ! bin="$(command -v agent-dispatch)"; then
-        log_fail "agent-dispatch is not on PATH. Install it first (see docs/operations.md):"
-        log_fail "  python3 -m venv ~/.local/share/agent-dispatch/venv"
-        log_fail "  ~/.local/share/agent-dispatch/venv/bin/pip install $REPO_ROOT"
+        log_fail "agent-dispatch is not on PATH. Install it first (see docs/operations.md §1):"
+        log_fail "  cd $REPO_ROOT"
+        log_fail "  uv sync --locked --no-dev          # runtime-only environment"
         log_fail "  mkdir -p ~/.local/bin"
-        log_fail "  ln -sf ~/.local/share/agent-dispatch/venv/bin/agent-dispatch ~/.local/bin/agent-dispatch"
+        log_fail "  ln -sf $REPO_ROOT/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch"
+        exit 1
+    fi
+
+    # The unit must not invoke `uv run`: that can sync/download packages when the
+    # environment does not match the lock, and a service restart must not mutate
+    # the deployment. Point the unit at the installed executable instead.
+    if [[ "$(basename "$bin")" == "uv" ]]; then
+        log_fail "agent-dispatch resolved to 'uv'; the unit must call the installed executable."
         exit 1
     fi
 

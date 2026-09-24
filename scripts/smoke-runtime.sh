@@ -75,6 +75,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Interpreter used for every inline validation snippet in this script.
+# Callers select it with PYTHON=... (CI passes the uv-managed interpreter so the
+# suite runs on the same Python as the application); the default keeps the script
+# usable straight from a checkout with no environment prepared.
+PYTHON="${PYTHON:-python3}"
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    log_fail "interpreter not found: $PYTHON"
+    exit 1
+fi
+
 # ==============================================================================
 # Shared Turn Validator & Data Parser
 #
@@ -90,7 +100,7 @@ validate_turn() {
     local expected_session_id="${3:-}"
     local expected_token="${4:-}"
 
-    python3 - "$log_file" "$exit_code" "$expected_session_id" "$expected_token" << 'PYEOF'
+    "$PYTHON" - "$log_file" "$exit_code" "$expected_session_id" "$expected_token" << 'PYEOF'
 import sys, json, os
 
 log_file = sys.argv[1]
@@ -211,7 +221,7 @@ PYEOF
 
 parse_validation_field() {
     local field="$1"
-    python3 -c 'import sys, json; data = json.load(sys.stdin); val = data.get(sys.argv[1]); print(val if val is not None else "")' "$field"
+    "$PYTHON" -c 'import sys, json; data = json.load(sys.stdin); val = data.get(sys.argv[1]); print(val if val is not None else "")' "$field"
 }
 
 # ==============================================================================
@@ -339,7 +349,7 @@ EOF
     rm -f "$canary_file"
     local fake_hostile="$SCRATCH_DIR/fake_hostile.jsonl"
 
-    python3 - "$fake_hostile" "$canary_file" << 'PYEOF'
+    "$PYTHON" - "$fake_hostile" "$canary_file" << 'PYEOF'
 import sys, json
 fake_file = sys.argv[1]
 canary = sys.argv[2]

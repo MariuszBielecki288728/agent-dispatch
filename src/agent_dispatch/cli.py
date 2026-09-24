@@ -30,7 +30,7 @@ from . import __version__
 from .config import Config, ConfigError, load_config
 from .doctor import run_doctor
 from .enqueue import enqueue_issue
-from .github import GitHubClient
+from .github import GitHubClient, GitHubError
 from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
 from .runlogs import prune
@@ -68,20 +68,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"agent-dispatch {__version__}")
-    parser.add_argument("--config", metavar="PATH", help="configuration file (default: ~/.config/agent-dispatch/config.toml)")
-    parser.add_argument("--log-format", choices=("text", "json"), default="text", help="log output format")
-    parser.add_argument("-v", "--verbose", action="store_true", help="include debug-level log lines")
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="configuration file (default: ~/.config/agent-dispatch/config.toml)",
+    )
+    parser.add_argument(
+        "--log-format", choices=("text", "json"), default="text", help="log output format"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="include debug-level log lines"
+    )
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    doctor = subparsers.add_parser("doctor", help="verify environment, wrapper, allowlist, labels and state placement")
-    doctor.add_argument("--skip-github", action="store_true", help="do local checks only; make no API calls")
-    doctor.add_argument("--timeout", type=float, default=60.0, help="per-call wrapper timeout in seconds")
+    doctor = subparsers.add_parser(
+        "doctor", help="verify environment, wrapper, allowlist, labels and state placement"
+    )
+    doctor.add_argument(
+        "--skip-github", action="store_true", help="do local checks only; make no API calls"
+    )
+    doctor.add_argument(
+        "--timeout", type=float, default=60.0, help="per-call wrapper timeout in seconds"
+    )
 
     status = subparsers.add_parser("status", help="show queued tasks and dispatchability")
     status.add_argument("--repo", help="restrict output to one allowlisted repository")
     status.add_argument("--json", action="store_true", help="machine-readable output")
-    status.add_argument("--no-sync", action="store_true", help="read local state only; make no API calls")
+    status.add_argument(
+        "--no-sync", action="store_true", help="read local state only; make no API calls"
+    )
 
     dry = subparsers.add_parser(
         "dry-run",
@@ -95,10 +111,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = subparsers.add_parser("worker", help="run the polling worker in the foreground")
     worker.add_argument("--interval", type=int, help="override worker.poll_interval_seconds")
-    worker.add_argument("--once", action="store_true", help="run a single poll and exit (still writes state)")
+    worker.add_argument(
+        "--once", action="store_true", help="run a single poll and exit (still writes state)"
+    )
     worker.add_argument("--timeout", type=int, help="override worker.run_timeout_seconds")
 
-    enqueue = subparsers.add_parser("enqueue", help="queue one labelled Issue now instead of waiting for a poll")
+    enqueue = subparsers.add_parser(
+        "enqueue", help="queue one labelled Issue now instead of waiting for a poll"
+    )
     enqueue.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
     enqueue.add_argument("--issue", type=int, required=True, help="Issue number")
 
@@ -111,7 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
         sub.add_argument("--issue", type=int, required=True, help="Issue number")
 
-    prune_parser = subparsers.add_parser("prune-logs", help="delete run logs beyond worker.run_log_keep")
+    prune_parser = subparsers.add_parser(
+        "prune-logs", help="delete run logs beyond worker.run_log_keep"
+    )
     prune_parser.add_argument("--dry-run", action="store_true", help="report what would be removed")
 
     labels = subparsers.add_parser(
@@ -119,7 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly create the dispatch labels in an allowlisted repository (idempotent)",
     )
     labels.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
-    labels.add_argument("--yes", action="store_true", help="required acknowledgement that this writes to GitHub")
+    labels.add_argument(
+        "--yes", action="store_true", help="required acknowledgement that this writes to GitHub"
+    )
 
     return parser
 
@@ -269,7 +293,11 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         )
         print()
         if not tasks:
-            print("  no tasks recorded. Label an Issue `" + config.github.trigger_label + "` and run `agent-dispatch dry-run`.")
+            print(
+                "  no tasks recorded. Label an Issue `"
+                + config.github.trigger_label
+                + "` and run `agent-dispatch dry-run`."
+            )
             return EXIT_OK
 
         header = f"  {'TASK':<28} {'PHASE':<15} {'INTENT':<7} {'PR':<6} DISPATCH"
@@ -285,7 +313,9 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
                 print(f"      note: {task.last_error}")
 
         print()
-        print("  Note: no task is promoted to `running` in this release; queueing is not implementation.")
+        print(
+            "  Note: no task is promoted to `running` in this release; queueing is not implementation."
+        )
         return EXIT_OK
     finally:
         view.close()
@@ -371,7 +401,9 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
     if result.result is not None:
         for repo_outcome in result.result.repos:
             if repo_outcome.failed:
-                print(f"  {repo_outcome.slug}: FAILED ({repo_outcome.error_kind}) {repo_outcome.error}")
+                print(
+                    f"  {repo_outcome.slug}: FAILED ({repo_outcome.error_kind}) {repo_outcome.error}"
+                )
                 continue
             print(
                 f"  {repo_outcome.slug}: queued={repo_outcome.queued} requeued={repo_outcome.requeued} "
@@ -478,10 +510,21 @@ def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) 
         try:
             task = getattr(store, action)(args.repo, args.issue)
         except ValueError as exc:
-            log.error("action_rejected", action=action, repo=args.repo, issue=args.issue, error=str(exc))
+            log.error(
+                "action_rejected", action=action, repo=args.repo, issue=args.issue, error=str(exc)
+            )
             return EXIT_FAILURE
-        log.info("action_applied", action=action, repo=task.repo, issue=task.issue_number, phase=task.phase)
-        print(f"{task.ref}: {action} → {task.phase}" + (f" ({task.last_error})" if task.last_error else ""))
+        log.info(
+            "action_applied",
+            action=action,
+            repo=task.repo,
+            issue=task.issue_number,
+            phase=task.phase,
+        )
+        print(
+            f"{task.ref}: {action} → {task.phase}"
+            + (f" ({task.last_error})" if task.last_error else "")
+        )
         return EXIT_OK
     finally:
         store.close()
@@ -528,7 +571,10 @@ def _cmd_setup_labels(args: argparse.Namespace, config: Config, log: Logger) -> 
         return EXIT_FAILURE
 
     wanted = [
-        (config.github.trigger_label, *MANAGED_LABELS.get(config.github.trigger_label, ("0E8A16", "Dispatch intent"))),
+        (
+            config.github.trigger_label,
+            *MANAGED_LABELS.get(config.github.trigger_label, ("0E8A16", "Dispatch intent")),
+        ),
         (
             config.github.review_handoff_label,
             *MANAGED_LABELS.get(config.github.review_handoff_label, ("1D76DB", "Review handoff")),
@@ -547,11 +593,15 @@ def _cmd_setup_labels(args: argparse.Namespace, config: Config, log: Logger) -> 
             else:
                 print(f"  {name}: already present")
         except GitHubError as exc:
-            log.error("label_create_failed", repo=repo.slug, label=name, kind=exc.kind, error=str(exc))
+            log.error(
+                "label_create_failed", repo=repo.slug, label=name, kind=exc.kind, error=str(exc)
+            )
             return EXIT_FAILURE
 
     log.info("labels_ready", repo=repo.slug, created=created)
-    print(f"{repo.slug}: {created} label(s) created. The trigger protocol is now live for this repository.")
+    print(
+        f"{repo.slug}: {created} label(s) created. The trigger protocol is now live for this repository."
+    )
     return EXIT_OK
 
 

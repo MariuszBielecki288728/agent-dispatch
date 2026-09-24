@@ -52,7 +52,9 @@ PAUSE_MAINTAINER = "maintainer"
 TERMINAL_PHASES = frozenset({"finished"})
 
 #: Phases a task can be paused from.
-PAUSABLE_PHASES = frozenset({"queued", "awaiting_review", "feedback_queued", "failed", "needs_attention"})
+PAUSABLE_PHASES = frozenset(
+    {"queued", "awaiting_review", "feedback_queued", "failed", "needs_attention"}
+)
 
 #: Phases `retry` may reschedule.
 RETRYABLE_PHASES = frozenset({"failed", "needs_attention"})
@@ -237,15 +239,12 @@ class Store:
     #: Columns added after the first release, applied to an existing database so
     #: an upgrade does not require deleting state. Deliberately additive only:
     #: nothing is dropped or rewritten, and no row is ever deleted here.
-    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-        ("tasks", "pause_reason", "TEXT"),
-    )
+    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (("tasks", "pause_reason", "TEXT"),)
 
     def _add_missing_columns(self) -> None:
         for table, column, column_type in self._ADDED_COLUMNS:
             existing = {
-                str(info["name"])
-                for info in self._conn.execute(f"PRAGMA table_info({table})")
+                str(info["name"]) for info in self._conn.execute(f"PRAGMA table_info({table})")
             }
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
@@ -262,8 +261,10 @@ class Store:
     # ------------------------------------------------------------------ reads
 
     def list_tasks(self, repo: str | None = None) -> list[Task]:
-        sql = "SELECT t.*, o.trigger_present, o.issue_state, o.linked_pr_number, o.linked_pr_state, o.observed_at " \
-              "FROM tasks t LEFT JOIN observed_state o ON o.task_id = t.id"
+        sql = (
+            "SELECT t.*, o.trigger_present, o.issue_state, o.linked_pr_number, o.linked_pr_state, o.observed_at "
+            "FROM tasks t LEFT JOIN observed_state o ON o.task_id = t.id"
+        )
         params: tuple[Any, ...] = ()
         if repo is not None:
             sql += " WHERE t.repo = ?"
@@ -288,7 +289,9 @@ class Store:
 
     def active_task_count(self) -> int:
         """Tasks with a live agent process. The MVP allows at most one, globally."""
-        row = self._conn.execute("SELECT COUNT(*) AS n FROM tasks WHERE phase = 'running'").fetchone()
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE phase = 'running'"
+        ).fetchone()
         return int(row["n"])
 
     # ----------------------------------------------------------------- writes
@@ -353,7 +356,14 @@ class Store:
                     "INSERT INTO observed_state (task_id, trigger_present, issue_state, linked_pr_number, "
                     "linked_pr_state, observed_at) VALUES (?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (task_id) DO NOTHING",
-                    (task_id, int(trigger_present), issue_state, linked_pr_number, linked_pr_state, now),
+                    (
+                        task_id,
+                        int(trigger_present),
+                        issue_state,
+                        linked_pr_number,
+                        linked_pr_state,
+                        now,
+                    ),
                 )
                 return True
 

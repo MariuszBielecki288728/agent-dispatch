@@ -14,7 +14,8 @@ Built for a single trusted personal development VM. Deliberately small: **simpli
 |---|---|---|
 | Feasibility spike (runtime, GitHub access, VM) | [#1](https://github.com/MariuszBielecki288728/agent-dispatch/issues/1) | ✅ Closed — see [`docs/feasibility.md`](docs/feasibility.md) |
 | Architecture and task state contract | [#2](https://github.com/MariuszBielecki288728/agent-dispatch/issues/2) | ✅ Merged — see [`docs/architecture.md`](docs/architecture.md) |
-| MVP foundation: service, polling, queue | #3 | ✅ Implemented — see [`docs/operations.md`](docs/operations.md) |
+| MVP foundation: service, polling, queue | #3 | ✅ Merged — see [`docs/operations.md`](docs/operations.md) |
+| Developer tooling: uv, Ruff, pre-commit | #14 | ✅ Implemented — see [`docs/operations.md` §2](docs/operations.md) |
 | MVP execution: worktree, session, PR | #4 | Planned |
 | Review loop: feedback collection, handoff | #5 | Planned |
 | Operational release and pilot | #6 | Planned |
@@ -37,15 +38,21 @@ than stubbed.
 asking what the queue contains cannot change it.
 
 ```bash
-python3 -m venv ~/.local/share/agent-dispatch/venv
-~/.local/share/agent-dispatch/venv/bin/pip install .
+uv sync --locked --no-dev                # one locked environment, no third-party deps
+mkdir -p ~/.local/bin
+ln -sf "$PWD/.venv/bin/agent-dispatch" ~/.local/bin/agent-dispatch
+
 agent-dispatch doctor      # wrapper, allowlist, labels, state placement, systemd
 agent-dispatch dry-run     # one poll that writes nothing to disk or GitHub
 ```
 
+**uv owns the environment.** The same tool and the same committed `uv.lock`
+produce the development environment and the deployable one (`--no-dev`); `uv run`
+is never used by the service unit, so a restart cannot sync or download packages.
 See **[`docs/operations.md`](docs/operations.md)** for install, configuration,
-the `systemd --user` unit, pause/unpause/retry semantics, log locations and the
-release's explicit limitations.
+the `systemd --user` unit, pause/unpause/retry semantics, log locations, the
+migration recipe from the pre-uv virtualenv, and the release's explicit
+limitations.
 
 ---
 
@@ -61,14 +68,32 @@ release's explicit limitations.
 
 ## Development
 
+One locked environment provides the interpreter, Ruff and pre-commit; there is no
+second, independently versioned tool copy to drift out of sync.
+
 ```bash
-./scripts/test-offline.sh      # deterministic suite: no network, no model credits, no GitHub mutation
-./scripts/smoke-runtime.sh --mock
+uv sync --locked                          # create/update the environment
+uv run --no-sync ruff check .             # lint
+uv run --no-sync ruff format --check .    # verify formatting
+uv run --no-sync ruff format .            # apply fixes locally
+uv run --no-sync pre-commit install       # install the git hook
+uv run --no-sync pre-commit run --all-files
+
+PYTHON=.venv/bin/python ./scripts/test-offline.sh        # deterministic suite
+PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 ```
 
-The offline suite drives the real `GitHubClient`/`Discovery`/`Worker` code against
-tests/fake_wrapper.py`, an executable that speaks the same CLI surface as the
-approved wrapper. It covers discovery and pagination, Issue-vs-PR filtering,
+`--no-sync` runs the already-locked environment and never resolves or downloads
+anything; a missing environment fails loudly rather than falling back to a system
+Ruff/Python. The pre-commit hooks use `language: system` and call the locked Ruff
+through `uv run --no-sync`, so they cannot disagree with CI. No hook runs a model,
+spends credits, or touches GitHub.
+
+CI runs the same commands after `uv sync --locked`, so a dependency change without
+a refreshed `uv.lock` is rejected rather than silently resolving something
+different. The offline suite drives the real `GitHubClient`/`Discovery`/`Worker`
+code against tests/fake_wrapper.py, an executable that speaks the same CLI surface
+as the approved wrapper. It covers discovery and pagination, Issue-vs-PR filtering,
 allowlist enforcement, missing auth/wrapper/label handling, repeated polls,
 restarts with previously labelled Issues, `take-it` removal and re-add, a
 pre-existing PR for the same Issue, failure/retry paths that must never mark a

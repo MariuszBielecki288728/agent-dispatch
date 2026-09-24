@@ -267,14 +267,16 @@ class Discovery:
 
         for issue in sorted(issues, key=lambda item: item.number):
             linked = _linked_pr(pulls, repo.slug, issue.number)
-            record = self.evaluate_and_record(
-                repo, issue, linked, linked_pr_known=True
-            )
+            record = self.evaluate_and_record(repo, issue, linked, linked_pr_known=True)
             self._count(outcome, issue, record)
 
         # Known tasks whose Issue is no longer returned by the trigger-label query
         # need their label state checked before anything is decided.
-        known = [task for task in self.store.list_tasks(repo.slug) if task.issue_number not in open_issue_numbers]
+        known = [
+            task
+            for task in self.store.list_tasks(repo.slug)
+            if task.issue_number not in open_issue_numbers
+        ]
         for task in known:
             self._reconcile_withdrawn(repo, task, outcome)
 
@@ -286,7 +288,9 @@ class Discovery:
         if action == ACTION_QUEUED:
             outcome.queued += 1
             outcome.queued_issue_numbers.add(issue.number)
-            self.log.info("issue_queued", issue=issue.number, title=_short(issue.title), phase="queued")
+            self.log.info(
+                "issue_queued", issue=issue.number, title=_short(issue.title), phase="queued"
+            )
         elif action == ACTION_REQUEUED:
             outcome.requeued += 1
             self.log.info("trigger_restored", issue=issue.number, phase="queued")
@@ -452,7 +456,9 @@ class Discovery:
             # This is a success for an explicit `enqueue`, not a rejection.
             return RecordOutcome(verdict, ACTION_ALREADY_QUEUED)
 
-        return RecordOutcome(verdict, ACTION_UNCHANGED, note=f"#{issue.number}: already recorded as {before_phase}")
+        return RecordOutcome(
+            verdict, ACTION_UNCHANGED, note=f"#{issue.number}: already recorded as {before_phase}"
+        )
 
     # ------------------------------------------------------------ per-repo
 
@@ -469,7 +475,9 @@ class Discovery:
             issue = self.client.open_issue(repo.slug, task.issue_number)
         except GitHubError as exc:
             if exc.kind == "denied_repo":
-                outcome.notes.append(f"#{task.issue_number}: Issue not readable ({exc.kind}); left unchanged")
+                outcome.notes.append(
+                    f"#{task.issue_number}: Issue not readable ({exc.kind}); left unchanged"
+                )
                 self._flag_needs_attention(task, f"Issue unreadable during reconciliation: {exc}")
             else:
                 # Transient: leave the task exactly as it was and try again next poll.
@@ -554,7 +562,9 @@ class Discovery:
 
     # ---------------------------------------------------------------- helpers
 
-    def _report_repo_failure(self, outcome: RepoDiscovery, repo: RepoConfig, exc: GitHubError) -> None:
+    def _report_repo_failure(
+        self, outcome: RepoDiscovery, repo: RepoConfig, exc: GitHubError
+    ) -> None:
         """Record a repository-level failure without touching any task state.
 
         A failed poll must never mark an Issue queued, running or completed, and
@@ -574,9 +584,13 @@ class Discovery:
     def _flag_needs_attention(self, task: Task, note: str) -> None:
         if task.phase != "needs_attention":
             self.store.mark_needs_attention(task.id, note)
-            self.log.warning("needs_attention", repo=task.repo, issue=task.issue_number, reason=note)
+            self.log.warning(
+                "needs_attention", repo=task.repo, issue=task.issue_number, reason=note
+            )
 
-    def _log_pagination_note(self, repo: RepoConfig, issues: list[Issue], pulls: list[PullRequest]) -> None:
+    def _log_pagination_note(
+        self, repo: RepoConfig, issues: list[Issue], pulls: list[PullRequest]
+    ) -> None:
         per_page = self.client.per_page
         if len(issues) and len(issues) % per_page == 0:
             self.log.warning(
