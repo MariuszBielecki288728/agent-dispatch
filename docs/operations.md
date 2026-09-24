@@ -9,20 +9,184 @@ worktrees, push branches or open PRs** (Issues #4/#5).
 ## 1. Install
 
 The service has **no third-party dependencies** (stdlib `tomllib`, `sqlite3`,
-`fcntl`). The VM's system Python has no `pip`, so install into a virtualenv:
+`fcntl`). The project is managed with **uv**: the same tool installs both the
+development environment and the deployable runtime, so there is no second
+toolchain and no ad-hoc `pip install`.
+
+Two things are pinned, and they are not the same thing:
+
+| What | Pinned by | Guarantee |
+|---|---|---|
+| Package/tool versions (Ruff, pre-commit) | `uv.lock` | exact resolved versions; `--locked` refuses any drift |
+| Python minor version | `.python-version` (`3.12`) | uv selects 3.12 locally; CI asserts the resolved version |
+
+`uv.lock` pins **packages** resolved against `requires-python = ">=3.11"` — it does
+**not** by itself pin the Python minor version. `.python-version` does that, and uv
+honours it natively (no CI-specific plumbing needed). CI runs an explicit check
+that the resolved interpreter matches the pin, so a drift fails the build instead
+of going unnoticed.
+
+On this VM uv reuses the system 3.12.3 rather than downloading an interpreter, so
+the pin costs nothing.
+
+### Which sync mode to use
 
 ```bash
-python3 -m venv ~/.local/share/agent-dispatch/venv
-~/.local/share/agent-dispatch/venv/bin/pip install .
-mkdir -p ~/.local/bin
-ln -sf ~/.local/share/agent-dispatch/venv/bin/agent-dispatch ~/.local/bin/agent-dispatch
+uv sync --locked           # developer environment (includes Ruff/pre-commit)
+uv sync --locked --no-dev  # runtime-only environment (deployment)
 ```
 
-Alternatively, run it straight from a checkout with `PYTHONPATH=src python3 -m agent_dispatch`.
+`--locked` refuses to resolve anything not already recorded in the committed
+`uv.lock`, so a deployment can never silently pick up a different Ruff or
+library version. The project is installed into `.venv` as an editable install,
+and `.venv/bin/agent-dispatch` is the CLI.
+
+> **These are alternative modes, not sequential setup steps.** Both write the
+> **same `.venv`**. Running `--no-dev` after a developer sync *removes* Ruff and
+> pre-commit from that environment, so an already-installed commit hook stops
+> working and `uv run --no-sync ruff …` fails with `Failed to spawn: ruff`.
+> Pick one mode per checkout — never both in the same one.
+
+| Checkout | Sync mode | Hooks |
+|---|---|---|
+| **Shared development/deployment checkout** (the default here) | `uv sync --locked` | install and keep them |
+| **Dedicated deployment checkout** | `uv sync --locked --no-dev` | do not install or expect them |
+
+For the shared checkout, a bare `uv sync --locked` is the correct choice: the dev
+group costs one environment and keeps the hook commands usable, while the service
+still needs no `uv` on its execution path because systemd invokes the installed
+executable directly.
+
+### Declared testing unit
+
+```bash
+systemctl --user restart agent-dispatch.service
+./scripts/install-service.sh --status
+```
+
+### A checkout dedicated to deployment
+
+Use this only when the source checkout is **not** used for development. Install
+the runtime environment without the dev group:
+
+```bash
+uv sync --locked --no-dev
+# -> .venv/bin/agent-dispatch, and no Ruff/pre-commit present
+```
+
+Do **not** install the commit hook in that checkout — the hook invokes the locked
+Ruff through `uv run --no-sync`, which `--no-dev` deliberately removes. Keep it a
+pure runtime environment.
+
+`./scripts/install-service.sh --install` resolves the executable on `PATH`. Link
+it once and the unit needs no further edits:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sf ~/code/agent-dispatch/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch
+```
+
+### Migrating from the pre-uv virtualenv (Issue #3 layout)
+
+The old layout installed into `~/.local/share/agent-dispatch/venv` with `pip`.
+Upgrading does **not** require touching configuration, the SQLite queue or logs —
+all of those live outside the environment.
+
+**First, update the checkout with the approved wrapper-backed Git procedure.**
+A bare `git pull` is not sufficient on this VM: the ambient credential-helper
+chain queries the **unapproved** raw `gh` helper before `gh-craftlypse`, and that
+ordering is incidental rather than guaranteed (see
+[`docs/architecture.md` §2.4](architecture.md)). Reset the inherited helper list,
+then set the configured wrapper — the wrapper's own `github.command` and
+`github.credential_helper_reset`/`credential_helper` values are the source of
+truth:
+
+```bash
+cd ~/code/agent-dispatch
+set +H   # '!' would otherwise trigger bash history expansion
+git -c credential.https://github.com.helper= \
+    -c credential.https://github.com.helper='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential' \
+    pull --ff-only
+```
+
+Then rebuild the environment and restart the service:
+
+```bash
+uv sync --locked                                # keep Ruff/pre-commit usable here
+mkdir -p ~/.local/bin
+ln -sf "$PWD/.venv/bin/agent-dispatch" ~/.local/bin/agent-dispatch
+systemctl --user restart agent-dispatch.service # unit keeps using the same ~/.local/bin path
+```
+
+Confirm before removing anything:
+
+```bash
+~/.local/bin/agent-dispatch doctor
+~/.local/bin/agent-dispatch status --no-sync
+uv run --no-sync ruff --version                 # proves the dev tooling still works
+```
+
+Only after that has been verified, the superseded environment may be deleted:
+
+```bash
+rm -rf ~/.local/share/agent-dispatch/venv
+```
+
+`worker.state_db`, `worker.run_log_dir` and `worker.lock_file` are unchanged by
+this migration, so the existing task rows and log history are preserved. If the
+service is not installed as a unit, run it from the checkout instead — there is
+deliberately **no timer**, because the worker polls forever on its own interval.
+
+`uv run` is **not** used in the service unit: `uv run` can sync/download packages
+when the environment does not match the lock, and a service restart must not
+silently mutate the deployment.
 
 ---
 
-## 2. Configure
+## 2. Development tooling (Ruff + pre-commit)
+
+Ruff and pre-commit come from the locked dev group; there is no second,
+independently versioned copy of either.
+
+```bash
+uv sync --locked                        # required before the commands below
+uv run --no-sync ruff check .           # lint
+uv run --no-sync ruff format --check .  # verify formatting
+uv run --no-sync ruff format .          # apply formatting locally
+```
+
+`--no-sync` is deliberate: it runs the already-locked environment and never
+silently resolves or downloads anything. If the environment is missing the
+command fails loudly instead of falling back to a system Ruff/Python.
+
+Formatting is delegated to `ruff format` (line length 100); E501 is not enforced
+separately because the formatter cannot wrap long string/URL literals, and manual
+splits there would be noise rather than clarity.
+
+### Commit hooks
+
+```bash
+uv sync --locked                          # prerequisite
+uv run --no-sync pre-commit install       # install the git hook
+uv run --no-sync pre-commit run --all-files
+```
+
+The hooks are `language: system` and call the locked Ruff through
+`uv run --no-sync`, so pre-commit downloads **no** tool environment of its own and
+the commit hook cannot disagree with CI. The hooks are:
+
+| Hook | Purpose |
+|---|---|
+| `ruff-check` | lint staged Python files |
+| `ruff-format-check` | verify formatting; never rewrites your staged tree |
+| `no-merge-conflict-markers` | block an unresolved conflict marker |
+
+No hook runs a model, spends credits, or touches GitHub — a commit must stay
+local, offline and fast.
+
+---
+
+## 3. Configure
 
 ```bash
 mkdir -p ~/.config/agent-dispatch
@@ -64,7 +228,7 @@ wrapper. That limitation is reported as such instead of being claimed.
 
 ---
 
-## 3. Create the labels intentionally
+## 4. Create the labels intentionally
 
 `take-it` and `agent:fix` did not exist in this repository. The service never
 creates labels as a side effect of polling; creation is an explicit,
@@ -82,7 +246,7 @@ allowlist are accepted, and nothing outside them is ever modified.
 
 ---
 
-## 4. Run the worker
+## 5. Run the worker
 
 ### Foreground (no systemd required)
 
@@ -123,7 +287,7 @@ released, and the process exits 0.
 
 ---
 
-## 5. Day-to-day commands
+## 6. Day-to-day commands
 
 ```bash
 agent-dispatch status                 # poll, then show every task and why it is/ isn't dispatchable
@@ -187,7 +351,7 @@ refused with a clear message rather than silently doing nothing.
 
 ---
 
-## 6. What `status` means
+## 7. What `status` means
 
 Phases this release can produce: `queued`, `paused`, `finished`, `needs_attention`.
 
@@ -218,7 +382,7 @@ the failure this separation prevents. An Issue with an observed PR is recorded a
 
 ---
 
-## 7. Logs and state
+## 8. Logs and state
 
 | What | Where |
 |---|---|
@@ -235,7 +399,7 @@ contents are never printed to CI or pasted into GitHub. `status` reports log
 
 ---
 
-## 8. Behaviour when GitHub is unavailable
+## 9. Behaviour when GitHub is unavailable
 
 Every GitHub problem is reported honestly, and none of them can mark an Issue as
 completed:
@@ -258,11 +422,21 @@ would schedule a duplicate implementation of work someone already did.
 
 ---
 
-## 9. Verifying this release
+## 10. Verifying this release
+
+Everything below is available after `uv sync --locked`. The scripts accept a
+`PYTHON=` override so the suite can run on the uv-managed interpreter, which is
+what CI does:
 
 ```bash
-./scripts/test-offline.sh      # 88 tests, deterministic, no network, no model credits
-./scripts/smoke-runtime.sh --mock
+uv sync --locked                       # prerequisite: one locked environment
+uv run --no-sync ruff check .          # lint
+uv run --no-sync ruff format --check . # formatting
+uv run --no-sync pre-commit run --all-files
+
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 92 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
+
 agent-dispatch doctor          # live capability report for this VM
 agent-dispatch status --no-sync    # on-disk state only, no API calls, writes nothing
 agent-dispatch dry-run         # live read-only poll
@@ -273,9 +447,24 @@ agent-dispatch status          # read-only snapshot + simulated poll
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout.
 
+Two failure modes are worth exercising deliberately, because a tooling gate that
+cannot fail is not a gate:
+
+```bash
+# 1. A malformed file must be rejected.
+printf 'def broken(\n  x =\n' > src/agent_dispatch/_probe.py
+uv run --no-sync ruff check .            # fails
+rm src/agent_dispatch/_probe.py
+
+# 2. A dependency change without a refreshed lock must be rejected.
+#    (Edit [dependency-groups] in pyproject.toml, then:)
+uv sync --locked                         # fails: lock is out of date
+uv lock                                  # refresh it deliberately
+```
+
 ---
 
-## 10. Not in this release
+## 11. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
 Issues #4/#5/#6 and are **not implemented, not stubbed and not faked**:

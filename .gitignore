@@ -11,6 +11,17 @@ __pycache__/
 htmlcov/
 .cache/
 
+# uv / Ruff / pre-commit
+# The environment and caches are local build products, never committed: uv.lock
+# IS committed so the tool versions stay pinned. Source and test files are
+# deliberately not ignored anywhere in this file.
+#
+# NOTE: do not add a `.pre-commit-*.yaml` glob here — it also matches the tracked
+# `.pre-commit-config.yaml`, which would silently drop the hook configuration
+# from every commit.
+.venv/
+.ruff_cache/
+
 # Python packaging artefacts
 build/
 dist/

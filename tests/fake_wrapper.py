@@ -184,7 +184,6 @@ def main(argv: list[str]) -> int:
     # without inventing thousands of real fixtures.
     pad_pages = int(os.environ.get("FAKE_GH_PAD_FULL_PAGES", "0") or 0)
 
-
     if endpoint == "user":
         spec = consume_failure(world, "user")
         if spec:
@@ -233,7 +232,11 @@ def main(argv: list[str]) -> int:
             fail_with(spec)
         name = fields.get("name", "")
         labels = repo.setdefault("labels", [])
-        record = {"name": name, "color": fields.get("color", ""), "description": fields.get("description", "")}
+        record = {
+            "name": name,
+            "color": fields.get("color", ""),
+            "description": fields.get("description", ""),
+        }
         if name in {item["name"] for item in labels}:
             # Mirrors GitHub's 422 already_exists for a duplicate label.
             die('gh: Validation Failed (HTTP 422) {"errors":[{"code":"already_exists"}]}', 1)

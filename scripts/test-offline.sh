@@ -13,6 +13,11 @@
 #
 # This is the command CI runs. It is deliberately the same command a developer
 # runs locally, so "passes in CI" and "passes here" cannot diverge.
+#
+# The interpreter is selected by the caller so CI can run the suite on the same
+# uv-managed Python as the application:
+#   PYTHON=.venv/bin/python ./scripts/test-offline.sh
+# With no PYTHON set it falls back to python3, so a bare checkout still works.
 # ==============================================================================
 
 set -euo pipefail
@@ -27,7 +32,7 @@ log_fail() { printf "${RED}[FAIL]${NC} %s\n" "$*" >&2; }
 
 PYTHON="${PYTHON:-python3}"
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
-    log_fail "python3 not found"
+    log_fail "interpreter not found: $PYTHON"
     exit 1
 fi
 

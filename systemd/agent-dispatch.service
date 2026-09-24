@@ -8,9 +8,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Adjust the config path (and the interpreter path if you did not `pipx install`
-# or `pip install --user` the package):
-#   agent-dispatch --config %h/.config/agent-dispatch/config.toml worker
+# This ExecStart is the repository default; `scripts/install-service.sh --install`
+# rewrites it with the real absolute paths for this machine.
+#
+# The deployed executable is the one installed by uv into the project's managed
+# `.venv` (normally symlinked from ~/.local/bin so the path stays stable across
+# upgrades). It is invoked DIRECTLY and never through `uv run`, because `uv run`
+# can sync or download packages when the environment does not match the lock, and
+# a service restart must not silently mutate the deployment.
 ExecStart=%h/.local/bin/agent-dispatch --config %h/.config/agent-dispatch/config.toml worker
 
 # The worker holds a single-instance flock; restarting it after a crash is safe

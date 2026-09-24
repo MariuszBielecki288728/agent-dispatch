@@ -101,7 +101,7 @@ class Config:
             known = ", ".join(sorted(self.repos)) or "<none configured>"
             raise ConfigError(
                 f"repository {slug!r} is not in the configured allowlist ({known}). "
-                "Add it under [repos.\"...\"] before running the worker."
+                'Add it under [repos."..."] before running the worker.'
             ) from None
 
 
@@ -161,7 +161,9 @@ def resolve_config_path(explicit: str | Path | None = None) -> Path:
     )
 
 
-def load_config(explicit_path: str | Path | None = None, *, schema_path: Path | None = None) -> Config:
+def load_config(
+    explicit_path: str | Path | None = None, *, schema_path: Path | None = None
+) -> Config:
     """Load, validate and freeze the configuration."""
     path = resolve_config_path(explicit_path)
     try:
@@ -174,7 +176,9 @@ def load_config(explicit_path: str | Path | None = None, *, schema_path: Path | 
     return build_config(raw, source_path=path, schema_path=schema_path)
 
 
-def build_config(raw: dict[str, Any], *, source_path: Path, schema_path: Path | None = None) -> Config:
+def build_config(
+    raw: dict[str, Any], *, source_path: Path, schema_path: Path | None = None
+) -> Config:
     """Validate an already-parsed config document and convert it to dataclasses."""
     schema = load_schema(schema_path)
     schema_mod.set_root(schema)
@@ -182,7 +186,9 @@ def build_config(raw: dict[str, Any], *, source_path: Path, schema_path: Path | 
     problems = schema_mod.validate(raw, schema)
     if problems:
         detail = "\n".join(f"  - {problem}" for problem in problems)
-        raise ConfigError(f"configuration {source_path} does not match config.schema.json:\n{detail}")
+        raise ConfigError(
+            f"configuration {source_path} does not match config.schema.json:\n{detail}"
+        )
 
     effective = schema_mod.apply_defaults(raw, schema)
     config = _build(effective, source_path)
@@ -202,9 +208,13 @@ def _build(raw: dict[str, Any], source_path: Path) -> Config:
         max_attempts=int(worker_raw.get("max_attempts", 3)),
         worktree_root=expand_path(worker_raw.get("worktree_root", "~/agent-dispatch/worktrees")),
         state_db=expand_path(worker_raw.get("state_db", "~/.local/state/agent-dispatch/state.db")),
-        run_log_dir=expand_path(worker_raw.get("run_log_dir", "~/.local/state/agent-dispatch/runs")),
+        run_log_dir=expand_path(
+            worker_raw.get("run_log_dir", "~/.local/state/agent-dispatch/runs")
+        ),
         run_log_keep=int(worker_raw.get("run_log_keep", 50)),
-        lock_file=expand_path(worker_raw.get("lock_file", "~/.local/state/agent-dispatch/worker.lock")),
+        lock_file=expand_path(
+            worker_raw.get("lock_file", "~/.local/state/agent-dispatch/worker.lock")
+        ),
         commandcode_path=worker_raw.get("commandcode_path"),
     )
 
@@ -250,7 +260,9 @@ def _check_cross_field_rules(config: Config) -> None:
     # Credential-helper contract: the empty reset entry must come first, and the
     # configured helper must be the approved wrapper rather than raw `gh`.
     if config.github.credential_helper_reset != "":
-        problems.append("github.credential_helper_reset must be empty — it resets the inherited helper list")
+        problems.append(
+            "github.credential_helper_reset must be empty — it resets the inherited helper list"
+        )
     helper = config.github.credential_helper
     if not helper.startswith("!"):
         problems.append("github.credential_helper must start with '!' to run a command")
@@ -261,13 +273,15 @@ def _check_cross_field_rules(config: Config) -> None:
         )
 
     if not config.repos:
-        problems.append("no repositories configured: add at least one [repos.\"owner/name\"] entry")
+        problems.append('no repositories configured: add at least one [repos."owner/name"] entry')
 
     for slug, repo in config.repos.items():
         if not is_repo_slug(slug):
             problems.append(f"repository key {slug!r} is not 'owner/name'")
         if not repo.path.is_dir():
-            problems.append(f"{slug}: repository path {repo.path} does not exist or is not a directory")
+            problems.append(
+                f"{slug}: repository path {repo.path} does not exist or is not a directory"
+            )
         elif not (repo.path / ".git").exists():
             problems.append(f"{slug}: {repo.path} is not a Git checkout (no .git entry)")
 

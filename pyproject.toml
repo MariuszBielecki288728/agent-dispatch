@@ -12,10 +12,25 @@ license = { text = "Proprietary" }
 # Deliberately zero runtime dependencies: TOML via stdlib tomllib, SQLite via
 # stdlib sqlite3, locking via stdlib fcntl. The VM has no pip for the system
 # interpreter, so "no dependencies" is also what keeps installation verifiable.
+#
+# uv (Issue #14) manages the *development* environment and is not a runtime
+# import: the deployed service runs the installed `agent-dispatch` executable
+# directly, with no uv process between systemd and the worker.
 dependencies = []
 
 [project.scripts]
 agent-dispatch = "agent_dispatch.cli:main"
+
+# Development tooling only — never installed into the deployment environment
+# (`uv sync --locked --no-dev`). Tool versions are resolved and pinned in
+# uv.lock so the VM and CI run the same Ruff and pre-commit. Note that uv.lock
+# pins *packages*, not the Python minor version; that is pinned by
+# `.python-version` (3.12) instead.
+[dependency-groups]
+dev = [
+    "pre-commit>=4.2.0",
+    "ruff>=0.14.0",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -29,3 +44,50 @@ where = ["src"]
 # config/ stays the reviewed source of truth; the offline suite asserts the two
 # files are identical.
 agent_dispatch = ["data/*.json"]
+
+[tool.uv]
+# `dev` stays a default dependency group: a bare `uv sync --locked` gives a
+# developer environment, `--no-dev` gives a deployable runtime-only one.
+# The project itself is installed in editable mode so `uv run` sees source edits
+# without a reinstall.
+package = true
+
+# ---------------------------------------------------------------------------
+# Ruff — one linter/formatter, configured once
+# ---------------------------------------------------------------------------
+# Canonical commands, always through the locked uv environment:
+#   uv run --no-sync ruff check .
+#   uv run --no-sync ruff format --check .
+#   uv run --no-sync ruff format .          # apply local fixes
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Files that may be passed to Ruff explicitly (e.g. by pre-commit) even though
+# they are not linted when a bare `ruff check .` walks the tree.
+src = ["src", "tests"]
+
+# Generated artefacts, caches and the local environment are never linted;
+# source and test files deliberately are.
+extend-exclude = ["build", "dist", ".venv", ".ruff_cache"]
+
+[tool.ruff.lint]
+# E4/E7/E9 + F are the pycodestyle-error and pyflakes correctness core; I adds
+# deterministic import ordering. Deliberately small: this is a baseline, not a
+# style rewrite, and new rules should be added deliberately.
+select = ["E4", "E7", "E9", "F", "I"]
+# E501 is delegated to the formatter, which wraps code but cannot wrap long
+# string/URL literals — those are legitimate and would otherwise force
+# meaningless manual splits. Line length is still enforced on code by
+# `ruff format`.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests/ builds long inline config and JSON strings and asserts on exact text.
+# Same rationale as E501 above.
+"tests/*" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

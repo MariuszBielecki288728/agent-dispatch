@@ -110,7 +110,9 @@ def _check_state_paths(config: Config, report: DoctorReport) -> None:
     )
 
 
-def _check_wrapper(config: Config, report: DoctorReport, *, skip_github: bool, timeout: float) -> None:
+def _check_wrapper(
+    config: Config, report: DoctorReport, *, skip_github: bool, timeout: float
+) -> None:
     client = GitHubClient(config.github.command, timeout_seconds=timeout)
     path = client.wrapper_path()
     if path is None:
@@ -126,9 +128,17 @@ def _check_wrapper(config: Config, report: DoctorReport, *, skip_github: bool, t
     report.add("github_wrapper", "ok", str(path))
 
     if "gh auth git-credential" in config.github.credential_helper:
-        report.add("credential_helper", "fail", "configured helper would call raw `gh`, which is not approved here")
+        report.add(
+            "credential_helper",
+            "fail",
+            "configured helper would call raw `gh`, which is not approved here",
+        )
     elif config.github.credential_helper_reset != "":
-        report.add("credential_helper", "fail", "credential_helper_reset must be empty (it resets the helper list)")
+        report.add(
+            "credential_helper",
+            "fail",
+            "credential_helper_reset must be empty (it resets the helper list)",
+        )
     else:
         report.add(
             "credential_helper",
@@ -147,7 +157,9 @@ def _check_wrapper(config: Config, report: DoctorReport, *, skip_github: bool, t
         status = "fail" if exc.kind in {ErrorKind.AUTH, ErrorKind.MISSING_WRAPPER} else "warn"
         report.add("github_api", status, f"{exc.kind}: {exc}")
         if exc.kind in {ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMIT}:
-            report.notes.append("Transient GitHub failure: the worker keeps existing tasks unchanged and retries.")
+            report.notes.append(
+                "Transient GitHub failure: the worker keeps existing tasks unchanged and retries."
+            )
         return
 
     required_labels = (config.github.trigger_label, config.github.review_handoff_label)
@@ -209,7 +221,9 @@ def _check_runtime_binary(config: Config, report: DoctorReport) -> None:
 
 def _check_systemd(report: DoctorReport) -> None:
     if not shutil.which("systemctl"):
-        report.add("systemd_user", "warn", "systemctl not available; use the foreground `worker` command")
+        report.add(
+            "systemd_user", "warn", "systemctl not available; use the foreground `worker` command"
+        )
         return
     try:
         state = subprocess.run(
@@ -244,7 +258,8 @@ def _check_systemd(report: DoctorReport) -> None:
         report.add(
             "systemd_user",
             "warn",
-            detail + f"; Linger={linger or 'unknown'} — run `loginctl enable-linger {username or '$USER'}` "
+            detail
+            + f"; Linger={linger or 'unknown'} — run `loginctl enable-linger {username or '$USER'}` "
             "so the worker survives logout",
         )
 
@@ -261,7 +276,9 @@ def _check_vcs_tools(config: Config, report: DoctorReport) -> None:
         if not (Path(repo.path) / ".git").exists():
             missing.append(slug)
     if missing:
-        report.add("source_clones", "warn", f"no Git checkout at configured path: {', '.join(missing)}")
+        report.add(
+            "source_clones", "warn", f"no Git checkout at configured path: {', '.join(missing)}"
+        )
     else:
         report.add(
             "source_clones",

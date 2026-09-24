@@ -1,0 +1,57 @@
+# ==============================================================================
+# pre-commit configuration — agent-dispatch
+#
+# Design decision: these hooks use `language: system` and invoke the **locked**
+# Ruff from the uv environment. Pre-commit must NOT download its own
+# independently versioned Ruff, because then a developer's local Ruff and the CI
+# Ruff could silently diverge — the exact problem this Issue is about.
+#
+#   uv sync --locked                       # required once: provides ruff
+#   uv run --no-sync pre-commit install    # install the git hook
+#   uv run --no-sync pre-commit run --all-files
+#
+# `language: system` runs the executable found on PATH, so `uv run --no-sync ...`
+# is what puts the locked Ruff there. A missing environment therefore fails
+# loudly instead of silently falling back to a system Ruff/Python.
+#
+# Deliberately NOT here:
+#   * `repo:` hooks that download their own tool environments (version drift),
+#   * model/paid checks or live GitHub calls — a commit hook stays local,
+#     offline and fast.
+# ==============================================================================
+
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+  - repo: local
+    hooks:
+      # Lint with the project's locked Ruff, not a separately downloaded copy.
+      # --force-exclude makes a file ruff would skip in a directory walk
+      # (e.g. build/) also be skipped when pre-commit passes it explicitly.
+      - id: ruff-check
+        name: ruff check (locked uv environment)
+        entry: uv run --no-sync ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      # Formatting is *checked*, never silently rewritten on commit: a hook that
+      # mutates the staged tree makes what you committed differ from what you
+      # reviewed. Run `uv run --no-sync ruff format .` yourself to apply fixes.
+      - id: ruff-format-check
+        name: ruff format --check (locked uv environment)
+        entry: uv run --no-sync ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      # Cheap, offline hygiene: an unresolved merge conflict must never reach a
+      # commit. Implemented with grep so no extra tool is required.
+      - id: no-merge-conflict-markers
+        name: no merge conflict markers
+        entry: bash -c 'grep -nHE "^(<{7}|={7}|>{7})( |$)" "$@" && exit 1 || exit 0' --
+        language: system
+        types: [text]
+        require_serial: true

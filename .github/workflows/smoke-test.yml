@@ -6,28 +6,81 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   offline-suite:
-    name: Offline test-suite (deterministic, no network)
+    name: Lint, hooks and offline suite (deterministic, no network)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # uv is the single source of tool versions: it installs the interpreter,
+      # Ruff and pre-commit from the committed uv.lock, so CI cannot drift from
+      # a developer's `uv sync --locked` environment.
+      # The interpreter minor version is pinned by the committed `.python-version`,
+      # which uv reads natively — so there is ONE source of truth rather than the
+      # version being repeated here where it could drift.
+      #
+      # Note: `uv.lock` pins *packages* resolved against `requires-python`, not the
+      # Python minor version itself. A step below asserts the resolved minor
+      # version, so the pin is verified rather than merely assumed.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
+      # `--locked` fails if uv.lock is out of date with pyproject.toml, so a
+      # dependency change without a refreshed lock is rejected here rather than
+      # silently resolving something different from what developers installed.
+      - name: Sync the locked environment
+        run: uv sync --locked
+
+      # Fail loudly if the interpreter is not the pinned minor version, instead of
+      # trusting that `.python-version` was honoured.
+      - name: Verify the pinned Python version
+        run: |
+          uv run --no-sync python - <<'PY'
+          import pathlib, sys, tomllib
+
+          pinned = pathlib.Path(".python-version").read_text().strip()
+          actual = f"{sys.version_info.major}.{sys.version_info.minor}"
+          print(f".python-version={pinned}  interpreter={actual}  ({sys.version})")
+          assert actual == pinned, f"expected Python {pinned}, got {actual}"
+          requires = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["requires-python"]
+          print(f"requires-python={requires}  OK")
+          PY
+
+      # Issue #14: one lint/format gate, run from the locked environment.
+      # E4/E7/E9/F/I; see [tool.ruff] in pyproject.toml for the rationale.
+      - name: Lint (ruff check)
+        run: uv run --no-sync ruff check .
+
+      - name: Check formatting (ruff format --check)
+        run: uv run --no-sync ruff format --check .
+
+      # Runs the same hook definitions a developer runs before committing.
+      # `language: system` hooks resolve Ruff through `uv run --no-sync`, so this
+      # is deterministic and downloads no second tool environment.
+      - name: Run pre-commit hooks
+        run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
+
+      # The offline suite and the mock runtime suite both run on the uv-managed
+      # interpreter (via PYTHON), not on a separately provisioned system Python.
+      #
       # Issue #3 acceptance requirement: the fixture/fake-wrapper suite covers
       # discovery, pagination, Issue-vs-PR filtering, allowlist enforcement,
       # auth/label failures, repeated polls, restarts, label removal/re-add,
       # pre-existing PRs and failure/retry behaviour — with no paid model calls
       # and no live GitHub mutation.
       - name: Run offline dispatch suite
-        run: ./scripts/test-offline.sh
+        run: PYTHON=.venv/bin/python ./scripts/test-offline.sh
 
       # The Issue #1/#2 validation suite is kept as a regression gate. It also
       # runs offline in --mock mode.
       - name: Run runtime validation suite (mock)
-        run: ./scripts/smoke-runtime.sh --mock
+        run: PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock

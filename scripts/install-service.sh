@@ -12,6 +12,9 @@
 #     timer on top would schedule a second, competing mechanism.
 #   * The service is installed for the current user only; nothing is written into
 #     any target repository.
+#   * The unit calls the uv-installed executable directly, never `uv run`, so a
+#     restart cannot trigger a dependency sync. Upgrading is an explicit
+#     `uv sync --locked --no-dev` followed by a restart (see docs/operations.md).
 #
 #   ./scripts/install-service.sh --install     # install + enable + start
 #   ./scripts/install-service.sh --status      # unit + lock + last polls
@@ -33,13 +36,67 @@ log_ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
 log_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 log_fail() { printf "${RED}[FAIL]${NC} %s\n" "$*" >&2; }
 
+# Print the configured GitHub wrapper command (the approved credential helper),
+# or nothing when it cannot be determined. The TOML is parsed by Python with the
+# path passed as an argv element, so configuration text is never interpreted as
+# shell code — the same rule cmd_status() follows.
+resolve_wrapper() {
+    [[ -f "$CONFIG_PATH" ]] || return 0
+    python3 - "$CONFIG_PATH" <<'PY' 2>/dev/null || true
+import sys, tomllib
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        cfg = tomllib.load(fh)
+except Exception:
+    sys.exit(0)
+
+command = cfg.get("github", {}).get("command", "")
+if command:
+    print(command)
+PY
+}
+
 usage() {
+    local wrapper
+    wrapper="$(resolve_wrapper)"
+    if [[ -z "$wrapper" ]]; then
+        wrapper="<configured-wrapper>   # github.command in $CONFIG_PATH"
+    fi
+
     cat <<EOF
 Usage: $0 [--install | --status | --uninstall | --help]
 
   --install    Render the unit, enable and start agent-dispatch.service.
   --status     Show unit state, lock holder and recent poll log lines.
   --uninstall  Stop, disable and delete the user unit.
+
+Canonical uv workflow (see docs/operations.md):
+
+  # shared development/deployment checkout (the usual case): keep the dev group
+  uv sync --locked
+  mkdir -p ~/.local/bin
+  ln -sf $REPO_ROOT/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch
+
+  # upgrade an existing deployment (state, config and logs are untouched).
+  # Update the checkout with the APPROVED wrapper-backed Git procedure first --
+  # a bare 'git pull' does not guarantee the approved credential helper is used
+  # on this VM (see docs/architecture.md 2.4). The reset entry is what stops an
+  # ambient unapproved helper from being queried first:
+  set +H   # '!' would otherwise trigger bash history expansion
+  git -c credential.https://github.com.helper= \\
+      -c credential.https://github.com.helper="!$wrapper auth git-credential" \\
+      pull --ff-only
+  uv sync --locked
+  systemctl --user restart agent-dispatch.service
+
+  # a DEDICATED deployment checkout (not used for development) may instead use
+  # 'uv sync --locked --no-dev' -- but do not run that in a checkout where you
+  # develop: it writes the same .venv and removes Ruff/pre-commit, breaking the
+  # commit hook. Do not install the hook in a --no-dev checkout.
+
+The unit invokes the installed executable directly and never 'uv run', so a
+restart cannot trigger a dependency sync.
 
 Environment:
   AGENT_DISPATCH_CONFIG  config path written into the unit (default: $CONFIG_PATH)
@@ -81,11 +138,19 @@ cmd_install() {
 
     local bin
     if ! bin="$(command -v agent-dispatch)"; then
-        log_fail "agent-dispatch is not on PATH. Install it first (see docs/operations.md):"
-        log_fail "  python3 -m venv ~/.local/share/agent-dispatch/venv"
-        log_fail "  ~/.local/share/agent-dispatch/venv/bin/pip install $REPO_ROOT"
+        log_fail "agent-dispatch is not on PATH. Install it first (see docs/operations.md §1):"
+        log_fail "  cd $REPO_ROOT"
+        log_fail "  uv sync --locked --no-dev          # runtime-only environment"
         log_fail "  mkdir -p ~/.local/bin"
-        log_fail "  ln -sf ~/.local/share/agent-dispatch/venv/bin/agent-dispatch ~/.local/bin/agent-dispatch"
+        log_fail "  ln -sf $REPO_ROOT/.venv/bin/agent-dispatch ~/.local/bin/agent-dispatch"
+        exit 1
+    fi
+
+    # The unit must not invoke `uv run`: that can sync/download packages when the
+    # environment does not match the lock, and a service restart must not mutate
+    # the deployment. Point the unit at the installed executable instead.
+    if [[ "$(basename "$bin")" == "uv" ]]; then
+        log_fail "agent-dispatch resolved to 'uv'; the unit must call the installed executable."
         exit 1
     fi
 

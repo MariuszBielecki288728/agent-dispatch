@@ -70,14 +70,18 @@ def _check_types(instance: Any, schema: dict[str, Any], where: str, problems: li
         problems.append(f"{where}: expected {joined}, got {type(instance).__name__}")
 
 
-def _validate_string(instance: str, schema: dict[str, Any], where: str, problems: list[str]) -> None:
+def _validate_string(
+    instance: str, schema: dict[str, Any], where: str, problems: list[str]
+) -> None:
     if "minLength" in schema and len(instance) < schema["minLength"]:
         problems.append(f"{where}: shorter than minLength {schema['minLength']}")
     if "pattern" in schema and not re.search(schema["pattern"], instance):
         problems.append(f"{where}: does not match pattern {schema['pattern']!r}")
 
 
-def _validate_object(instance: dict[str, Any], schema: dict[str, Any], where: str, problems: list[str]) -> None:
+def _validate_object(
+    instance: dict[str, Any], schema: dict[str, Any], where: str, problems: list[str]
+) -> None:
     for name in schema.get("required", []):
         if name not in instance:
             problems.append(f"{where}: missing required key '{name}'")
@@ -94,7 +98,9 @@ def _validate_object(instance: dict[str, Any], schema: dict[str, Any], where: st
         if name_rule is not None:
             key_problems: list[str] = []
             if "pattern" in name_rule and not re.search(name_rule["pattern"], key):
-                key_problems.append(f"{where}: property name {key!r} does not match {name_rule['pattern']!r}")
+                key_problems.append(
+                    f"{where}: property name {key!r} does not match {name_rule['pattern']!r}"
+                )
             problems.extend(key_problems)
 
         if key in properties:
