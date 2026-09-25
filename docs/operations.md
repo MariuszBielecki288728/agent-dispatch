@@ -666,10 +666,20 @@ A bare `needs_attention` phase is deliberately **not** enough to trigger a push:
 also where a maintainer parks a task for reasons the dispatcher cannot see, and
 pushing new commits on their behalf is not a decision to make from a phase alone.
 
+**The parking reason survives a failed recovery attempt.** A transient failure during
+recovery — an `ls-remote` outage, or a commit that failed again — leaves
+the recorded stage untouched, so the *next* healthy attempt can still publish. If that
+stage were overwritten with `interrupted` on every unsuccessful attempt, one momentary
+network problem would permanently destroy the task's recoverability. The dispatcher
+re-parks as `interrupted` only when there is no publishable stage to preserve, which is
+the honest answer for genuinely ambiguous work.
+
 The "branch is on the remote" check compares **tips**, not existence. A branch pushed
 by an earlier attempt still exists while pointing at older commits, so an existence
-check would accept a failed push and open a PR without the new work. If the remote tip
-differs from the owned worktree's tip, nothing is published and the task is parked.
+check would accept a failed push and open a PR without the new work. Publishing
+proceeds **only when the remote tip equals the owned worktree's tip**; a mismatch — or
+an unreadable remote tip, since an unknown answer is not evidence the work landed —
+makes nothing get published and parks the task with both SHAs recorded.
 
 Reconciliation runs **once at startup, under the single-instance lock**, from both
 entry points: the persistent `worker` (the systemd path) and the explicit `run`.
@@ -687,6 +697,7 @@ still repairs the task on the next poll.
 | Process died during `git push` | publish-only recovery: the run had completed, so the PR is created or adopted and no agent runs |
 | Process died after `git push`, before the PR | adopt or create the PR; no agent runs |
 | A failed push left an older branch on the remote | the tip comparison refuses to publish, and the task is parked so the mismatch is visible |
+| Recovery itself hit a transient failure | the parking reason is kept, so the next attempt can still publish; the task is not downgraded to an unrecoverable state |
 | PR created, DB write lost | adopt by exact head-branch match, verified head repository and Issue link |
 | PR lookup or creation failed | `needs_attention` with the branch preserved; the next start finishes it publish-only |
 | The dispatcher's own commit failed | `needs_attention` **before** any push, so no PR can omit the run's work; the next start commits the preserved edits, pushes and opens the PR — no model call |
@@ -799,7 +810,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 196 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 201 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -829,6 +840,8 @@ a mock. The cases most worth knowing about:
 | `UnfinishedRunNotPublishedTests` | a killed agent's partial edits are never committed or published, and are preserved for retry |
 | `NoWorktreePublishTests` | Git is never run against an invented working directory; the PR is reconciled through the wrapper instead |
 | `ReconcileRetryTests` | a transient wrapper outage does not consume the single reconciliation attempt |
+| `RecoveryStagePreservationTests` | a second failure during recovery keeps the publishable stage, so the task stays recoverable and the retry succeeds with zero model calls |
+| `PublishTipFailsClosedTests` | an unreadable remote tip opens no PR, while a confirmed matching tip still publishes |
 | `MigrationRaceTests` | two processes can migrate the same new database without the loser crashing |
 | `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |
 | `WorktreeIdentityTests` | a worktree switched to another branch is detected and never published from |

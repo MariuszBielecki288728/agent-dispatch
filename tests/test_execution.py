@@ -3066,5 +3066,275 @@ class MigrationRaceTests(ExecutionCase):
             store._conn.execute("ALTER TABLE tasks ADD COLUMN this is not valid sql")
 
 
+class RecoveryStagePreservationTests(ExecutionCase):
+    """Review round 3: a transient recovery failure must not destroy the evidence.
+
+    `PUBLISH_UNKNOWN` means "this attempt could not finish", which is NOT the same as
+    "the runtime was interrupted". The outer reconciliation used to overwrite the
+    persisted stage with `interrupted` on every unknown outcome, so a one-off
+    `ls-remote` outage (or a commit that failed a second time) dropped the very
+    evidence that authorises the next attempt to push — leaving the task permanently
+    unrecoverable even though the model had finished cleanly.
+    """
+
+    def parked_task(self, *, stage: str = "push_failed"):
+        """A real task with a completed run, a pushed branch and a recorded stage."""
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        self.set_issues(issue(1, "Transient outage", labels=[TRIGGER]))
+        # A real run: worktree, branch, commit, push and a completed run row.
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # Park it as if publishing had failed, and forget the PR so publishing is
+        # attempted again.
+        store.park_for_recovery(task.id, stage=stage, note="simulated publish failure")
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        return orchestrator, store, config
+
+    def test_a_transient_ls_remote_failure_preserves_the_publishable_stage(self) -> None:
+        """Requested regression 1: push_failed + clean run + transient failure.
+
+        The stage must survive so the *next* attempt can still push; otherwise a
+        one-off GitHub outage destroys the task's recoverability permanently.
+        """
+        orchestrator, store, config = self.parked_task(stage="push_failed")
+
+        from agent_dispatch.gitcmd import GitError
+
+        def failing_tip(repo, branch):
+            raise GitError("transient ls-remote failure", argv=["ls-remote"])
+
+        healthy_tip = orchestrator._remote_branch_tip
+        orchestrator._remote_branch_tip = failing_tip  # type: ignore[method-assign]
+        orchestrator._reconcile_publish_pending(store.get_task(self.slug, 1))
+
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(
+            after.recovery_stage,
+            "push_failed",
+            "a transient lookup failure must not downgrade a publishable stage",
+        )
+        self.assertTrue(after.has_publishable_stage)
+
+        # Second attempt, remote readable again: recovery must succeed with no model call.
+        # Restoring the real lookup is the point of the test — leaving the outage in
+        # place would exercise the same failure twice and prove nothing.
+        orchestrator._remote_branch_tip = healthy_tip  # type: ignore[method-assign]
+        runs_before = len(self.recorded_argv())
+        orchestrator._reconcile_publish_pending(store.get_task(self.slug, 1))
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero model calls")
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number)
+
+    def test_a_second_commit_failure_keeps_the_commit_failed_stage(self) -> None:
+        """Requested regression 2: commit_failed, commit fails again, then recovers."""
+        self.write_scenario(
+            runs=[{"session_id": "sess-1", "subtype": "success", "edits": {"work.txt": "new\n"}}]
+        )
+        self.set_issues(issue(1, "Commit fails twice", labels=[TRIGGER]))
+
+        # First attempt fails to commit.
+        self.world.env_overrides["GIT_AUTHOR_NAME"] = ""
+        self.assertEqual(self.run_cli("run").returncode, 1)
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.recovery_stage, "commit_failed")
+        branch = task.branch
+        store.close()
+
+        # Attempt reconciliation while the commit STILL cannot be made: the stage must
+        # survive so the task remains recoverable.
+        self.run_cli("run", "--skip-poll")
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        after_failed_retry = store.get_task(self.slug, 1)
+        self.assertEqual(
+            after_failed_retry.recovery_stage,
+            "commit_failed",
+            "a repeated commit failure must not downgrade the stage",
+        )
+        self.assertTrue(after_failed_retry.has_publishable_stage)
+
+        # Fix the cause and recover: one PR, no model call.
+        self.world.env_overrides.pop("GIT_AUTHOR_NAME", None)
+        runs_before = len(self.recorded_argv())
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero model calls during recovery")
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number)
+        self.assertIsNone(recovered.recovery_stage, "the stage is cleared once published")
+
+        import subprocess
+
+        show = subprocess.run(
+            ["git", "-C", str(self.remote), "show", f"{branch}:work.txt"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+
+    def test_an_ambiguous_task_still_parks_as_interrupted(self) -> None:
+        # The fallback stage is still used when there is NO publishable stage to
+        # preserve, so genuinely ambiguous work is not treated as publishable.
+        import subprocess
+
+        orchestrator, store, config = self.parked_task(stage="push_failed")
+        task = store.get_task(self.slug, 1)
+        # Clear the stage: now nothing authorises pushing this task's local commits.
+        store.clear_recovery_stage(task.id)
+        # Give the local branch commits the remote does NOT have, so publishing would
+        # require a push. With no recorded stage and no phase evidence that this
+        # service was interrupted mid-publish, that push is not recovery's call.
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        (Path(task.worktree_path) / "local-only.txt").write_text("local only\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(task.worktree_path), "add", "-A"], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-C", str(task.worktree_path), "commit", "-q", "-m", "local only"],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL, phase = 'needs_attention' "
+            "WHERE id = ?",
+            (task.id,),
+        )
+
+        orchestrator._reconcile_publish_pending(store.get_task(self.slug, 1))
+
+        after = store.get_task(self.slug, 1)
+        self.assertFalse(after.has_publishable_stage, "no publishable stage may be invented")
+        self.assertIsNotNone(after.recovery_stage, "the unresolved state must be recorded")
+        self.assertNotIn(
+            "local-only.txt",
+            self._remote_files(after.branch),
+            "a task with no recorded publish failure must not have commits pushed for it",
+        )
+
+    def _remote_files(self, branch: str) -> set[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+class PublishTipFailsClosedTests(ExecutionCase):
+    """Review round 3, hardening: proceed only when remote tip == local tip."""
+
+    def test_an_unreadable_remote_tip_does_not_open_a_pr(self) -> None:
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.worktree import WorktreeManager
+
+        self.set_issues(issue(1, "Unreadable tip", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        manager = WorktreeManager(
+            orchestrator.git,
+            source_path=config.repo(self.slug).path,
+            worktree_root=config.worker.worktree_root,
+            base_branch="main",
+            repo_slug=self.slug,
+            commit_identity=("t", "t@example.invalid"),
+        )
+        state = manager.inspect(Path(task.worktree_path), task.branch)
+
+        # Forget the PR so publishing would otherwise proceed, and make the tip
+        # unreadable: an unknown answer is not evidence the work landed, so the
+        # documented invariant ("proceed only when the tips match") must fail closed.
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+        orchestrator._remote_branch_tip = lambda repo, branch: None  # type: ignore[method-assign]
+        pulls_before = len(self.world.read_world()["repos"][self.slug]["pulls"])
+
+        outcome = orchestrator._publish(
+            store.get_task(self.slug, 1), config.repo(self.slug), manager, state
+        )
+
+        self.assertEqual(outcome.reason, "remote_tip_unverified")
+        self.assertEqual(
+            len(self.world.read_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "no PR may be created while the delivered work cannot be confirmed",
+        )
+        self.assertNotEqual(store.get_task(self.slug, 1).phase, "awaiting_review")
+
+    def test_a_confirmed_matching_tip_still_publishes(self) -> None:
+        # The complement, so failing closed is not simply refusing everything.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.worktree import WorktreeManager
+
+        self.set_issues(issue(1, "Matching tip", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        manager = WorktreeManager(
+            orchestrator.git,
+            source_path=config.repo(self.slug).path,
+            worktree_root=config.worker.worktree_root,
+            base_branch="main",
+            repo_slug=self.slug,
+            commit_identity=("t", "t@example.invalid"),
+        )
+        state = manager.inspect(Path(task.worktree_path), task.branch)
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+
+        outcome = orchestrator._publish(
+            store.get_task(self.slug, 1), config.repo(self.slug), manager, state
+        )
+        self.assertIn(outcome.action, {"awaiting_review", "adopted_existing_pr"})
+        self.assertIsNotNone(store.get_task(self.slug, 1).pr_number)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

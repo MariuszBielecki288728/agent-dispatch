@@ -859,20 +859,21 @@ class Orchestrator:
         # an earlier attempt still exists, so "the branch is there" would let a real
         # push failure pass unnoticed and open a PR **without the new commits**.
         # Compare the remote tip against the local one and refuse to publish on a
-        # mismatch, because publishing less work than was produced is the failure this
-        # whole workflow exists to prevent.
+        # mismatch — or when the remote tip cannot be read at all, since an unreadable
+        # answer is not evidence that the work landed. The invariant documented here is
+        # "proceed only when the tips match", so `None` fails closed too.
         remote_tip = self._remote_branch_tip(repo, state.branch)
-        if remote_tip is not None and state.head_sha and remote_tip != state.head_sha:
+        if remote_tip is None or (state.head_sha and remote_tip != state.head_sha):
             detail = (
-                f"remote {state.branch} is at {remote_tip[:12]} but the owned worktree is at "
-                f"{state.head_sha[:12]}; the push did not deliver the produced work, so no PR "
-                "was created"
+                f"could not confirm that {state.branch} on the remote holds the produced work "
+                f"(remote tip {remote_tip or 'unreadable'}, local tip {state.head_sha or 'unknown'}); "
+                "no PR was created"
             )
             self.store.park_for_recovery(task.id, stage=RECOVERY_PUSH_FAILED, note=detail)
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
                 task_ref=task.ref,
-                reason="remote_tip_mismatch",
+                reason="remote_tip_unverified",
                 session_id=result.session_id if result else task.session_id,
                 run=result,
                 notes=notes + [detail],
@@ -1268,13 +1269,24 @@ class Orchestrator:
             # Parking matters: `needs_attention` is what makes the unresolved state
             # visible in `status` and stops a later poll from treating the row as
             # dispatchable. Leaving the phase alone would hide it.
-            note = (
-                " ".join(result.notes)
-                or f"could not determine whether {task.branch} is published; no agent was started. "
-                "Re-run `agent-dispatch run` when the remote is reachable to retry publish-only "
-                "recovery."
+            #
+            # The stage is preserved rather than forced to `interrupted`. "Unknown"
+            # does not mean "the runtime was interrupted": it also covers a transient
+            # local failure (an `ls-remote` outage, or a commit that failed again) while
+            # the evidence that finished work exists is still intact. Overwriting it
+            # would drop the very evidence recovery depends on, and the task could then
+            # never be pushed again — a one-off outage permanently destroying
+            # recoverability. `_recover_publish_only` re-parks a more specific stage
+            # when it has one, so this reads the row back instead of assuming.
+            self._park_preserving_stage(
+                task,
+                result.notes,
+                fallback=(
+                    f"could not determine whether {task.branch} is published; no agent was "
+                    "started. Re-run `agent-dispatch run` when the remote is reachable to "
+                    "retry publish-only recovery."
+                ),
             )
-            self.store.park_for_recovery(task.id, stage=RECOVERY_INTERRUPTED, note=note)
             return result.notes or [f"{task.ref}: publish state unknown; left for a later attempt"]
 
         if result.status == PUBLISH_ABSENT:
@@ -1287,6 +1299,27 @@ class Orchestrator:
                 f"{task.ref}: nothing published for {task.branch}; escalated to needs_attention"
             ]
         return []
+
+    def _park_preserving_stage(self, task: Task, notes: list[str], *, fallback: str) -> None:
+        """Park a task without discarding a more specific recovery stage.
+
+        `PUBLISH_UNKNOWN` means "this attempt could not finish", which is not the same
+        as "the runtime was interrupted". If `_recover_publish_only` already recorded a
+        precise stage (`commit_failed`, `push_failed`, `pr_failed`) then that evidence is
+        still true and must survive: it is what authorises the next attempt to push.
+        Downgrading it to `interrupted` would make the task permanently unrecoverable
+        after a single transient failure.
+
+        A task that already has a publishable stage keeps it; anything else takes the
+        given fallback stage, which is the honest answer for genuinely ambiguous work.
+        """
+        current = self.store.get_task(task.repo, task.issue_number)
+        stage = (
+            current.recovery_stage
+            if current is not None and current.has_publishable_stage
+            else RECOVERY_INTERRUPTED
+        )
+        self.store.park_for_recovery(task.id, stage=stage, note=" ".join(notes) or fallback)
 
     def _recover_publish_only(
         self, task: Task, *, run_completed: bool | None = None
