@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-dispatch"
 version = "0.1.0"
-description = "Poll GitHub Issues labelled take-it and maintain a durable dispatch queue (MVP foundation, Issue #3)."
+description = "Poll GitHub Issues labelled take-it and implement each one with a coding agent in an owned Git worktree, ending in exactly one PR (MVP, Issues #3-#4)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

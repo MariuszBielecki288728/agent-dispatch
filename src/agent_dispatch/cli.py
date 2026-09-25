@@ -1,21 +1,23 @@
 """Command-line interface.
 
-Operator surface for Issue #3 (deliberately small):
+Operator surface for Issues #3–#4:
 
 | Command | Purpose |
 |---|---|
-| ``doctor`` | Verify wrapper, allowlist, labels, state placement, systemd |
+| ``doctor`` | Verify wrapper, allowlist, labels, state placement, runtime, systemd |
 | ``status`` | Show every task row, its phase, and why it is or is not dispatchable |
 | ``dry-run`` | One poll that writes nothing to disk and nothing to GitHub |
-| ``worker`` | The foreground polling loop (systemd or manual) |
+| ``worker`` | The polling loop: discover, queue, and (from #4) execute one task |
+| ``run`` | Execute one queued task now, through to exactly one PR |
+| ``open`` | Print the owned branch, worktree, session and PR for a task |
 | ``enqueue`` | Queue a labelled Issue now, without waiting for the next poll |
 | ``pause`` / ``unpause`` / ``retry`` | Act on a queued task |
 | ``prune-logs`` | Bounded retention for run logs |
 | ``setup-labels`` | Explicit, idempotent, maintainer-invoked label creation |
 
-Commands that would need a coding agent (``open``, session inspection, review
-handling) are intentionally absent and documented as #4/#5 work rather than
-stubbed with a fake success.
+Review-loop commands (``agent:fix`` handoff, feedback rounds) are intentionally
+absent: that is Issue #5, and stubbing them with a fake success would be worse
+than their absence.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from .enqueue import enqueue_issue
 from .github import GitHubClient, GitHubError
 from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
+from .orchestrator import OUTCOME_BLOCKED, Orchestrator
 from .runlogs import prune
 from .store import Store, phase_summary
 from .worker import PollOutcome, Worker
@@ -54,8 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-dispatch",
         description=(
-            "Poll allowlisted GitHub repositories for Issues labelled `take-it` and maintain a durable, "
-            "idempotent dispatch queue. This release queues work; it does not run an agent (Issue #4)."
+            "Poll allowlisted GitHub repositories for Issues labelled `take-it`, maintain a durable "
+            "idempotent dispatch queue, and execute one task at a time in a task-owned Git worktree "
+            "through to a single pull request."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -63,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  agent-dispatch doctor\n"
             "  agent-dispatch dry-run\n"
             "  agent-dispatch status\n"
+            "  agent-dispatch run\n"
+            "  agent-dispatch open --repo owner/name --issue 12\n"
             "  agent-dispatch worker --interval 120\n"
             "  agent-dispatch pause --repo owner/name --issue 12\n"
         ),
@@ -83,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     doctor = subparsers.add_parser(
-        "doctor", help="verify environment, wrapper, allowlist, labels and state placement"
+        "doctor", help="verify environment, wrapper, allowlist, labels, state placement"
     )
     doctor.add_argument(
         "--skip-github", action="store_true", help="do local checks only; make no API calls"
@@ -115,6 +121,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true", help="run a single poll and exit (still writes state)"
     )
     worker.add_argument("--timeout", type=int, help="override worker.run_timeout_seconds")
+    worker.add_argument(
+        "--no-execute",
+        action="store_true",
+        help="discover and queue only; do not start an agent even for eligible tasks",
+    )
+
+    run = subparsers.add_parser(
+        "run", help="execute one queued task now, through to exactly one pull request"
+    )
+    run.add_argument("--repo", help="restrict to one allowlisted repository")
+    run.add_argument("--issue", type=int, help="execute this Issue instead of the oldest queued")
+    run.add_argument(
+        "--skip-poll",
+        action="store_true",
+        help="do not poll GitHub first; use the existing queue state",
+    )
+    open_parser = subparsers.add_parser(
+        "open", help="show the owned branch, worktree, session and PR for one task"
+    )
+    open_parser.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
+    open_parser.add_argument("--issue", type=int, required=True, help="Issue number")
 
     enqueue = subparsers.add_parser(
         "enqueue", help="queue one labelled Issue now instead of waiting for a poll"
@@ -124,12 +151,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text in (
         ("pause", "pause a queued task (dispatch intent withdrawn locally)"),
-        ("unpause", "return a paused task to the queue"),
-        ("retry", "re-queue a failed or needs_attention task with a fresh attempt budget"),
+        ("unpause", "release a paused task; publish-pending work returns to publication"),
+        (
+            "retry",
+            "re-queue a failed task with a fresh budget (refused while publication is pending)",
+        ),
     ):
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
         sub.add_argument("--issue", type=int, required=True, help="Issue number")
+
+    resume = subparsers.add_parser(
+        "resume-publish",
+        help="return a paused task whose finished work awaits publication (no model call)",
+    )
+    resume.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
+    resume.add_argument("--issue", type=int, required=True, help="Issue number")
 
     prune_parser = subparsers.add_parser(
         "prune-logs", help="delete run logs beyond worker.run_log_keep"
@@ -168,10 +205,13 @@ def main(argv: list[str] | None = None) -> int:
         "status": _cmd_status,
         "dry-run": _cmd_dry_run,
         "worker": _cmd_worker,
+        "run": _cmd_run,
+        "open": _cmd_open,
         "enqueue": _cmd_enqueue,
         "pause": _cmd_pause,
         "unpause": _cmd_unpause,
         "retry": _cmd_retry,
+        "resume-publish": _cmd_resume_publish,
         "prune-logs": _cmd_prune_logs,
         "setup-labels": _cmd_setup_labels,
     }
@@ -268,6 +308,7 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
                         "worktree_path": task.worktree_path,
                         "session_id": task.session_id,
                         "pr_number": task.pr_number,
+                        "pr_url": task.pr_url,
                         "attempts": task.attempts,
                         "last_error": task.last_error,
                         "last_run_at": task.last_run_at,
@@ -289,7 +330,7 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print(f"phases: {phase_summary(counts)}")
         print(
             f"active tasks: {active} / {config.worker.max_concurrent_tasks} "
-            "(agent execution arrives in Issue #4)"
+            "(one task at a time, globally — Issue #4)"
         )
         print()
         if not tasks:
@@ -300,21 +341,32 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
             )
             return EXIT_OK
 
-        header = f"  {'TASK':<28} {'PHASE':<15} {'INTENT':<7} {'PR':<6} DISPATCH"
+        header = f"  {'TASK':<28} {'PHASE':<16} {'INTENT':<7} {'PR':<7} DISPATCH"
         print(header)
         print("  " + "-" * (len(header) - 2))
         for task in tasks:
             allowed, blocker = task.dispatchability()
             intent = "yes" if task.trigger_present else "no"
-            pr = str(task.linked_pr_number) if task.linked_pr_number else "-"
+            # An owned PR is the one this worker created; an observed one merely
+            # references the Issue. The distinction is the point (see #3's review).
+            if task.pr_number is not None:
+                pr = f"own#{task.pr_number}"
+            elif task.linked_pr_number is not None:
+                pr = f"obs#{task.linked_pr_number}"
+            else:
+                pr = "-"
             state = "ready" if allowed else blocker
-            print(f"  {task.ref:<28} {task.phase:<15} {intent:<7} {pr:<6} {state}")
+            print(f"  {task.ref:<28} {task.phase:<16} {intent:<7} {pr:<7} {state}")
+            if task.branch or task.session_id:
+                print(f"      branch: {task.branch or '-'}  session: {task.session_id or '-'}")
             if task.last_error:
                 print(f"      note: {task.last_error}")
 
         print()
+        print("  own#N = a PR this worker created; obs#N = a PR that merely references the Issue.")
         print(
-            "  Note: no task is promoted to `running` in this release; queueing is not implementation."
+            "  In this release an eligible task is executed, pushed and opened as one PR; "
+            "the review loop is Issue #5."
         )
         return EXIT_OK
     finally:
@@ -412,7 +464,9 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
             )
             for note in repo_outcome.notes:
                 print(f"      note: {note}")
-    print(f"  dispatchable now: {len(dispatchable)} (dispatch itself is Issue #4 scope)")
+    print(
+        f"  dispatchable now: {len(dispatchable)} (an eligible task is executed by `run`/`worker`)"
+    )
     for ref in dispatchable[:10]:
         print(f"      {ref}")
 
@@ -421,6 +475,184 @@ def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
         return EXIT_FAILURE
     print("  result: OK")
     return EXIT_OK
+
+
+# ------------------------------------------------------------------- execute
+
+
+def _cmd_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Execute one queued task through to a PR.
+
+    Takes the single-instance lock first, so an explicit ``run`` and the systemd
+    worker can never have two agents live at once — the MVP allows exactly one
+    active task globally, and that guarantee is worth more than the convenience of
+    a lock-free shortcut.
+    """
+    if args.repo is not None:
+        config.repo(args.repo)  # allowlist check before anything else
+
+    lock = WorkerLock(
+        config.worker.lock_file,
+        command=f"agent-dispatch run --config {config.source_path}",
+    )
+    try:
+        lock.acquire()
+    except LockBusyError as exc:
+        log.error(
+            "lock_busy",
+            path=str(exc.path),
+            holder=str(exc.holder),
+            detail="another worker or run holds the lock; refusing to start a second agent",
+        )
+        return EXIT_BUSY
+
+    try:
+        store = Store(config.worker.state_db)
+        try:
+            client = GitHubClient(config.github.command)
+            try:
+                client.check_available()
+            except GitHubError as exc:
+                log.error("run_failed", kind=exc.kind, error=str(exc))
+                return EXIT_FAILURE
+
+            if not args.skip_poll:
+                # Refresh the queue first, so `run` cannot act on a stale snapshot.
+                # This is the same poll the worker performs, not a second rule set.
+                # `execute=False` on purpose: this command decides which single task
+                # to run *after* the refresh, and letting the poll dispatch first
+                # would make the choice implicit.
+                outcome = Worker(config, store, log, execute=False).poll_once()
+                if not outcome.ok:
+                    log.error(
+                        "run_poll_failed",
+                        detail=outcome.error or "one or more repositories were inaccessible",
+                    )
+                    return EXIT_FAILURE
+
+            orchestrator = Orchestrator(config, store, client, log)
+
+            # Crash recovery before any new work: an orphaned `running` row, or a
+            # branch/PR created but not confirmed, is repaired from evidence
+            # instead of being repeated.
+            for note in orchestrator.reconcile():
+                print(f"reconcile: {note}")
+
+            if args.issue is not None:
+                if args.repo is None:
+                    print("--issue requires --repo so the task can be identified", file=sys.stderr)
+                    return EXIT_USAGE
+                task = store.get_task(args.repo, args.issue)
+                if task is None:
+                    print(f"{args.repo}#{args.issue}: no task row recorded", file=sys.stderr)
+                    return EXIT_FAILURE
+                result = orchestrator.dispatch_task(task)
+            else:
+                result = orchestrator.dispatch_next()
+
+            print(f"result: {result.summary()}")
+            for note in result.notes:
+                print(f"  note: {note}")
+            if result.run is not None:
+                for name, ok in result.run.validation.checks.items():
+                    print(f"  check {name}: {'pass' if ok else 'FAIL'}")
+                if result.run.log_path is not None:
+                    # Path only, never contents: raw transcripts stay out of the
+                    # terminal and out of anything an operator might paste.
+                    print(f"  run log: {result.run.log_path}")
+
+            if result.action == OUTCOME_BLOCKED:
+                return EXIT_OK
+            if result.dispatched:
+                return EXIT_OK
+            return EXIT_FAILURE
+        finally:
+            store.close()
+    finally:
+        lock.release()
+        log.info("lock_released", path=str(config.worker.lock_file))
+
+
+# ---------------------------------------------------------------------- open
+
+
+def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Print the paths and IDs needed to inspect a task by hand.
+
+    Read-only by construction: it opens the state database without write access, so
+    a look-up can never create or migrate the file. Nothing here resumes a session
+    — the operator can copy the session ID and resume it in the worktree terminal,
+    which is the supported handoff (no native VS Code Chat integration is claimed).
+    """
+    config.repo(args.repo)
+    store = Store.open_read_only(config.worker.state_db)
+    try:
+        task = store.get_task(args.repo, args.issue)
+        if task is None:
+            print(f"{args.repo}#{args.issue}: no task recorded", file=sys.stderr)
+            return EXIT_FAILURE
+
+        runs = store.run_history(task.id)
+        resumable = store.resumable_session(task.id)
+        print(f"{task.ref} — {task.title or '(no title)'}")
+        print(
+            f"  phase          : {task.phase}"
+            + (f" ({task.pause_reason})" if task.pause_reason else "")
+        )
+        print(f"  branch         : {task.branch or '-'}")
+        print(f"  worktree       : {task.worktree_path or '-'}")
+        print(f"  base           : {task.base_branch or '-'}")
+        print(
+            "  owned PR       : "
+            + (f"#{task.pr_number} {task.pr_url or ''}" if task.pr_number else "-")
+        )
+        print(
+            "  observed PR    : "
+            + (
+                f"#{task.linked_pr_number} ({task.linked_pr_state})"
+                if task.linked_pr_number
+                else "-"
+            )
+        )
+        print(
+            f"  pinned runtime : {task.runtime_driver} / {task.runtime_model} / {task.runtime_effort}"
+        )
+        print(f"  attempts       : {task.attempts}")
+        print(f"  session        : {task.session_id or '-'}")
+        print(
+            "  resumable      : "
+            + (
+                f"yes — {resumable}"
+                if resumable
+                else "no — a session is resumable only after a run that completed cleanly"
+            )
+        )
+        if task.last_error:
+            print(f"  last message   : {task.last_error}")
+        if runs:
+            print("  runs:")
+            for run in runs:
+                outcome = (
+                    run.outcome
+                    + (" (blocked tools)" if run.tool_hook_blocked else "")
+                    + (" (timed out)" if run.timed_out else "")
+                )
+                print(
+                    f"    {run.run_id}  {run.kind:<16} {outcome:<24} "
+                    f"session={run.session_id or '-'} exit={run.exit_code} "
+                    f"work={run.produced_work}"
+                )
+                if run.log_path:
+                    print(f"      log: {run.log_path}")
+
+        if task.worktree_path and task.branch and task.session_id and resumable:
+            print()
+            print("  to inspect or resume the session in a terminal:")
+            print(f"    cd {task.worktree_path}")
+            print(f"    commandcode --session {task.session_id}")
+        return EXIT_OK
+    finally:
+        store.close()
 
 
 # -------------------------------------------------------------------- worker
@@ -453,10 +685,18 @@ def _cmd_worker(args: argparse.Namespace, config: Config, log: Logger) -> int:
     try:
         store = Store(config.worker.state_db)
         try:
-            worker = Worker(config, store, log)
+            worker = Worker(config, store, log, execute=not args.no_execute)
             if args.once:
-                log.info("worker_once", note="single poll; state is written, no agent is started")
+                log.info(
+                    "worker_once",
+                    note="single poll"
+                    + ("" if not args.no_execute else "; agent execution disabled by --no-execute"),
+                )
                 outcome = worker.poll_once()
+                if outcome.dispatch is not None:
+                    print(f"dispatch: {outcome.dispatch.summary()}")
+                    for note in outcome.dispatch.notes:
+                        print(f"  note: {note}")
                 return EXIT_OK if outcome.ok else EXIT_FAILURE
             return worker.run_forever()
         finally:
@@ -501,6 +741,131 @@ def _cmd_unpause(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
 def _cmd_retry(args: argparse.Namespace, config: Config, log: Logger) -> int:
     return _mutate(args, config, log, "retry")
+
+
+def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Finish publication for a paused publish-pending task.
+
+    The publish-pending counterpart of ``retry``: it commits, pushes and opens the PR
+    for work the model already completed, and never starts a runtime.
+
+    It takes the single-instance lock and runs the same publish-only reconciliation the
+    worker does, rather than only moving the row and relying on a live worker to notice.
+    Re-arming alone would leave an already-running service to pick it up on a later
+    poll; doing the work here means the command's stated effect is what actually
+    happens. When the worker does hold the lock, the command reports that it has
+    re-armed the task and the running worker will finish it — which the worker's
+    per-poll pass guarantees.
+
+    Exits 0 only when the work is actually published, or when a live worker holds the
+    lock and has explicitly taken responsibility for the next poll. A second failure
+    leaves the task publish-pending, and says so with a non-zero exit rather than
+    reporting success for an attempt that did not land.
+    """
+    config.repo(args.repo)  # allowlist check before anything else
+    store = Store(config.worker.state_db)
+    try:
+        try:
+            task = store.resume_publication(args.repo, args.issue)
+        except ValueError as exc:
+            log.error(
+                "action_rejected",
+                action="resume-publish",
+                repo=args.repo,
+                issue=args.issue,
+                error=str(exc),
+            )
+            return EXIT_FAILURE
+        print(f"{task.ref}: publishing re-armed → {task.phase}")
+    finally:
+        store.close()
+
+    lock = WorkerLock(
+        config.worker.lock_file,
+        command=f"agent-dispatch resume-publish --config {config.source_path}",
+    )
+    try:
+        lock.acquire()
+    except LockBusyError as exc:
+        # The running worker owns publication: it reconciles publish-pending tasks on
+        # every poll, so re-arming the row is genuinely sufficient here.
+        log.info(
+            "publish_deferred_to_worker",
+            path=str(exc.path),
+            holder=str(exc.holder),
+            detail="the running worker will finish this publication on its next poll",
+        )
+        print(
+            "a worker holds the lock; the task is re-armed and will be published on its next poll"
+        )
+        return EXIT_OK
+
+    try:
+        store = Store(config.worker.state_db)
+        try:
+            client = GitHubClient(config.github.command)
+            try:
+                client.check_available()
+            except GitHubError as exc:
+                log.error("publish_failed", kind=exc.kind, error=str(exc))
+                return EXIT_FAILURE
+            orchestrator = Orchestrator(config, store, client, log)
+            notes = orchestrator.reconcile_publish_pending()
+            for note in notes:
+                print(f"publish: {note}")
+            return _resume_publish_result(args, store, log, notes)
+        finally:
+            store.close()
+    finally:
+        lock.release()
+
+
+def _resume_publish_result(
+    args: argparse.Namespace, store: Store, log: Logger, notes: list[str]
+) -> int:
+    """Report whether the attempted publication actually completed.
+
+    The command promises to *finish* publication, so its exit status has to describe
+    the outcome rather than the attempt. A second failure leaves the task exactly where
+    it was — publish-pending with no owned PR — and reporting shell success for that
+    would be a lie an operator or a script could act on. The durable task state is
+    re-read rather than inferred from ``notes``, which describe what was tried.
+    """
+    task = store.get_task(args.repo, args.issue)
+    if task is None:
+        print(f"{args.repo}#{args.issue}: no task row recorded", file=sys.stderr)
+        return EXIT_FAILURE
+    if task.pr_number is not None:
+        if not notes:
+            # Already published before this attempt: nothing was pending after all.
+            print(f"{task.ref}: nothing left to publish")
+        else:
+            print(f"{task.ref}: publication finished → {task.phase} (PR #{task.pr_number})")
+        return EXIT_OK
+
+    # Still publish-pending with no owned PR: the attempt did not get the work
+    # published, whatever the notes said about it.
+    detail = " ".join(notes[-1:]) if notes else "no progress was recorded"
+    log.error(
+        "publish_incomplete",
+        repo=task.repo,
+        issue=task.issue_number,
+        phase=task.phase,
+        recovery_stage=task.recovery_stage,
+        detail=detail,
+    )
+    print(
+        f"{task.ref}: publication is still incomplete → {task.phase}"
+        + (f" (recovery_stage={task.recovery_stage})" if task.recovery_stage else "")
+        + (
+            ". The task is unchanged and remains recoverable; re-run `agent-dispatch run` "
+            "once the cause is fixed, or let the worker's next poll retry it."
+            if task.is_publish_pending
+            else ". It is not awaiting publication any more; check the note above."
+        ),
+        file=sys.stderr,
+    )
+    return EXIT_FAILURE
 
 
 def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) -> int:

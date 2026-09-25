@@ -28,13 +28,29 @@ poll_interval_seconds = 120
 max_concurrent_tasks = 1
 
 # Hard wall-clock cap for a single agent run.
+#
+# Enforced by a watchdog that kills the run's whole PROCESS GROUP, so a hung agent
+# cannot leave a grandchild holding the worktree. Minimum 30s; a killed run is
+# recorded as a timeout, never as a success.
 run_timeout_seconds = 3600
 
 # Bounded retries per task before the task is marked failed.
+#
+# A failed attempt within budget leaves the task queued for another try. A retry
+# PRESERVES whatever the previous attempt wrote and starts a FRESH session in the
+# same worktree: an interrupted Command Code run writes no transcript, so it cannot
+# be resumed and the service does not pretend otherwise.
 max_attempts = 3
 
 # Where orchestrator-owned worktrees are created. The user's normal checkout
 # is never touched.
+#
+# Layout: <worktree_root>/<owner>__<name>/issue-<N>/
+# Branch:  dispatch/issue-<N>-<kebab-title>
+#
+# Point a repo's `path` at an orchestrator-managed clone rather than your working
+# copy: a worktree shares its source clone's Git common config, and provisioning
+# may write repo-local credential config there when that is enabled below.
 worktree_root = "~/agent-dispatch/worktrees"
 
 # SQLite state database. MUST live outside target repositories.
@@ -48,11 +64,43 @@ run_log_dir = "~/.local/state/agent-dispatch/runs"
 # Bounded retention for run logs (count-based pruning).
 run_log_keep = 50
 
+# Author identity for commits the ORCHESTRATOR makes itself — specifically when the
+# agent leaves its changes uncommitted and the dispatcher commits them so the branch
+# can be pushed.
+#
+# Applied per-invocation with `git -c`, so it neither depends on nor writes to your
+# ambient Git config. That independence is the point: a machine with no `user.email`
+# configured fails such a commit with exit 128 ("Author identity unknown"), and the
+# finished work then silently never reaches the branch — a failure that only shows
+# up on a machine other than the one it was written on.
+#
+# These commits are machine work, so the defaults say so. Set the email to your
+# GitHub noreply address if you would rather they be attributed to you.
+commit_identity_name = "agent-dispatch"
+commit_identity_email = "agent-dispatch@localhost"
+
 # Single-process lock; prevents accidentally running two workers.
 lock_file = "~/.local/state/agent-dispatch/worker.lock"
 
 # Path to the runtime binary; resolved via PATH when omitted.
+#
+# `agent-dispatch run` / `worker` refuse to claim a task when this cannot be
+# executed, reporting it once as `dispatch_unavailable`. That is deliberate: a
+# missing runtime is a configuration fault, not a task failure, so a queued Issue
+# is not consumed (and not marked `failed`) because the tool is not installed.
 # commandcode_path = "commandcode"
+
+# Write the reset-then-wrapper Git credential sequence into the source clone's
+# LOCAL config, in addition to the GIT_CONFIG_COUNT/KEY/VALUE environment pairs
+# that are always applied.
+#
+# OFF by default, and worth understanding before enabling: a Git worktree shares
+# --git-common-dir with the clone it came from, so this edits configuration that
+# every worktree of that clone inherits. That is correct for a dedicated
+# orchestrator-managed clone and surprising for a personal checkout. The env pairs
+# already cover both orchestrator Git and Git that the agent spawns itself, so this
+# is an extra, not a requirement.
+write_repo_local_credentials = false
 
 
 [github]

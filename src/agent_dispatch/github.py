@@ -29,7 +29,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 #: Hard cap on pagination so a pathological response cannot loop forever.
 MAX_PAGES = 50
@@ -88,6 +88,10 @@ class Issue:
     #: ``pull_request`` marker. It is captured here because discarding it is how a
     #: PR number gets mistaken for an Issue (see ``open_issue``).
     is_pull_request: bool = False
+    #: The Issue's own description. Untrusted task content: it is fenced and
+    #: labelled as data by :mod:`agent_dispatch.instruction`, never treated as
+    #: operator authorization.
+    body: str = ""
 
     def has_label(self, label: str) -> bool:
         return label in self.labels
@@ -102,6 +106,35 @@ class PullRequest:
     url: str
     title: str = ""
     body: str = ""
+    head_sha: str = ""
+    #: ``owner/name`` that hosts the head branch. For a pull request opened from a
+    #: fork this is the fork, not the base repository, which is why an exact
+    #: branch-name match alone cannot prove a PR is ours.
+    head_repo: str = ""
+    head_owner: str = ""
+
+    @property
+    def head_label(self) -> str:
+        """Human-readable head identity, e.g. ``owner:branch`` or just the branch."""
+        if self.head_owner and self.head_ref:
+            return f"{self.head_owner}:{self.head_ref}"
+        return self.head_ref
+
+    def head_ref_matches_owner(self, repo: str) -> bool:
+        """Whether this PR's head branch lives in ``repo`` rather than a fork.
+
+        A branch *name* is not unique across GitHub: ``dispatch/issue-7-x`` in a fork
+        can collide with ours. Comparing the head repository (and, when reported,
+        the owner) is what keeps a fork's pull request from being adopted as this
+        task's. Unknown head information fails closed when the base repo is known,
+        because adopting the wrong PR is worse than asking a human.
+        """
+        if not self.head_ref:
+            return False
+        if not self.head_repo:
+            # Older/short payloads omit the head repository. Treat as unproven.
+            return False
+        return self.head_repo.lower() == repo.lower()
 
     def references_issue(self, repo: str, issue_number: int) -> bool:
         """Whether this PR appears to implement ``repo#issue_number``.
@@ -111,11 +144,32 @@ class PullRequest:
 
         1. the deterministic dispatch branch name for that Issue, or
         2. a closing keyword / the Issue URL in the PR body.
-        """
-        match = DISPATCH_BRANCH_RE.match(self.head_ref or "")
-        if match and int(match.group(1)) == issue_number:
-            return True
 
+        Signal 1 makes this **unsuitable for deciding ownership**: a branch name is a
+        naming convention, not evidence that a PR implements this Issue. Use
+        :meth:`references_issue_in_text` for that, and see its docstring for why the
+        distinction matters.
+        """
+        if DISPATCH_BRANCH_RE.match(self.head_ref or ""):
+            match = DISPATCH_BRANCH_RE.match(self.head_ref or "")
+            if match and int(match.group(1)) == issue_number:
+                return True
+        return self.references_issue_in_text(repo, issue_number)
+
+    def references_issue_in_text(self, repo: str, issue_number: int) -> bool:
+        """Whether the PR *text* explicitly links to ``repo#issue_number``.
+
+        Deliberately ignores the branch name. For deciding whether a PR is this
+        task's own, a branch-name match is the wrong evidence: anyone can push a
+        branch called ``dispatch/issue-7-...``, and a PR that merely *sits on* such a
+        branch while implementing something else would otherwise be adopted as this
+        task's work. Requiring a closing keyword or the Issue URL in the title/body
+        makes ownership a claim the PR itself makes.
+
+        Used for ownership decisions. The looser :meth:`references_issue` stays for
+        *discovery*, where treating a dispatch-named branch as "this Issue already has
+        work" is the conservative choice.
+        """
         text = f"{self.title}\n{self.body}"
         for closing in _CLOSING_REF_RE.finditer(text):
             if closing.group("urlrepo") and closing.group("urlrepo").lower() == repo.lower():
@@ -361,6 +415,86 @@ class GitHubClient:
             )
         return _to_issue(raw)
 
+    def get_pull(self, slug: str, pr_number: int) -> PullRequest:
+        """Fetch one pull request by number, with its head SHA."""
+        raw = self._run_json(["api", f"repos/{slug}/pulls/{pr_number}"])
+        if not isinstance(raw, dict):
+            raise GitHubError(
+                f"GitHub returned no data for {slug} PR #{pr_number}", kind=ErrorKind.MALFORMED
+            )
+        return _to_pull(raw)
+
+    def find_pull_by_head(self, slug: str, head_branch: str) -> PullRequest | None:
+        """Find the open PR whose head is exactly ``head_branch``, if any.
+
+        This is the recovery primitive: it answers "did my push already turn into a
+        PR before the crash?" without trusting a PR's *title* or a stray ``#N`` in
+        prose. Only an exact head-branch match counts, and the caller must still
+        verify the PR references the intended Issue before recording ownership.
+        """
+        owner = slug.split("/", 1)[0]
+        head_param = f"{owner}:{head_branch}"
+        for raw in self._paginate(f"repos/{slug}/pulls", {"state": "open", "head": head_param}):
+            if not isinstance(raw, dict) or "number" not in raw:
+                continue
+            pull = _to_pull(raw)
+            if pull.head_ref == head_branch:
+                return pull
+        return None
+
+    def create_pull(
+        self,
+        slug: str,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        draft: bool = False,
+    ) -> PullRequest:
+        """Open a pull request and return the real object GitHub created.
+
+        The returned ``number`` is what gets recorded as task ownership — never a
+        number parsed out of a response fragment, and never inferred from a branch
+        name. Idempotency is the caller's job (check :meth:`find_pull_by_head`
+        first): a second POST for an existing head/base pair is an API error, and
+        treating that error as "no PR" would be exactly the duplicate-creation bug
+        this workflow exists to avoid.
+        """
+        self.check_available()
+        argv = ["api", "-X", "POST", f"repos/{slug}/pulls"]
+        argv += ["-f", f"title={title}"]
+        argv += ["-f", f"head={head_branch}"]
+        argv += ["-f", f"base={base_branch}"]
+        argv += ["-f", f"body={body}"]
+        if draft:
+            argv += ["-F", "draft=true"]
+
+        try:
+            proc = self._execute(argv)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise GitHubError(f"failed to create a pull request in {slug}: {exc}") from exc
+
+        if proc.returncode != 0:
+            raise _classify_failure(proc.returncode, proc.stderr or "", argv)
+
+        try:
+            raw = json.loads((proc.stdout or "").strip() or "null")
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub accepted the pull request but returned an unparseable body, so the PR "
+                "number is unknown; check GitHub before retrying",
+                kind=ErrorKind.MALFORMED,
+                detail=(proc.stdout or "")[:400],
+            ) from exc
+        if not isinstance(raw, dict) or "number" not in raw:
+            raise GitHubError(
+                "GitHub returned no pull request number after creating one; check GitHub before "
+                "retrying so a duplicate is not created",
+                kind=ErrorKind.MALFORMED,
+            )
+        return _to_pull(raw)
+
     def _paginate(self, endpoint: str, params: dict[str, str] | None = None) -> list[Any]:
         """Collect all pages of a list endpoint, page by page.
 
@@ -469,6 +603,7 @@ def _to_issue(raw: dict[str, Any]) -> Issue:
         for item in (raw.get("labels") or [])
         if isinstance(item, dict) and item.get("name")
     )
+    body = raw.get("body")
     return Issue(
         number=int(raw.get("number", 0)),
         title=str(raw.get("title") or ""),
@@ -476,12 +611,22 @@ def _to_issue(raw: dict[str, Any]) -> Issue:
         url=str(raw.get("html_url") or ""),
         labels=labels,
         is_pull_request="pull_request" in raw,
+        body=str(body) if isinstance(body, str) else "",
     )
 
 
 def _to_pull(raw: dict[str, Any]) -> PullRequest:
     merged_at = raw.get("merged_at")
     head = raw.get("head") or {}
+    body = raw.get("body")
+    head_repo_raw = head.get("repo") or {}
+    head_repo = ""
+    if isinstance(head_repo_raw, Mapping):
+        head_repo = str(head_repo_raw.get("full_name") or "")
+    head_owner = ""
+    head_user = head.get("user") or head_repo_raw.get("owner") or {}
+    if isinstance(head_user, Mapping):
+        head_owner = str(head_user.get("login") or "")
     return PullRequest(
         number=int(raw.get("number", 0)),
         state=str(raw.get("state") or "unknown"),
@@ -489,7 +634,10 @@ def _to_pull(raw: dict[str, Any]) -> PullRequest:
         head_ref=str(head.get("ref") or ""),
         url=str(raw.get("html_url") or ""),
         title=str(raw.get("title") or ""),
-        body=str(raw.get("body") or ""),
+        body=str(body) if isinstance(body, str) else "",
+        head_sha=str(head.get("sha") or ""),
+        head_repo=head_repo,
+        head_owner=head_owner,
     )
 
 

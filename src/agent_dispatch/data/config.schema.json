@@ -71,6 +71,23 @@
           "type": "string",
           "minLength": 1,
           "description": "Path to the runtime binary. Resolved via PATH when omitted."
+        },
+        "commit_identity_name": {
+          "type": "string",
+          "minLength": 1,
+          "default": "agent-dispatch",
+          "description": "Author name for commits the ORCHESTRATOR makes itself, i.e. committing work the agent left uncommitted. Applied per-invocation with `git -c`, so it never depends on - or writes to - ambient Git config. Without it a machine with no user.email fails the commit with exit 128 (\"Author identity unknown\") and finished work never reaches the branch."
+        },
+        "commit_identity_email": {
+          "type": "string",
+          "minLength": 1,
+          "default": "agent-dispatch@localhost",
+          "description": "Author email for orchestrator-made commits. Set this to your GitHub noreply address if you want those commits attributed to you."
+        },
+        "write_repo_local_credentials": {
+          "type": "boolean",
+          "default": false,
+          "description": "Write the reset-then-wrapper Git credential sequence into the source clone's LOCAL config. Off by default because a worktree shares its clone's Git common config, so this edits configuration that may belong to a personal checkout. The GIT_CONFIG_COUNT/KEY/VALUE environment pairs already cover orchestrator Git and Git the agent spawns, so this is optional rather than required."
         }
       }
     },
