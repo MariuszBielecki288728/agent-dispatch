@@ -744,12 +744,77 @@ def _cmd_retry(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
 
 def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -> int:
-    """Return a paused publish-pending task to publication.
+    """Finish publication for a paused publish-pending task.
 
-    The publish-pending counterpart of ``retry``: it finishes committing, pushing and
-    opening the PR for work the model already completed, and never starts a runtime.
+    The publish-pending counterpart of ``retry``: it commits, pushes and opens the PR
+    for work the model already completed, and never starts a runtime.
+
+    It takes the single-instance lock and runs the same publish-only reconciliation the
+    worker does, rather than only moving the row and relying on a live worker to notice.
+    Re-arming alone would leave an already-running service to pick it up on a later
+    poll; doing the work here means the command's stated effect is what actually
+    happens. When the worker does hold the lock, the command reports that it has
+    re-armed the task and the running worker will finish it — which the worker's
+    per-poll pass guarantees.
     """
-    return _mutate(args, config, log, "resume_publication")
+    config.repo(args.repo)  # allowlist check before anything else
+    store = Store(config.worker.state_db)
+    try:
+        try:
+            task = store.resume_publication(args.repo, args.issue)
+        except ValueError as exc:
+            log.error(
+                "action_rejected",
+                action="resume-publish",
+                repo=args.repo,
+                issue=args.issue,
+                error=str(exc),
+            )
+            return EXIT_FAILURE
+        print(f"{task.ref}: publishing re-armed → {task.phase}")
+    finally:
+        store.close()
+
+    lock = WorkerLock(
+        config.worker.lock_file,
+        command=f"agent-dispatch resume-publish --config {config.source_path}",
+    )
+    try:
+        lock.acquire()
+    except LockBusyError as exc:
+        # The running worker owns publication: it reconciles publish-pending tasks on
+        # every poll, so re-arming the row is genuinely sufficient here.
+        log.info(
+            "publish_deferred_to_worker",
+            path=str(exc.path),
+            holder=str(exc.holder),
+            detail="the running worker will finish this publication on its next poll",
+        )
+        print(
+            "a worker holds the lock; the task is re-armed and will be published on its next poll"
+        )
+        return EXIT_OK
+
+    try:
+        store = Store(config.worker.state_db)
+        try:
+            client = GitHubClient(config.github.command)
+            try:
+                client.check_available()
+            except GitHubError as exc:
+                log.error("publish_failed", kind=exc.kind, error=str(exc))
+                return EXIT_FAILURE
+            orchestrator = Orchestrator(config, store, client, log)
+            notes = orchestrator.reconcile_publish_pending()
+            for note in notes:
+                print(f"publish: {note}")
+            if not notes:
+                print("nothing left to publish")
+            return EXIT_OK
+        finally:
+            store.close()
+    finally:
+        lock.release()
 
 
 def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) -> int:

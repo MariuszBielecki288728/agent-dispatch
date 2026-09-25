@@ -81,6 +81,16 @@ PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RE
 #: means "an implementation run is wanted".
 PUBLISH_PENDING_PHASE = "needs_attention"
 
+#: The only phases in which an automatic publish reconciliation pass may act.
+#:
+#: `recovery_stage` survives a manual `pause` by design (so re-adding `take-it` or
+#: `unpause` can restore publication), which means a *paused* task also has a
+#: publishable stage. Without this gate the per-poll pass would publish work the
+#: operator had deliberately stopped — it would silently undo `pause`, and worse,
+#: push to GitHub while the task reported itself as paused. `queued` is excluded for
+#: the same reason: publication is never something a queued task silently acquires.
+PUBLISH_RECONCILE_PHASES = frozenset({"awaiting_review", PUBLISH_PENDING_PHASE})
+
 #: `recovery_stage` values that mean "do not start a model run". Interpolated into one
 #: SQL predicate below; every member is a module-level constant defined in this file,
 #: never caller input, so the interpolation cannot carry anything user-supplied.

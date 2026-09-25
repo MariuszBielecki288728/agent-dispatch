@@ -31,6 +31,7 @@ Coverage maps to the Issue #4 acceptance list:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -199,6 +200,85 @@ class ExecutionCase(BaseCase):
             for line in self.argv_log.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    # ------------------------------------------------- persistent-worker helpers
+
+    def live_worker(self):
+        """A single persistent ``Worker`` over the real store, with captured logging.
+
+        Used by the tests that have to prove a *running* service picks up work without
+        a restart, so they drive one instance across several ``poll_once()`` calls
+        instead of starting a fresh process (which would silently re-run startup
+        reconciliation and hide the bug).
+        """
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.worker import Worker
+
+        # The fake runtime reads its script from the environment. `run_cli` wires this
+        # up per subprocess; an in-process worker needs it in this process.
+        previous = os.environ.get("FAKE_RUNTIME_SCENARIO")
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("FAKE_RUNTIME_SCENARIO", None)
+            else:
+                os.environ["FAKE_RUNTIME_SCENARIO"] = previous
+
+        self.addCleanup(restore)
+        os.environ["FAKE_RUNTIME_SCENARIO"] = str(self.scenario_path)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        self.log_stream = io.StringIO()
+        log = Logger(fmt="text", stream=self.log_stream)
+        # `execute=True` on purpose: the worker must be *able* to start an agent, so a
+        # poll that starts one anyway is caught rather than excused by the flag.
+        worker = Worker(
+            config, store, log, execute=True, client=GitHubClient(config.github.command)
+        )
+        return worker, store, config
+
+    def break_commits(self) -> None:
+        """Make every `git commit` fail, restoring the environment afterwards.
+
+        An empty `GIT_AUTHOR_NAME` outranks configured `-c user.name`, so the commit
+        fails exactly like the round-1 production bug the commit identity fixed.
+        """
+        previous = os.environ.get("GIT_AUTHOR_NAME")
+
+        def restore() -> None:
+            if previous is None:
+                os.environ.pop("GIT_AUTHOR_NAME", None)
+            else:
+                os.environ["GIT_AUTHOR_NAME"] = previous
+
+        self.addCleanup(restore)
+        os.environ["GIT_AUTHOR_NAME"] = ""
+
+    def repair_commits(self) -> None:
+        os.environ.pop("GIT_AUTHOR_NAME", None)
+
+    def assert_published_once(self, store, runs_before: int, branch: str, session: str) -> None:
+        """Assert publication finished exactly once, with no further runtime call."""
+        published = store.get_task(self.slug, 1)
+        self.assertEqual(
+            published.phase,
+            "awaiting_review",
+            "a running worker must finish publication on its next poll, without a restart",
+        )
+        self.assertIsNotNone(published.pr_number)
+        self.assertIsNone(published.recovery_stage)
+        self.assertEqual(published.branch, branch, "publication must reuse the finished work")
+        self.assertEqual(published.session_id, session)
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero additional runtime calls")
+        self.assertEqual(
+            len(self.world.read_world()["repos"][self.slug]["pulls"]),
+            1,
+            "exactly one PR",
+        )
 
     def assert_worktree_clean_of_orchestrator_files(self, worktree: Path) -> None:
         """No run log, state db or lock may exist inside the owned worktree."""
@@ -3430,18 +3510,52 @@ class PublishPendingTransitionTests(ExecutionCase):
         self.assertIsNotNone(recovered.pr_number)
 
     def test_resume_publish_returns_a_paused_task_to_publication(self) -> None:
-        # The explicit publish-pending counterpart of `retry`.
+        # The explicit publish-pending counterpart of `retry`, and it must actually
+        # publish: a command whose stated effect is "resume publication" cannot only
+        # move the row and hope a worker notices.
         orchestrator, store, config = self.parked(stage="push_failed")
         runs_before = len(self.recorded_argv())
         self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
 
         resumed = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+
+        # No agent was started, and the work is published.
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero additional runtime calls")
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(after.phase, "awaiting_review")
+        self.assertIsNotNone(after.pr_number)
+
+    def test_resume_publish_defers_to_a_running_worker_without_losing_the_task(self) -> None:
+        """When a worker holds the lock, `resume-publish` must hand off, not stall.
+
+        It re-arms the task and says so, and the running worker's next poll finishes
+        publication — the same already-running instance, no restart, no extra run.
+        """
+        from agent_dispatch.lockfile import WorkerLock
+
+        orchestrator, store, config = self.parked(stage="push_failed")
+        runs_before = len(self.recorded_argv())
+        task = store.get_task(self.slug, 1)
+        branch, session = task.branch, task.session_id
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        worker, live_store, _ = self.live_worker()
+        worker.poll_once()  # consume this instance's one startup reconciliation
+        self.assertTrue(worker._reconciled)
+
+        lock = WorkerLock(config.worker.lock_file, command="test worker")
+        lock.acquire()
+        try:
+            deferred = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
+        finally:
+            lock.release()
+        self.assertEqual(deferred.returncode, 0, deferred.stdout + deferred.stderr)
+        self.assertIn("holds the lock", deferred.stdout + deferred.stderr)
         self.assertEqual(store.get_task(self.slug, 1).phase, "needs_attention")
 
-        self.run_cli("run", "--skip-poll")
-        self.assertEqual(len(self.recorded_argv()), runs_before)
-        self.assertIsNotNone(store.get_task(self.slug, 1).pr_number)
+        worker.poll_once()
+        self.assert_published_once(live_store, runs_before, branch, session)
 
     def test_resume_publish_is_refused_when_nothing_awaits_publication(self) -> None:
         self.set_issues(issue(1, "Nothing pending", labels=[TRIGGER]))
@@ -3587,6 +3701,113 @@ class PublishPendingTransitionTests(ExecutionCase):
         self.assertEqual(self.run_cli("retry", "--repo", self.slug, "--issue", "1").returncode, 0)
         self.assertEqual(store.get_task(self.slug, 1).phase, "queued")
         self.assertEqual(store.get_task(self.slug, 1).attempts, 0)
+
+
+class LiveWorkerPublishPickupTests(ExecutionCase):
+    """Review round 5: a *running* worker must pick up newly publish-pending work.
+
+    Startup reconciliation runs once per process (`Worker._reconciled`), so a task that
+    becomes publish-pending *while the service is alive* — because `take-it` came back,
+    or an operator unpaused it — used to sit untouched until a restart.
+
+    The round-4 tests could not catch that: they finished publication with an explicit
+    `run --skip-poll`, and that command always calls `Orchestrator.reconcile()`, which
+    masked the missing per-poll pass. These tests therefore drive **one** `Worker`
+    instance across several `poll_once()` calls, never construct a second one, and
+    never invoke `run`.
+    """
+
+    def stuck_publication(self, worker, store):
+        """First poll: a real run finishes but its commit fails, so it stays unpublished.
+
+        This spends exactly one runtime invocation. Everything the tests do afterwards
+        must finish publication without any further invocation.
+        """
+        self.set_issues(issue(1, "Publish pending", labels=[TRIGGER]))
+        self.break_commits()
+
+        outcome = worker.poll_once()
+        self.assertIsNone(outcome.error, outcome.error)
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.recovery_stage, "commit_failed", task.last_error)
+        self.assertIsNone(task.pr_number)
+        self.assertEqual(len(self.recorded_argv()), 1, "exactly one implementation run")
+        self.assertTrue(
+            worker._reconciled,
+            "the persistent worker has already spent its one startup reconciliation",
+        )
+        return task
+
+    # -------------------------------------------------------------------- tests
+
+    def test_readding_the_label_publishes_on_the_next_poll(self) -> None:
+        worker, store, _ = self.live_worker()
+        task = self.stuck_publication(worker, store)
+        runs_before = len(self.recorded_argv())
+        branch, session = task.branch, task.session_id
+
+        # Withdraw `take-it`: discovery pauses the task, and the reason it is
+        # publish-pending must survive so re-adding the label restores publication.
+        self.set_issues(issue(1, "Publish pending", labels=[]))
+        worker.poll_once()
+        paused = store.get_task(self.slug, 1)
+        self.assertEqual(paused.phase, "paused")
+        self.assertEqual(paused.pause_reason, "label_withdrawn")
+        self.assertEqual(paused.recovery_stage, "commit_failed")
+        self.assertIsNone(paused.pr_number)
+
+        # Fix the cause, put the label back, and poll the SAME worker instance: no new
+        # Worker, no `run`, and no restart of the service.
+        self.repair_commits()
+        self.set_issues(issue(1, "Publish pending", labels=[TRIGGER]))
+        worker.poll_once()
+
+        self.assert_published_once(store, runs_before, branch, session)
+        self.assertIn("publish_reconciled", self.log_stream.getvalue())
+
+    def test_unpause_publishes_on_the_next_poll(self) -> None:
+        worker, store, _ = self.live_worker()
+        task = self.stuck_publication(worker, store)
+        runs_before = len(self.recorded_argv())
+        branch, session = task.branch, task.session_id
+
+        # A maintainer pause, then the pause released. The store routes publish-pending
+        # work to `needs_attention`, never back to the implementation queue.
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "paused")
+
+        self.repair_commits()
+        released = self.run_cli("unpause", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "needs_attention")
+
+        worker.poll_once()
+
+        self.assert_published_once(store, runs_before, branch, session)
+
+    def test_a_maintainer_pause_is_never_overtaken_by_a_poll(self) -> None:
+        """A publishable stage outlives a pause on purpose, so a poll must respect it.
+
+        Re-adding `take-it` or unpausing is what restores publication, which is exactly
+        why the stage survives a pause. A per-poll pass that keyed off the stage alone
+        would publish work a maintainer had deliberately stopped — pushing to GitHub
+        for a task that reports itself as paused.
+        """
+        worker, store, _ = self.live_worker()
+        self.stuck_publication(worker, store)
+        runs_before = len(self.recorded_argv())
+        self.repair_commits()
+
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+        worker.poll_once()
+
+        held = store.get_task(self.slug, 1)
+        self.assertEqual(held.phase, "paused", "a poll must not undo a maintainer pause")
+        self.assertIsNone(held.pr_number, "a paused task's work must not be published")
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+        self.assertEqual(len(self.recorded_argv()), runs_before, "no runtime may be started")
+        self.assertTrue(held.has_publishable_stage, "the stage must survive for the release")
 
 
 if __name__ == "__main__":

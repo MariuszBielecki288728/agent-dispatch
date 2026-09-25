@@ -417,6 +417,7 @@ orchestrator holding a writable store.
 | `open` | on-disk state (read-only connection) | no | nothing | no |
 | `worker --once --no-execute` | — | yes | **yes** | no |
 | `enqueue` / `pause` / `unpause` / `retry` | — | yes (`enqueue` only) | **yes** | no |
+| `resume-publish` | — | yes | **yes** | no |
 | `worker` | — | yes | **yes** | **yes** |
 | `run` | — | yes | **yes** | **yes** |
 
@@ -448,6 +449,14 @@ maintainer `pause` is never released automatically.
 
 `retry` applies only to `failed`/`needs_attention` tasks; on a `queued` task it is
 refused with a clear message rather than silently doing nothing.
+
+`resume-publish` is the publish-pending counterpart of `retry`: for a task whose
+model run finished but whose push/PR did not, and which was then paused. It finishes
+that publication — never starting an agent — and refuses a task with nothing pending.
+A live worker holds the single-instance lock for the whole time it runs, so when one
+is up the command re-arms the task and hands off, reporting that the worker will
+publish it on its next poll. That hand-off is safe because the worker finishes
+publish-pending work on every poll; it does not depend on a restart.
 
 ---
 
@@ -687,7 +696,7 @@ could modify work that is already finished. Every path that could do that is clo
 | `retry` | **Refused**, with the reason and the action that does help. Retrying means "run the implementation again", which is exactly wrong here |
 | `unpause` | Returns the task to `needs_attention` — i.e. "carry on with publication" — not to `queued` |
 | Re-adding `take-it` after a label-withdrawn pause | Restores it to `needs_attention`, not `queued`. The label restores *dispatch intent*, but this task does not need another implementation run |
-| `resume-publish` | Returns a paused publish-pending task to publication, the counterpart of `retry` |
+| `resume-publish` | Finishes publication for a paused publish-pending task — the counterpart of `retry`, and it actually publishes. When a live worker holds the lock it re-arms the task and hands off, because that worker finishes publication on its next poll |
 | Any row left `queued` by an older build | The dispatcher **escalates** it and starts no runtime, and the atomic claim additionally refuses it in SQL |
 
 The normal retry behaviour for a genuinely interrupted or failed runtime (no
@@ -711,6 +720,22 @@ operator would reach for to unstick a task safely. A transient wrapper outage at
 startup does **not** consume the one reconciliation attempt, so a recovered wrapper
 still repairs the task on the next poll.
 
+**Publish-pending recovery also runs on every poll, not only at startup.** Startup
+reconciliation happens once per process, but a task can become publish-pending
+*while the service is alive*: re-adding `take-it` to a withdrawn task, a manual
+`unpause`, or `resume-publish`. If recovery only ran at startup, those tasks would
+sit untouched until the service happened to restart. The per-poll pass is
+deliberately narrow — it visits only tasks already known to be publish-pending in an
+`awaiting_review`/`needs_attention` phase — so it never re-checks published state for
+every task the way the startup pass does, and it never starts a runtime.
+
+**A `paused` task is never published by a poll.** The publishable stage deliberately
+survives a `pause` so that unpausing can restore publication, which means a paused
+task also looks publish-pending. Excluding it is what stops an automatic pass from
+silently undoing a maintainer's `pause` — and from pushing to GitHub for a task that
+reports itself as paused. Releasing the pause (`unpause`, re-adding `take-it`, or
+`resume-publish`) is what restores publication.
+
 | Crash point | Reconciliation on the next `worker` start or `run` |
 |---|---|
 | Process died mid-run, nothing published | the orphaned `running` row is closed as `failed`; the worktree is inspected and left untouched; the partial edits are **preserved but not committed**; the task returns to `queued` (or `failed` when the budget is spent) |
@@ -726,6 +751,7 @@ still repairs the task on the next poll.
 | PR merged or closed externally | no new rounds; the task ends via the normal reconciliation rules |
 | Owned worktree with uncommitted edits | **preserved** and reported; committed only when a completed run produced them |
 | A task parked by a maintainer | left alone. Recovery does not push commits or open PRs for it |
+| A task that becomes publish-pending while the service is running | finished by the next poll of the **same** worker process — no restart, no second agent run |
 
 An orphaned `running` row needs no PID liveness check precisely *because* of the
 single-instance lock: while this process holds the lock, any `running` row it finds
@@ -830,7 +856,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 209 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 213 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -863,6 +889,7 @@ a mock. The cases most worth knowing about:
 | `RecoveryStagePreservationTests` | a second failure during recovery keeps the publishable stage, so the task stays recoverable and the retry succeeds with zero model calls |
 | `PublishTipFailsClosedTests` | an unreadable remote tip opens no PR, while a confirmed matching tip still publishes |
 | `PublishPendingTransitionTests` | `retry`, pause/unpause, `resume-publish` and re-adding `take-it` never queue an implementation run for finished work, and a legacy `queued` row starts no runtime |
+| `LiveWorkerPublishPickupTests` | one already-running `Worker` finishes publication on its next poll after `take-it` returns or an `unpause` — zero extra runtime calls, exactly one PR — and a maintainer `pause` is never overtaken by a poll |
 | `MigrationRaceTests` | two processes can migrate the same new database without the loser crashing |
 | `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |
 | `WorktreeIdentityTests` | a worktree switched to another branch is detected and never published from |

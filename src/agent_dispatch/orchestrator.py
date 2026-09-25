@@ -53,6 +53,7 @@ from .runtime import (
     redact_argv,
 )
 from .store import (
+    PUBLISH_RECONCILE_PHASES,
     RECOVERY_COMMIT_FAILED,
     RECOVERY_INTERRUPTED,
     RECOVERY_PR_FAILED,
@@ -1125,6 +1126,34 @@ class Orchestrator:
 
     # --------------------------------------------------------- reconciliation
 
+    def reconcile_publish_pending(self) -> list[str]:
+        """Finish publication for parked tasks. Cheap, so it can run every poll.
+
+        Called by the worker on each poll, unlike :meth:`reconcile`, which walks every
+        task's branch and remote and therefore runs once at startup. This one touches
+        only tasks that are already known to be publish-pending (`needs_attention`
+        with a publishable stage), and never starts a runtime.
+
+        Without it, a task that becomes publish-pending *while the service is running*
+        — re-adding `take-it` to a withdrawn task, a manual `unpause`, or
+        ``resume-publish`` — would sit untouched until the service restarted, because
+        startup reconciliation had already run for this process.
+
+        Only phases named by :data:`~agent_dispatch.store.PUBLISH_RECONCILE_PHASES` are
+        touched. A publishable stage survives a manual ``pause`` on purpose, so
+        ``is_publish_pending`` alone would make this pass publish work an operator had
+        deliberately stopped — silently undoing ``pause`` and pushing to GitHub for a
+        task that reports itself as paused.
+        """
+        notes: list[str] = []
+        for task in self.store.list_tasks():
+            if task.is_terminal or not task.is_publish_pending:
+                continue
+            if task.phase not in PUBLISH_RECONCILE_PHASES:
+                continue
+            notes.extend(self._reconcile_publish_pending(task))
+        return notes
+
     def reconcile(self) -> list[str]:
         """Repair state left by a crash, using GitHub and Git as evidence.
 
@@ -1150,10 +1179,14 @@ class Orchestrator:
                 continue
             if task.phase == "running":
                 notes.extend(self._reconcile_running(task))
-            elif task.phase in {"awaiting_review", "needs_attention"}:
+            elif task.phase in PUBLISH_RECONCILE_PHASES:
                 # A `needs_attention` row may be recoverable: the published-work
                 # check decides. It is NOT reset to `queued` here, because that is
                 # how a stale-queue row silently spends a second model call.
+                #
+                # A paused task is deliberately excluded: its publishable stage is
+                # preserved so that unpausing can restore publication, and acting on it
+                # here would publish work the operator had stopped.
                 notes.extend(self._reconcile_publish_pending(task))
 
         if self.config.worker.run_log_dir.is_dir():

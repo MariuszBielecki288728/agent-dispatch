@@ -222,10 +222,23 @@ class Worker:
                 tasks=",".join(dispatchable[:10]),
             )
 
+        # Publish-pending reconciliation runs on EVERY poll, not just at startup. Tasks
+        # can become publish-pending while the service is alive — re-adding `take-it` to
+        # a withdrawn task, a manual `unpause`, or `resume-publish` — and startup
+        # reconciliation has already happened for this process, so without this they
+        # would sit untouched until a restart. It is deliberately narrow: only tasks
+        # already known to be publish-pending, and it never starts a runtime.
+        publish_notes: list[str] = []
+        if self.reconcile:
+            publish_notes = Orchestrator(
+                self.config, self.store, client, self.log
+            ).reconcile_publish_pending()
+            for note in publish_notes:
+                self.log.info("publish_reconciled", detail=note)
+
         dispatch: DispatchOutcome | None = None
-        if (
-            self.execute and dispatchable and self.store.active_task_count() == 0
-        ):  # A missing runtime is a *configuration* fault, exactly like a missing
+        if self.execute and dispatchable and self.store.active_task_count() == 0:
+            # A missing runtime is a *configuration* fault, exactly like a missing
             # GitHub wrapper: it is reported once and touches no task state. Without
             # this check the first task would be claimed and marked `failed` for a
             # reason that is not about the task at all.
