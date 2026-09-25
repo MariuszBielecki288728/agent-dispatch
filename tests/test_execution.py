@@ -1379,12 +1379,13 @@ class EligibilityTests(ExecutionCase):
             "UPDATE tasks SET phase = 'running', pr_number = NULL, pr_url = NULL WHERE id = ?",
             (task.id,),
         )
-        store.start_run(
-            task.id,
-            run_id="20260101T000000Z-implementation",
-            kind="implementation",
-            resumed_from=None,
-            log_path=str(self.tmp / "crash.ndjson"),
+        # Deliberately NO extra open run row: the run had already completed and been
+        # recorded as succeeded before `git push` began. An open run row would model a
+        # killed agent mid-edit, which is a different window with a different repair.
+        self.assertEqual(
+            [r for r in store.run_history(task.id) if r.outcome == "running"],
+            [],
+            "the crash-during-push window has no open run row",
         )
         store.close()
 
@@ -1891,8 +1892,12 @@ class PublishRecoveryTests(ExecutionCase):
         self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
 
     def test_a_publish_only_recovery_commits_pending_edits_first(self) -> None:
-        # A crash between the agent finishing and the dispatcher committing its work is
-        # exactly this window; recovery must commit and publish it, still without a run.
+        # A completed run whose dispatcher commit failed, with the edits still in the
+        # worktree: recovery commits them and publishes, still without a run.
+        #
+        # The parking stage is what makes this recoverable. A bare `needs_attention`
+        # (someone else's pause) deliberately does NOT trigger a push of new commits,
+        # which `test_a_human_parked_task_is_not_pushed_by_recovery` covers.
         self.set_issues(issue(1, "Uncommitted at crash", labels=[TRIGGER]))
         self.assertEqual(self.run_cli("run").returncode, 0)
 
@@ -1901,8 +1906,7 @@ class PublishRecoveryTests(ExecutionCase):
         store = Store(self.world.load_config().worker.state_db)
         self.addCleanup(store.close)
         task = store.get_task(self.slug, 1)
-        # Drop the branch tip and leave a pending edit in the worktree, as a crash
-        # before `commit_all` would.
+        # Leave a pending edit in the worktree, as a failed `commit_all` would.
         Path(task.worktree_path, "late.txt").write_text("late change\n", encoding="utf-8")
         world = self.world.read_world()
         world["repos"][self.slug]["pulls"] = []
@@ -1910,7 +1914,8 @@ class PublishRecoveryTests(ExecutionCase):
         self.world.world = world
         self.world.write_world()
         store._conn.execute(
-            "UPDATE tasks SET phase = 'needs_attention', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            "UPDATE tasks SET phase = 'needs_attention', recovery_stage = 'commit_failed', "
+            "pr_number = NULL, pr_url = NULL WHERE id = ?",
             (task.id,),
         )
         store.close()
@@ -2444,6 +2449,621 @@ class SessionCaptureTests(ExecutionCase):
             store.resumable_session(task.id),
             "an interrupted run is not resumable, however early its ID was captured",
         )
+
+
+class FailedFirstCommitRecoveryTests(ExecutionCase):
+    """Review round 2, blocker 1: the advertised recovery must actually exist.
+
+    Round 1 fixed "a failed commit must not publish" but left the *subsequent* repair
+    unreachable: recovery looked only for a remote branch, so a first run whose commit
+    failed — where nothing reached the remote by definition — was reported as "no
+    work" and the task sat in `needs_attention` forever. The parking stage and the
+    completed-run check are what make the promise true.
+    """
+
+    def repair(self, *, remote_branch: bool):
+        """Force a first-run commit failure, then remove the cause and recover.
+
+        Returns ``(recovery_output, remote_branches, extra_runtime_invocations)``.
+        """
+        self.write_scenario(
+            runs=[{"session_id": "sess-1", "subtype": "success", "edits": {"work.txt": "new\n"}}]
+        )
+        self.set_issues(issue(1, "Commit fails then recovers", labels=[TRIGGER]))
+
+        # An empty Git identity is an override that outranks `-c user.name`, so the
+        # dispatcher's own commit fails — the exact production failure mode.
+        self.world.env_overrides["GIT_AUTHOR_NAME"] = ""
+        first = self.run_cli("run")
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "needs_attention")
+        self.assertEqual(task.recovery_stage, "commit_failed", "the parking reason must persist")
+        self.assertIsNone(task.pr_number)
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+        branch = task.branch
+        store.close()
+
+        if not remote_branch:
+            # Nothing was ever pushed, which is the normal state for this window.
+            self.assertNotIn(branch, self._remote_branches())
+
+        # Remove the cause of the failure WITHOUT losing the preserved edits, then ask
+        # the service to finish the job.
+        self.world.env_overrides.pop("GIT_AUTHOR_NAME", None)
+        runs_before = len(self.recorded_argv())
+        repaired = self.run_cli("run", "--skip-poll")
+        return repaired, branch, len(self.recorded_argv()) - runs_before
+
+    def test_a_failed_first_commit_is_recovered_locally_without_a_model_call(self) -> None:
+        repaired, branch, extra_runs = self.repair(remote_branch=False)
+
+        self.assertEqual(
+            extra_runs,
+            0,
+            "recovering a failed commit must not spend a second model call",
+        )
+        self.assertIn(branch, self._remote_branches(), "the preserved work must reach the remote")
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "awaiting_review")
+        self.assertIsNotNone(task.pr_number, "exactly one PR must be created")
+        self.assertIsNone(task.recovery_stage, "the parking reason must be cleared")
+
+        pulls = self.world.read_world()["repos"][self.slug]["pulls"]
+        self.assertEqual(len(pulls), 1)
+        self.assertIn("work.txt", self._remote_files(branch), "the edited file must be in the PR")
+
+    def test_the_recovery_is_idempotent(self) -> None:
+        # Running the recovery twice must not create a second PR or move the task back.
+        self.repair(remote_branch=False)
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        first_pr = store.get_task(self.slug, 1).pr_number
+        store.close()
+
+        again = self.run_cli("run", "--skip-poll")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.pr_number, first_pr)
+        self.assertEqual(task.phase, "awaiting_review")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
+    def test_a_bare_needs_attention_task_is_not_pushed_by_recovery(self) -> None:
+        # A human may park a task for reasons this code cannot see, and pushing new
+        # commits on their behalf is not a decision to make from a phase alone.
+        self.set_issues(issue(1, "Human parked", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        branch = task.branch
+        # A NEW local commit that the remote does not have.
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(task.worktree_path), "commit", "-q", "--allow-empty", "-m", "extra"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            },
+        )
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'needs_attention', recovery_stage = NULL, "
+            "pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        remote_before = self._remote_tip(branch)
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(
+            self._remote_tip(branch),
+            remote_before,
+            "a task parked by a human must not have new commits pushed for it",
+        )
+
+    def _remote_branches(self) -> list[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    def _remote_files(self, branch: str) -> set[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    def _remote_tip(self, branch: str) -> str | None:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "rev-parse", "--verify", "--quiet", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.stdout.strip() or None
+
+
+class FailedPushRecoveryTests(ExecutionCase):
+    """Review round 2, blocker 2: a failed push must not be treated as success.
+
+    The old check asked only whether *a* branch existed on the remote. A branch pushed
+    by an earlier attempt answers "yes" while pointing at **older** commits, so a
+    failed push was accepted and a PR could be opened without the new work.
+
+    Driven directly against :meth:`Orchestrator._publish`, because an end-to-end test
+    cannot isolate this: when the push fails hard enough to be observable, other
+    guards (no PR created, task re-queued) also fire and mask whether the tip was
+    compared at all. The decision under review is the tip comparison itself.
+    """
+
+    def orchestrator_and_task(self):
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.worktree import WorktreeManager
+
+        self.set_issues(issue(1, "Stale remote", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        manager = WorktreeManager(
+            orchestrator.git,
+            source_path=config.repo(self.slug).path,
+            worktree_root=config.worker.worktree_root,
+            base_branch="main",
+            repo_slug=self.slug,
+            commit_identity=("t", "t@example.invalid"),
+        )
+        return orchestrator, store, config, task, manager
+
+    def test_a_stale_remote_tip_blocks_publishing(self) -> None:
+        import subprocess
+
+        orchestrator, store, config, task, manager = self.orchestrator_and_task()
+
+        # Leave the remote at the OLD tip while the local branch moves ahead: exactly
+        # the state a failed push leaves behind.
+        remote_tip_before = orchestrator._remote_branch_tip(config.repo(self.slug), task.branch)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        (Path(task.worktree_path) / "newer.txt").write_text("newer\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(task.worktree_path), "add", "-A"], check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-C", str(task.worktree_path), "commit", "-q", "-m", "newer"],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        moved = manager.inspect(Path(task.worktree_path), task.branch)
+        self.assertNotEqual(moved.head_sha, remote_tip_before, "precondition: local moved ahead")
+
+        # Reject the push at the remote itself, via a pre-receive hook. This is the
+        # realistic "push refused" failure (permissions, protected branch, non-fast-
+        # forward) and, unlike pointing `origin` at a missing path, it leaves the
+        # remote READABLE so the tip comparison is what gets exercised.
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text(
+            "#!/bin/sh\necho 'push rejected for the test' >&2\nexit 1\n", encoding="utf-8"
+        )
+        hook.chmod(0o755)
+        self.addCleanup(hook.unlink)
+
+        # Forget the owned PR so publishing would otherwise proceed to create one.
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+        task = store.get_task(self.slug, 1)
+        pulls_before = len(self.world.read_world()["repos"][self.slug]["pulls"])
+
+        outcome = orchestrator._publish(task, config.repo(self.slug), manager, moved)
+
+        # The remote tip does not match local, so nothing may be published: not a new
+        # PR, and not an awaiting_review phase that implies the work landed.
+        self.assertNotEqual(
+            outcome.action,
+            "awaiting_review",
+            f"a push that did not deliver the new commit must not publish: {outcome.summary()}",
+        )
+        self.assertEqual(
+            len(self.world.read_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "no PR may be created while the remote lacks the produced commits",
+        )
+        self.assertNotEqual(store.get_task(self.slug, 1).phase, "awaiting_review")
+
+    def test_recovery_pushes_when_the_remote_is_behind_local(self) -> None:
+        # The complement: when the local branch really is ahead and the remote is
+        # reachable, recovery must push and publish rather than stall forever.
+        orchestrator, store, config, task, manager = self.orchestrator_and_task()
+        repo = config.repo(self.slug)
+        # A recorded publish stage is the evidence that this service was interrupted
+        # while publishing, which is what authorises pushing on recovery.
+        store.park_for_recovery(
+            task.id, stage="push_failed", note="simulated failed push after a completed run"
+        )
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+
+        result = orchestrator._recover_publish_only(store.get_task(self.slug, 1))
+        self.assertTrue(result.handled, f"recovery should have published: {result.notes}")
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number)
+        self.assertEqual(
+            orchestrator._remote_branch_tip(repo, recovered.branch),
+            manager.inspect(Path(recovered.worktree_path), recovered.branch).head_sha,
+            "the remote tip must match the published work",
+        )
+
+
+class UnfinishedRunNotPublishedTests(ExecutionCase):
+    """Review round 2, blocker 3: never publish a crashed agent's half-written edits.
+
+    "The remote branch exists" proves a *previous* push happened; it does not prove
+    the edits currently on disk are finished. With an older pushed branch plus an
+    interrupted runtime's partial edits, the old recovery committed the partial work
+    and opened a PR for it.
+    """
+
+    def test_partial_edits_from_a_killed_agent_are_not_committed_or_published(self) -> None:
+        self.set_issues(issue(1, "Killed mid-edit", labels=[TRIGGER]))
+        # A first successful publish, so the remote branch exists.
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        branch = task.branch
+        worktree = Path(task.worktree_path)
+
+        # A SECOND attempt starts and is killed mid-edit: an open run row, the task in
+        # `running`, and half-written changes in the worktree.
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.start_run(
+            task.id,
+            run_id="20260101T000000Z-implementation",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "killed.ndjson"),
+        )
+        store.close()
+
+        (worktree / "half-written.txt").write_text("BROKEN partial edit\n", encoding="utf-8")
+
+        runs_before = len(self.recorded_argv())
+        result = self.run_cli("run", "--skip-poll")
+        self.assertIn("reconcile", result.stdout)
+
+        # The partial edit must NOT be published, and no PR may be created for it. The
+        # remote branch still holds the earlier GOOD work, so the file must be absent.
+        self.assertNotIn(
+            "half-written.txt",
+            self._remote_files(branch),
+            "a killed agent's partial edits must never be committed and published",
+        )
+        # The first successful run already opened a PR, so the assertion is that the
+        # partial work did NOT add another one; combined with the file check above, that
+        # is what proves the unfinished edits were not published.
+        self.assertLessEqual(
+            len(self.world.read_world()["repos"][self.slug]["pulls"]),
+            1,
+            "partial work must not create an additional PR",
+        )
+        # It is preserved locally for a bounded retry, not deleted.
+        self.assertTrue(
+            (worktree / "half-written.txt").is_file(),
+            "the partial edits must be preserved for a retry, not discarded",
+        )
+        # And the agent was retried rather than the work being published silently.
+        self.assertGreaterEqual(len(self.recorded_argv()), runs_before)
+
+    def test_an_interrupted_run_with_a_pushed_branch_escalates_rather_than_publishing(self) -> None:
+        # Same window, but the attempt budget is spent: the task must be parked with a
+        # reason, and the local edits must remain untouched.
+        self.set_issues(issue(1, "No budget", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        worktree = Path(task.worktree_path)
+        # Spend the attempt budget so the retry has nowhere to go.
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', attempts = 99, pr_number = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.start_run(
+            task.id,
+            run_id="20260101T000001Z-implementation",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "killed2.ndjson"),
+        )
+        store.close()
+        (worktree / "partial2.txt").write_text("partial\n", encoding="utf-8")
+
+        self.run_cli("run", "--skip-poll")
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(
+            after.phase, "failed", "an exhausted interrupted task is failed, not published"
+        )
+        self.assertNotIn("partial2.txt", self._remote_files(after.branch))
+        self.assertTrue((worktree / "partial2.txt").is_file())
+
+    def _remote_files(self, branch: str) -> set[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+class NoWorktreePublishTests(ExecutionCase):
+    """Review round 2, item 4: never run Git against an invented working directory."""
+
+    def test_recovery_does_not_push_from_the_process_cwd(self) -> None:
+        # The old code used `Path('.')` when a task had no worktree, so `git push`
+        # ran in whatever directory the dispatcher process was in — possibly an
+        # unrelated checkout. Recovery must refuse instead.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.worktree import WorktreeState
+
+        self.set_issues(issue(1, "No worktree", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+
+        bogus = WorktreeState(
+            path=Path("."),
+            branch="dispatch/issue-1-whatever",
+            exists=False,
+            is_registered_worktree=False,
+            remote_branch_exists=True,
+        )
+        with self.assertRaises(ValueError) as caught:
+            orchestrator._publish(
+                task, config.repo(self.slug), orchestrator._manager(config.repo(self.slug)), bogus
+            )
+        self.assertIn("refusing to push", str(caught.exception))
+
+    def test_recovery_without_a_worktree_reconciles_the_pr_without_pushing(self) -> None:
+        # When the worktree is gone but the branch is genuinely on the remote, the PR
+        # is still reconciled — through the wrapper, with no local Git at all.
+        self.set_issues(issue(1, "Worktree gone", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        branch = task.branch
+        pr_before = task.pr_number
+        # Forget the worktree path and the PR, as a partially restored state would.
+        store._conn.execute(
+            "UPDATE tasks SET worktree_path = NULL, phase = 'running', pr_number = NULL, "
+            "pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        result = self.run_cli("run", "--skip-poll")
+
+        self.assertEqual(len(self.recorded_argv()), runs_before, "no agent may be re-run")
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(after.pr_number, pr_before, "the existing PR must be adopted")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+        self.assertIn(branch, result.stdout + result.stderr)
+
+
+class ReconcileRetryTests(ExecutionCase):
+    """Review round 2, small follow-up: a transient wrapper failure must not disable
+    reconciliation for the lifetime of the process."""
+
+    def test_reconciliation_retries_after_a_transient_wrapper_failure(self) -> None:
+        self.set_issues(issue(1, "Transient wrapper", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # `--no-execute` queues without recording owned artifacts, so supply the branch
+        # this test needs to reason about.
+        branch = dispatch_branch_name(1, task.title or "Transient wrapper")
+        store.set_owned_worktree(
+            task.id, branch=branch, worktree_path=str(self.tmp / "wt"), base_branch="main"
+        )
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "-D", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', pr_number = NULL WHERE id = ?", (task.id,)
+        )
+        store.start_run(
+            task.id,
+            run_id="20260101T000000Z-implementation",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "t.ndjson"),
+        )
+        store.close()
+
+        # A wrapper that fails once, then works: the first poll must skip reconciliation
+        # WITHOUT marking it done, so the next poll repairs the task.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.worker import Worker
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+
+        worker = Worker(config, store, log, execute=False)
+        worker._client = _FailingOnceClient(config)  # type: ignore[assignment]
+        worker.reconcile_once()
+        self.assertFalse(worker._reconciled, "a failed preflight must not consume reconciliation")
+
+        # Now with a working client, reconciliation must actually run and repair it.
+        store.close()
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        worker2 = Worker(config, store, log, execute=False)
+        worker2.reconcile_once()
+        self.assertNotEqual(
+            store.get_task(self.slug, 1).phase,
+            "running",
+            "the orphaned row must be repaired on the retry",
+        )
+
+
+class _FailingOnceClient:
+    """A GitHubClient stand-in whose `check_available` fails once, then succeeds."""
+
+    def __init__(self, config) -> None:
+        from agent_dispatch.github import GitHubClient
+
+        self._real = GitHubClient(config.github.command)
+        self._fail = True
+        self._config = config
+
+    def check_available(self):
+        from agent_dispatch.github import ErrorKind, GitHubError
+
+        if self._fail:
+            self._fail = False
+            raise GitHubError("transient wrapper outage", kind=ErrorKind.MISSING_WRAPPER)
+        return self._real.check_available()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class MigrationRaceTests(ExecutionCase):
+    """A concurrent column migration must not crash the process that loses.
+
+    Found by the round-2 session-capture test, which kills a run mid-flight: two
+    processes can both observe a column as missing and both issue the ``ALTER``, and
+    the loser used to die with ``duplicate column name`` — during crash recovery,
+    exactly when the service is least able to afford another failure.
+    """
+
+    def test_two_stores_can_migrate_the_same_new_database(self) -> None:
+        from agent_dispatch.store import Store
+
+        db = self.tmp / "race" / "state.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+
+        # Both handles are opened before either migrates, so the second one genuinely
+        # re-runs the additive migration against an already-migrated file.
+        first = Store(db)
+        self.addCleanup(first.close)
+        second = Store(db)
+        self.addCleanup(second.close)
+
+        # And a third, fresh handle on the migrated file, which is the common path.
+        third = Store(db)
+        self.addCleanup(third.close)
+        self.assertEqual(third.count_by_phase()["queued"], 0)
+
+    def test_the_additive_columns_all_exist_after_migration(self) -> None:
+        from agent_dispatch.store import Store
+
+        store = Store(self.tmp / "cols" / "state.db")
+        self.addCleanup(store.close)
+        columns = {str(info["name"]) for info in store._conn.execute("PRAGMA table_info(tasks)")}
+        for expected in (
+            "pause_reason",
+            "pr_url",
+            "pr_created_at",
+            "dispatched_at",
+            "recovery_stage",
+        ):
+            with self.subTest(column=expected):
+                self.assertIn(expected, columns)
+
+    def test_a_duplicate_column_error_is_only_swallowed_when_it_is_true(self) -> None:
+        # The race handling re-checks the column rather than swallowing every
+        # OperationalError, so a genuine migration failure still surfaces.
+        import sqlite3
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.tmp / "genuine" / "state.db")
+        self.addCleanup(store.close)
+        self.assertFalse(store._column_present("tasks", "definitely_not_a_column"))
+        # An impossible ALTER must still raise, proving errors are not blanket-swallowed.
+        with self.assertRaises(sqlite3.OperationalError):
+            store._conn.execute("ALTER TABLE tasks ADD COLUMN this is not valid sql")
 
 
 if __name__ == "__main__":

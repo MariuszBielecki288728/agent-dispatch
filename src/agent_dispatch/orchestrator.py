@@ -53,6 +53,10 @@ from .runtime import (
     redact_argv,
 )
 from .store import (
+    RECOVERY_COMMIT_FAILED,
+    RECOVERY_INTERRUPTED,
+    RECOVERY_PR_FAILED,
+    RECOVERY_PUSH_FAILED,
     RUN_FAILED,
     RUN_RUNNING,
     RUN_SUCCEEDED,
@@ -684,7 +688,7 @@ class Orchestrator:
                 f"({commit_note}); nothing was pushed and no PR was created. The edits are "
                 "preserved in the worktree."
             )
-            self.store.mark_needs_attention(task.id, detail)
+            self.store.park_for_recovery(task.id, stage=RECOVERY_COMMIT_FAILED, note=detail)
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
                 task_ref=task.ref,
@@ -803,7 +807,19 @@ class Orchestrator:
         published, or the previous run's commit failed and is now retried. The agent
         is never re-invoked for either, because the code already exists on the
         branch.
+
+        Requires a real owned worktree. Pushing needs one, and inventing a working
+        directory would run ``git push`` in whatever directory the dispatcher process
+        happens to be in — potentially an unrelated repository — so this refuses
+        instead. Recovery for a task whose worktree is gone reconciles the PR through
+        the GitHub wrapper without a local push.
         """
+        if not (state.exists and state.branch_matches):
+            raise ValueError(
+                f"refusing to push {state.branch!r} without an owned worktree at {state.path} "
+                f"(exists={state.exists}, checked_out={state.checked_out_branch!r})"
+            )
+
         notes: list[str] = []
 
         # --- push (intent-before-action) ---
@@ -824,7 +840,11 @@ class Orchestrator:
             # not a failure if the remote really has it. Verified rather than
             # assumed, so a genuine push failure is not silently swallowed.
             if not self._branch_on_remote(repo, state.branch):
-                self.store.set_phase(task.id, "queued", f"push failed: {push_note}")
+                self.store.park_for_recovery(
+                    task.id,
+                    stage=RECOVERY_PUSH_FAILED,
+                    note=f"push failed and no branch reached the remote: {push_note}",
+                )
                 return DispatchOutcome(
                     action=OUTCOME_FAILED,
                     task_ref=task.ref,
@@ -833,6 +853,30 @@ class Orchestrator:
                     run=result,
                     notes=notes,
                 )
+
+        # The push reported success (or the branch was already present). Neither of
+        # those proves the remote tip is the work we just produced: a branch pushed by
+        # an earlier attempt still exists, so "the branch is there" would let a real
+        # push failure pass unnoticed and open a PR **without the new commits**.
+        # Compare the remote tip against the local one and refuse to publish on a
+        # mismatch, because publishing less work than was produced is the failure this
+        # whole workflow exists to prevent.
+        remote_tip = self._remote_branch_tip(repo, state.branch)
+        if remote_tip is not None and state.head_sha and remote_tip != state.head_sha:
+            detail = (
+                f"remote {state.branch} is at {remote_tip[:12]} but the owned worktree is at "
+                f"{state.head_sha[:12]}; the push did not deliver the produced work, so no PR "
+                "was created"
+            )
+            self.store.park_for_recovery(task.id, stage=RECOVERY_PUSH_FAILED, note=detail)
+            return DispatchOutcome(
+                action=OUTCOME_NEEDS_ATTENTION,
+                task_ref=task.ref,
+                reason="remote_tip_mismatch",
+                session_id=result.session_id if result else task.session_id,
+                run=result,
+                notes=notes + [detail],
+            )
 
         # --- PR: adopt or create, never both ---
         return self._ensure_pull_request(task, repo, state, result=result, notes=notes)
@@ -864,12 +908,12 @@ class Orchestrator:
             existing = self.client.find_pull_by_head(repo.slug, state.branch)
         except GitHubError as exc:
             self.store.fail_operation(pr_op, detail=str(exc))
-            self.store.set_phase(
+            self.store.park_for_recovery(
                 task.id,
-                "needs_attention",
-                f"branch {state.branch} is pushed, but GitHub could not be queried for an existing "
-                f"PR ({exc.kind}); `agent-dispatch run` will retry publish-only recovery (no new "
-                "model call)",
+                stage=RECOVERY_PR_FAILED,
+                note=f"branch {state.branch} is pushed, but GitHub could not be queried for an "
+                f"existing PR ({exc.kind}); `agent-dispatch run` will retry publish-only "
+                "recovery (no new model call)",
             )
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
@@ -936,6 +980,7 @@ class Orchestrator:
                 pr_url=existing.url,
                 note=f"adopted the existing PR for owned branch {state.branch}",
             )
+            self.store.clear_recovery_stage(task.id)
             self.store.set_phase(task.id, "awaiting_review")
             notes.append(
                 f"PR #{existing.number} already existed for the owned branch {state.branch}; "
@@ -965,10 +1010,10 @@ class Orchestrator:
             # The branch is pushed and the PR is not confirmed: record the intent as
             # recoverable and let publish-only recovery adopt or create it without
             # re-running the agent.
-            self.store.set_phase(
+            self.store.park_for_recovery(
                 task.id,
-                "needs_attention",
-                f"branch {state.branch} is pushed but PR creation failed ({exc.kind}): {exc}. "
+                stage=RECOVERY_PR_FAILED,
+                note=f"branch {state.branch} is pushed but PR creation failed ({exc.kind}): {exc}. "
                 "`agent-dispatch run` will retry publish-only recovery (no new model call).",
             )
             return DispatchOutcome(
@@ -984,6 +1029,7 @@ class Orchestrator:
         # is written, and it happens after the PR provably exists.
         self.store.confirm_operation(pr_op, external_id=str(pull.number))
         self.store.record_owned_pr(task.id, pr_number=pull.number, pr_url=pull.url)
+        self.store.clear_recovery_stage(task.id)
         self.store.set_phase(task.id, "awaiting_review")
         notes.append(f"created PR #{pull.number} referencing #{task.issue_number}")
         self.log.info(
@@ -1003,6 +1049,32 @@ class Orchestrator:
             run=result,
             notes=notes,
         )
+
+    def _remote_branch_tip(self, repo: RepoConfig, branch: str) -> str | None:
+        """The SHA of ``branch`` on the remote, or ``None`` when it is absent.
+
+        Returning the SHA rather than a boolean is what makes "the push delivered our
+        work" checkable. A pre-existing branch from an earlier attempt answers "exists"
+        while pointing at *older* commits, so a plain existence check would accept a
+        failed push and publish a PR without the new work.
+
+        A Git failure propagates: unreadable is not the same as absent, and guessing
+        in that direction risks publishing the wrong thing.
+        """
+        result = self.git.run(
+            ["ls-remote", "--heads", "origin", f"refs/heads/{branch}"], cwd=repo.path
+        )
+        if not result.ok:
+            raise GitError(
+                f"git ls-remote failed for {branch}: {result.stderr.strip()}",
+                argv=["ls-remote", "origin", branch],
+            )
+        line = result.stdout.strip()
+        if not line:
+            return None
+        # `ls-remote` prints "<sha>\t<ref>".
+        sha = line.split()[0].strip()
+        return sha or None
 
     def _branch_on_remote(self, repo: RepoConfig, branch: str) -> bool:
         """Whether ``branch`` exists on the remote, asked through Git.
@@ -1049,13 +1121,12 @@ class Orchestrator:
         from spending a second model call on work that already exists on the branch.
         """
         notes: list[str] = []
-        api_available = True
 
         for task in self.store.list_tasks():
             if task.is_terminal:
                 continue
             if task.phase == "running":
-                notes.extend(self._reconcile_running(task, api_available=api_available))
+                notes.extend(self._reconcile_running(task))
             elif task.phase in {"awaiting_review", "needs_attention"}:
                 # A `needs_attention` row may be recoverable: the published-work
                 # check decides. It is NOT reset to `queued` here, because that is
@@ -1069,18 +1140,33 @@ class Orchestrator:
                 self.log.debug("run_log_prune_failed", error=str(exc))
         return notes
 
-    def _reconcile_running(self, task: Task, *, api_available: bool = True) -> list[str]:
+    def _reconcile_running(self, task: Task) -> list[str]:
         """A ``running`` row from a previous process. No agent is started here.
 
-        Closing the open run is unconditional — no process is alive to own it. What
-        happens to the *task* afterwards depends on evidence, not on the phase: a
-        branch that already carries published work is finished off by
-        :meth:`_reconcile_publish_pending` (publish-only), while a task whose work
-        never reached the remote returns to the queue for a bounded retry.
+        Closing the open run is unconditional — no process is alive to own it — and it
+        happens **before** deciding what to do with the task, because the run outcomes
+        are the evidence that decision needs.
+
+        What happens to the task then depends on evidence, not on the phase:
+
+        * an open run means the agent was killed mid-flight, so its worktree may hold
+          half-written edits: those are preserved for a bounded fresh-session retry and
+          explicitly **not** committed or published, since a branch left by an earlier
+          attempt would otherwise make partial work look publishable;
+        * no open run, with a completed run and a published branch, is the crash
+          *during publish* window, which is finished off publish-only.
         """
-        for run in self.store.run_history(task.id):
-            if run.outcome != RUN_RUNNING:
-                continue
+        # Capture the completion evidence BEFORE closing the open run: the open run is
+        # itself the proof that the agent may have been killed mid-edit, so asking
+        # afterwards (when it has already been recorded as failed) would read a
+        # different answer than the one that matters. `publishable` is True only when
+        # no run was in flight, which is exactly the crash-during-publish window.
+        runs = self.store.run_history(task.id)
+        open_runs = [run for run in runs if run.outcome == RUN_RUNNING]
+        newest = runs[-1] if runs else None
+        publishable = not open_runs and newest is not None and newest.outcome == RUN_SUCCEEDED
+
+        for run in open_runs:
             self.store.finish_run(
                 run.id,
                 outcome=RUN_FAILED,
@@ -1098,19 +1184,22 @@ class Orchestrator:
             # been published, so this is a plain retry.
             return self._requeue_interrupted(task, "interrupted before a branch was recorded")
 
-        # Whether work was already published decides publish-only vs. agent-again.
-        # This is the crash-during-push window: the branch is on the remote and the
-        # PR was never recorded, so the repair must publish WITHOUT another run.
-        recovery = self._recover_publish_only(task)
+        # Whether finished work exists decides publish-only vs. agent-again. This is
+        # the crash-during-publish window: the run completed and the branch may be on
+        # the remote, so the repair must publish WITHOUT another run.
+        recovery = self._recover_publish_only(task, run_completed=publishable)
         if recovery.handled:
+            # The task is no longer parked for recovery.
+            self.store.clear_recovery_stage(task.id)
             return recovery.notes
         if recovery.status == PUBLISH_UNKNOWN:
-            self.store.mark_needs_attention(
+            self.store.park_for_recovery(
                 task.id,
-                "interrupted run: could not determine whether its branch was published, so it was "
-                "not retried; re-run `agent-dispatch run` when the remote is reachable",
+                stage=RECOVERY_INTERRUPTED,
+                note="interrupted run: could not determine whether its branch was published, so it "
+                "was not retried; re-run `agent-dispatch run` when the remote is reachable",
             )
-            return [f"{task.ref}: publish state unknown after an interruption"]
+            return recovery.notes or [f"{task.ref}: publish state unknown after an interruption"]
 
         try:
             repo = self.config.repo(task.repo)
@@ -1118,6 +1207,10 @@ class Orchestrator:
             self.store.mark_needs_attention(task.id, "repository is no longer allowlisted")
             return [f"{task.ref}: running row left as needs_attention (repo not allowlisted)"]
 
+        # `recovery.notes` explains why publishing was refused (typically "the newest
+        # run never completed"), so it is carried into the requeue detail rather than
+        # dropped: the operator needs to know the edits were deliberately not published.
+        refusal = " ".join(recovery.notes)
         detail = "interrupted run recovered"
         if task.worktree_path:
             manager = self._manager(repo)
@@ -1128,6 +1221,9 @@ class Orchestrator:
             )
             if state.produced_work:
                 detail += " — its changes are preserved"
+        if refusal:
+            detail += f". {refusal}"
+            self.store.set_phase(task.id, task.phase, refusal)
         return self._requeue_interrupted(task, detail)
 
     def _requeue_interrupted(self, task: Task, detail: str) -> list[str]:
@@ -1142,11 +1238,19 @@ class Orchestrator:
     def _reconcile_publish_pending(self, task: Task) -> list[str]:
         """Finish publishing work that already exists, or escalate honestly.
 
-        Handles the windows that leave a task without an owned PR: a crash after
-        ``git push``, and a PR lookup/creation failure (phase ``needs_attention``,
-        where the dispatcher tells the operator to re-run ``run``). Both resolve
-        through the same publish-only path, so that promise is actually reachable and
-        no second model call is spent on work that already exists on the branch.
+        Handles the windows that leave a task parked without an owned PR: a crash
+        after ``git push``, a failed push, a failed PR lookup/creation, and a run
+        whose changes could not be committed. All resolve through the same
+        publish-only path, so the dispatcher's promise that ``run`` will finish the
+        job without a model call is actually true.
+
+        The decision is driven by the **persisted recovery stage** rather than by the
+        phase, because ``needs_attention`` alone cannot distinguish:
+
+        * work that a *completed, validated* run produced and only publishing failed
+          for — recoverable locally, no model call; from
+        * edits left by an *interrupted* runtime — which must not be committed as
+          though they were finished.
         """
         if task.pr_number is not None:
             # Ownership already recorded, so there is nothing to publish. A task left
@@ -1156,36 +1260,53 @@ class Orchestrator:
         result = self._recover_publish_only(task)
         if result.handled:
             return result.notes
+
         if result.status == PUBLISH_UNKNOWN:
-            # Cannot tell whether work was published. Never guess by re-running the
-            # model: escalate and say exactly what to do.
-            self.store.mark_needs_attention(
-                task.id,
-                f"could not determine whether {task.branch} is published; no agent was started. "
+            # Cannot tell whether work was published, or the local state needs a human.
+            # Never guess by re-running the model: park the task and say what to do.
+            #
+            # Parking matters: `needs_attention` is what makes the unresolved state
+            # visible in `status` and stops a later poll from treating the row as
+            # dispatchable. Leaving the phase alone would hide it.
+            note = (
+                " ".join(result.notes)
+                or f"could not determine whether {task.branch} is published; no agent was started. "
                 "Re-run `agent-dispatch run` when the remote is reachable to retry publish-only "
-                "recovery.",
+                "recovery."
             )
-            return [f"{task.ref}: publish state unknown; left for a later attempt"]
+            self.store.park_for_recovery(task.id, stage=RECOVERY_INTERRUPTED, note=note)
+            return result.notes or [f"{task.ref}: publish state unknown; left for a later attempt"]
+
         if result.status == PUBLISH_ABSENT:
             self.store.mark_needs_attention(
                 task.id,
-                f"recorded {task.phase} but neither {task.branch} nor a PR exists for it; left for "
-                "the maintainer rather than re-running the agent",
+                f"parked as {task.recovery_stage or task.phase} but nothing is published for "
+                f"{task.branch}; left for the maintainer rather than re-running the agent",
             )
             return [
-                f"{task.ref}: neither the branch nor a PR exists for {task.branch}; escalated to "
-                "needs_attention"
+                f"{task.ref}: nothing published for {task.branch}; escalated to needs_attention"
             ]
         return []
 
-    def _recover_publish_only(self, task: Task) -> "RecoveryResult":
-        """Publish already-pushed work without running the agent.
+    def _recover_publish_only(
+        self, task: Task, *, run_completed: bool | None = None
+    ) -> "RecoveryResult":
+        """Publish work that a completed run produced, without running the agent.
 
-        A task is only recoverable when its recorded branch really is on the remote:
-        that is the evidence a run got far enough to produce shareable work. The
-        result distinguishes the three outcomes that must NOT be treated alike —
-        published-and-handled, provably-absent, and unknown — because collapsing them
-        is how a stale-queue row ends up spending a second model call.
+        Two pieces of persisted evidence decide whether that is safe, and both are
+        required:
+
+        1. **a completed, validated run** (:meth:`Store.last_completed_run`) — proof
+           that the edits in the worktree belong to a finished piece of work rather
+           than to a process killed mid-edit; and
+        2. **no newer unfinished run** (:meth:`Store.has_unfinished_run`) — the newest
+           run is the one that describes what is currently on disk, so an
+           interrupted attempt on top of an older success means the contents are not
+           trustworthy.
+
+        Local commits and a *parked publish stage* also count, so a first run whose
+        orchestrator commit failed is recoverable even though nothing reached the
+        remote yet.
         """
         if not task.branch:
             return RecoveryResult(PUBLISH_NOT_APPLICABLE)
@@ -1194,20 +1315,41 @@ class Orchestrator:
         except Exception:
             return RecoveryResult(PUBLISH_NOT_APPLICABLE)
 
+        # Never auto-commit work from an unfinished run: the worktree may hold
+        # half-written changes from a process that was killed mid-edit. `run_completed`
+        # overrides the query when the caller already knows, which is what keeps the
+        # `running` path from reading the run history it has just amended.
+        unfinished = (
+            not run_completed
+            if run_completed is not None
+            else self.store.has_unfinished_run(task.id)
+        )
+        if unfinished and not task.has_publishable_stage:
+            detail = (
+                f"the newest run for {task.ref} never completed, so the worktree may hold "
+                "half-written edits; they are left for a bounded fresh-session retry rather "
+                "than committed and published"
+            )
+            return RecoveryResult(PUBLISH_ABSENT, [f"{task.ref}: {detail}"])
+
+        has_completed = (
+            run_completed
+            if run_completed is not None
+            else self.store.last_completed_run(task.id) is not None
+        )
+        if not has_completed and not task.has_publishable_stage:
+            # No completed run and no recorded publish stage: there is no evidence of
+            # finished work, so do not invent any.
+            return RecoveryResult(PUBLISH_ABSENT)
+
         try:
-            pushed = self._branch_on_remote(repo, task.branch)
+            remote_tip = self._remote_branch_tip(repo, task.branch)
         except GitError as exc:
             self.log.warning(
                 "publish_state_unknown", repo=task.repo, issue=task.issue_number, detail=str(exc)
             )
             return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {exc}"])
 
-        if not pushed:
-            return RecoveryResult(PUBLISH_ABSENT)
-
-        # The branch is on the remote, so work exists. Commit anything still
-        # uncommitted first: a crash between the agent finishing and the dispatcher
-        # committing it is exactly this window, and no model call is involved.
         manager = self._manager(repo)
         worktree = Path(task.worktree_path) if task.worktree_path else None
         if worktree is not None and worktree.is_dir():
@@ -1217,32 +1359,64 @@ class Orchestrator:
                     f"cannot publish {task.branch}: worktree {worktree} is checked out on "
                     f"{state.checked_out_branch!r}; refusing to commit or push from the wrong branch"
                 )
-                self.store.mark_needs_attention(task.id, detail)
+                self.store.park_for_recovery(task.id, stage=RECOVERY_INTERRUPTED, note=detail)
                 return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}"])
+
             if state.dirty:
+                # Safe now only because a completed run produced these edits. Commit
+                # them so the branch can carry them; `git push` cannot.
                 committed, note = manager.commit_all(
                     state.path, state.branch, _recovery_commit_message(task)
                 )
                 if not committed:
                     detail = (
-                        f"cannot publish {task.branch}: committing the pending changes failed "
+                        f"cannot publish {task.branch}: committing the preserved changes failed "
                         f"({note}); the edits are preserved in the worktree"
                     )
-                    self.store.mark_needs_attention(task.id, detail)
+                    self.store.park_for_recovery(task.id, stage=RECOVERY_COMMIT_FAILED, note=detail)
                     return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}"])
                 state = manager.inspect(state.path, task.branch)
+
+            if remote_tip is None or (state.head_sha and remote_tip != state.head_sha):
+                # Nothing published yet (the failed-first-commit case), or the remote
+                # is behind local work (the failed-push case). Both need a push, and
+                # both are safe because the commits came from a completed run.
+                #
+                # Gated on evidence that *this service* was interrupted while
+                # publishing: a recorded publish stage, or a `running` row whose run had
+                # already completed (the crash-during-push window). `needs_attention`
+                # is also where a human parks a task for reasons this code cannot see,
+                # and pushing new commits on their behalf is not a decision to make
+                # from a phase alone.
+                publishing_interrupted = task.has_publishable_stage or (
+                    run_completed is True and task.phase == "running"
+                )
+                if not publishing_interrupted:
+                    detail = (
+                        f"needs_attention: has local commits for {task.branch} but the remote "
+                        "does not have them, and no recorded publish failure justifies pushing "
+                        "them. Left for the maintainer."
+                    )
+                    # Parked so the unresolved state is visible in `status` and the row is
+                    # not treated as dispatchable; the local commits are kept.
+                    self.store.park_for_recovery(task.id, stage=RECOVERY_INTERRUPTED, note=detail)
+                    return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}"])
+                return self._publish_local(task, repo, manager, state)
         else:
-            # No local worktree to commit from (or it is gone). Publishing an
-            # already-pushed branch is still valid: its commits are on the remote.
+            # No local worktree to commit from. Publishing is still possible only when
+            # the remote branch genuinely is ours, which the tip comparison below
+            # establishes; nothing is ever run against an invented working directory.
+            if remote_tip is None:
+                return RecoveryResult(PUBLISH_ABSENT)
             state = WorktreeState(
-                path=worktree or Path("."),
+                path=worktree or repo.path,
                 branch=task.branch,
                 exists=False,
                 is_registered_worktree=False,
                 remote_branch_exists=True,
             )
 
-        outcome = self._publish(task, repo, manager, state, result=None)
+        outcome = self._ensure_pull_request(task, repo, state, result=None, notes=[])
         detail = f"publish-only recovery: {outcome.summary()}"
         self.log.warning(
             "publish_only_recovered",
@@ -1252,6 +1426,35 @@ class Orchestrator:
             detail=detail,
         )
         return RecoveryResult(PUBLISH_HANDLED, [f"{task.ref}: {detail}", *outcome.notes])
+
+    def _publish_local(
+        self,
+        task: Task,
+        repo: RepoConfig,
+        manager: WorktreeManager,
+        state: WorktreeState,
+    ) -> "RecoveryResult":
+        """Push locally-committed work and open its PR. No agent involvement.
+
+        Used when a completed run's changes exist locally but never reached the remote
+        — the failed-first-commit case, where the earlier recovery could not help
+        because it only looked for a remote branch and so called finished work
+        \"absent\".
+        """
+        outcome = self._publish(task, repo, manager, state, result=None)
+        detail = f"publish-only recovery from local commits: {outcome.summary()}"
+        self.log.warning(
+            "publish_only_recovered_local",
+            repo=task.repo,
+            issue=task.issue_number,
+            action=outcome.action,
+            detail=detail,
+        )
+        if outcome.action in {OUTCOME_PR_READY, OUTCOME_ADOPTED}:
+            return RecoveryResult(PUBLISH_HANDLED, [f"{task.ref}: {detail}", *outcome.notes])
+        if outcome.action == OUTCOME_FAILED:
+            return RecoveryResult(PUBLISH_ABSENT, [f"{task.ref}: {detail}", *outcome.notes])
+        return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}", *outcome.notes])
 
     def _manager(self, repo: RepoConfig) -> WorktreeManager:
         """A WorktreeManager for ``repo``, configured exactly like dispatch uses."""

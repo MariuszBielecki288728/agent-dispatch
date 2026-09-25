@@ -650,31 +650,51 @@ would refuse to dispatch until someone ran `run` by hand. It is not gated on
 `--no-execute`, since repairing state is not executing and that is the flag an
 operator would reach for to unstick a task safely.
 
-What happens to an interrupted task depends on **evidence, not on its phase**:
+What happens to an interrupted task depends on **evidence, not on its phase**. Two
+pieces of persisted evidence decide it: whether a run actually **completed**, and
+the **parking stage** recorded when the dispatcher gave up (`tasks.recovery_stage`).
 
 | Evidence | Repair |
 |---|---|
-| The recorded branch is **already on the remote** | **Publish-only**: commit anything still uncommitted, push, and adopt or create the PR. **No second agent run** — the code already exists on the branch |
-| No branch on the remote, or no branch recorded at all | Bounded fresh-session retry in the same owned worktree, with existing edits preserved |
+| A completed, validated run, and the branch is on the remote | **Publish-only**: commit anything still uncommitted, push, adopt or create the PR. **No second agent run** |
+| A completed run whose commit or push failed, so nothing reached the remote | **Publish-only from local commits**: commit, push, then create the PR. No model call |
+| The newest run never completed (killed mid-edit) | Bounded fresh-session retry. Edits are **preserved and deliberately not committed**: partial work must not be published as though it were finished |
+| No completed run and no recorded stage | Escalate. There is no evidence of finished work, so none is invented |
 | Cannot determine whether the branch was published | `needs_attention`, with the reason. Never guessed, because guessing "absent" is how a stale row spends a second model call |
 
-That first row is what makes a crash inside `git push` (or between a successful PR
-POST and the SQLite write) recoverable without paying for the work twice. It is
-also why the dispatcher's messages about PR failures are truthful: a task parked in
-`needs_attention` with a pushed branch is finished off by the next `run` or worker
-start, publish-only.
+A bare `needs_attention` phase is deliberately **not** enough to trigger a push: it is
+also where a maintainer parks a task for reasons the dispatcher cannot see, and
+pushing new commits on their behalf is not a decision to make from a phase alone.
+
+The "branch is on the remote" check compares **tips**, not existence. A branch pushed
+by an earlier attempt still exists while pointing at older commits, so an existence
+check would accept a failed push and open a PR without the new work. If the remote tip
+differs from the owned worktree's tip, nothing is published and the task is parked.
+
+Reconciliation runs **once at startup, under the single-instance lock**, from both
+entry points: the persistent `worker` (the systemd path) and the explicit `run`.
+That matters — without it a crash during a run would leave `phase=running`
+forever, and because the MVP allows one active task globally, *every* future poll
+would refuse to dispatch until someone ran `run` by hand. It is not gated on
+`--no-execute`, since repairing state is not executing and that is the flag an
+operator would reach for to unstick a task safely. A transient wrapper outage at
+startup does **not** consume the one reconciliation attempt, so a recovered wrapper
+still repairs the task on the next poll.
 
 | Crash point | Reconciliation on the next `worker` start or `run` |
 |---|---|
-| Process died mid-run, nothing pushed | the orphaned `running` row is closed as `failed`; the worktree is inspected and left untouched; the task returns to `queued` (or `failed` when the budget is spent) |
-| Process died during `git push` | publish-only recovery: the branch is already on the remote, so the PR is created or adopted and no agent runs |
-| PR created, DB write lost | adopt by exact head-branch match **and** verified head repository and Issue link, so `tasks.pr_number` is restored to the real number |
-| PR lookup or creation failed after a push | `needs_attention` with the branch preserved; the next start finishes it publish-only |
-| The dispatcher's own commit failed | `needs_attention` **before** any push, so no PR can appear to omit the run's work; the edits stay for a publish-only retry |
+| Process died mid-run, nothing published | the orphaned `running` row is closed as `failed`; the worktree is inspected and left untouched; the partial edits are **preserved but not committed**; the task returns to `queued` (or `failed` when the budget is spent) |
+| Process died during `git push` | publish-only recovery: the run had completed, so the PR is created or adopted and no agent runs |
+| Process died after `git push`, before the PR | adopt or create the PR; no agent runs |
+| A failed push left an older branch on the remote | the tip comparison refuses to publish, and the task is parked so the mismatch is visible |
+| PR created, DB write lost | adopt by exact head-branch match, verified head repository and Issue link |
+| PR lookup or creation failed | `needs_attention` with the branch preserved; the next start finishes it publish-only |
+| The dispatcher's own commit failed | `needs_attention` **before** any push, so no PR can omit the run's work; the next start commits the preserved edits, pushes and opens the PR — no model call |
 | Duplicate poll | one task row per `(repo, Issue)`; a task not in `queued` is never dispatched |
 | Owned worktree on the wrong branch | refused and escalated: work is never committed or published from a branch this task does not own |
 | PR merged or closed externally | no new rounds; the task ends via the normal reconciliation rules |
-| Owned worktree with uncommitted edits | **preserved** and reported |
+| Owned worktree with uncommitted edits | **preserved** and reported; committed only when a completed run produced them |
+| A task parked by a maintainer | left alone. Recovery does not push commits or open PRs for it |
 
 An orphaned `running` row needs no PID liveness check precisely *because* of the
 single-instance lock: while this process holds the lock, any `running` row it finds
@@ -779,7 +799,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 183 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 196 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -804,6 +824,12 @@ a mock. The cases most worth knowing about:
 | `EligibilityTests` | a withdrawn label, a paused task or a foreign PR prevents the run — even when named explicitly; a crash after push recovers **publish-only** |
 | `WorkerStartupReconciliationTests` | the `worker` entry point (not just `run`) repairs an orphaned `running` row, and an orphan no longer blocks dispatch globally |
 | `PublishRecoveryTests` | a `needs_attention` row with a pushed branch is finished off without a second model call |
+| `FailedFirstCommitRecoveryTests` | a first run whose commit failed is recovered locally — commit, push, one PR, zero extra runtime invocations — and a maintainer-parked task is left alone |
+| `FailedPushRecoveryTests` | a stale remote tip blocks publishing, and a genuine publish stage pushes and matches tips |
+| `UnfinishedRunNotPublishedTests` | a killed agent's partial edits are never committed or published, and are preserved for retry |
+| `NoWorktreePublishTests` | Git is never run against an invented working directory; the PR is reconciled through the wrapper instead |
+| `ReconcileRetryTests` | a transient wrapper outage does not consume the single reconciliation attempt |
+| `MigrationRaceTests` | two processes can migrate the same new database without the loser crashing |
 | `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |
 | `WorktreeIdentityTests` | a worktree switched to another branch is detected and never published from |
 | `PrAdoptionVerificationTests` | a fork's PR, an unlinked PR and a short payload are refused; a genuine PR is adopted |

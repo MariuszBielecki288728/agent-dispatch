@@ -138,15 +138,19 @@ class Worker:
         """
         if self._reconciled or not self.reconcile:
             return []
-        self._reconciled = True
         client = self._client or GitHubClient(self.config.github.command, timeout_seconds=60.0)
         try:
             client.check_available()
         except GitHubError as exc:
-            # A missing wrapper is a configuration fault. Report it and let the
-            # normal poll surface the same problem consistently.
+            # A missing wrapper is a configuration fault. Report it and do NOT mark
+            # reconciliation done: the check runs before any repair, so a transient
+            # failure at startup would otherwise skip reconciliation for this whole
+            # process lifetime, leaving a `running` row blocking every future poll
+            # until the service happened to restart again. Retrying on the next poll
+            # is safe because reconciliation is idempotent.
             self.log.error("reconcile_skipped", kind=exc.kind, error=str(exc))
             return []
+        self._reconciled = True
         notes = Orchestrator(self.config, self.store, client, self.log).reconcile()
         for note in notes:
             self.log.info("reconciled", detail=note)

@@ -20,7 +20,9 @@ not evidence that anything was implemented.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -52,6 +54,26 @@ PAUSE_MAINTAINER = "maintainer"
 RUN_RUNNING = "running"
 RUN_SUCCEEDED = "succeeded"
 RUN_FAILED = "failed"
+
+#: Why a task was parked for recovery. Recorded explicitly instead of inferred from
+#: the phase, because the two cases need opposite repairs:
+#:
+#: * :data:`RECOVERY_COMMIT_FAILED` — the agent run **completed and was validated**, and
+#:   only publishing failed. Local commits and/or uncommitted edits are finished work,
+#:   so recovery may commit them and publish without spending a model call.
+#: * :data:`RECOVERY_PUSH_FAILED` / :data:`RECOVERY_PR_FAILED` — a run completed and
+#:   published, but the push or PR step failed. Recovery re-does only that step.
+#:
+#: An interrupted *runtime* leaves no stage at all (or :data:`RECOVERY_INTERRUPTED`),
+#: which is what keeps half-written edits from being committed as if they were done.
+RECOVERY_COMMIT_FAILED = "commit_failed"
+RECOVERY_PUSH_FAILED = "push_failed"
+RECOVERY_PR_FAILED = "pr_failed"
+RECOVERY_INTERRUPTED = "interrupted"
+
+#: Stages whose preserved local work is finished work and may be published without a
+#: model call. Deliberately excludes `interrupted`.
+PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RECOVERY_PR_FAILED})
 
 #: Phases with no further automatic transitions.
 TERMINAL_PHASES = frozenset({"finished"})
@@ -242,6 +264,15 @@ class Task:
     pr_url: str | None = None
     pr_created_at: str | None = None
     dispatched_at: str | None = None
+    #: Why the task was parked for recovery, or ``None``. See
+    #: :data:`RECOVERY_COMMIT_FAILED` and friends for why the phase alone is not
+    #: enough to decide whether preserved edits are finished work.
+    recovery_stage: str | None = None
+
+    @property
+    def has_publishable_stage(self) -> bool:
+        """Whether preserved local work may be published without a model call."""
+        return self.recovery_stage in PUBLISHABLE_STAGES
 
     @property
     def ref(self) -> str:
@@ -364,15 +395,52 @@ class Store:
         ("tasks", "pr_url", "TEXT"),
         ("tasks", "pr_created_at", "TEXT"),
         ("tasks", "dispatched_at", "TEXT"),
+        # Issue #4 review round 2. A bare `needs_attention` phase does not say
+        # *why* the task was parked, so recovery could not tell "the agent finished
+        # and only publishing failed" (recoverable without a model call) from "the
+        # agent was killed mid-edit" (must NOT be auto-committed).
+        ("tasks", "recovery_stage", "TEXT"),
     )
 
     def _add_missing_columns(self) -> None:
+        """Apply the additive column migrations, tolerating a losing race.
+
+        "Check then ALTER" is not atomic: two processes opening the same database at
+        once — the worker and an explicit `run`, or a test's subprocess — can both
+        observe a column as missing and both issue the ``ALTER``, and the loser fails
+        with ``duplicate column name``. That surfaced as a crash while a run was in
+        flight, i.e. exactly when the service was already recovering from something.
+
+        ``ADD COLUMN`` is the intended state either way, so a duplicate-column failure
+        means another process already applied it and is treated as success. The column
+        is re-checked to keep this honest rather than blindly swallowing the error.
+        """
         for table, column, column_type in self._ADDED_COLUMNS:
-            existing = {
-                str(info["name"]) for info in self._conn.execute(f"PRAGMA table_info({table})")
-            }
-            if column not in existing:
+            if self._column_present(table, column):
+                continue
+            try:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            except sqlite3.OperationalError as exc:
+                if not self._column_present(table, column):
+                    raise
+                self._log_migration_race(table, column, exc)
+
+    def _column_present(self, table: str, column: str) -> bool:
+        existing = {str(info["name"]) for info in self._conn.execute(f"PRAGMA table_info({table})")}
+        return column in existing
+
+    def _log_migration_race(self, table: str, column: str, exc: sqlite3.OperationalError) -> None:
+        """Record a benign migration race once, without a logger dependency.
+
+        This module deliberately has no logger of its own, so the note goes to stderr
+        only when the caller opted into verbosity via the environment. Silence here
+        would hide a real concurrency signal; a normal run stays quiet.
+        """
+        if os.environ.get("AGENT_DISPATCH_DEBUG_MIGRATION"):
+            print(
+                f"note: {table}.{column} was added concurrently by another process ({exc})",
+                file=sys.stderr,
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -615,6 +683,71 @@ class Store:
         self._conn.execute(
             "UPDATE tasks SET phase = 'needs_attention', last_error = ?, updated_at = ? WHERE id = ?",
             (note, utcnow_iso(), task_id),
+        )
+
+    def park_for_recovery(self, task_id: int, *, stage: str, note: str) -> None:
+        """Park a task in ``needs_attention`` together with **why** it was parked.
+
+        The stage is what makes the difference between the two repairs that look
+        identical from the outside: publishing already-finished work (no model call)
+        versus discarding an interrupted runtime's partial edits in favour of a fresh
+        attempt. Inferring that from the phase alone is what let a crashed agent's
+        half-written changes be committed as though they were complete.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET phase = 'needs_attention', recovery_stage = ?, last_error = ?, "
+            "updated_at = ? WHERE id = ?",
+            (stage, note, utcnow_iso(), task_id),
+        )
+
+    def clear_recovery_stage(self, task_id: int) -> None:
+        """Forget the parking reason once the task is no longer parked."""
+        self._conn.execute(
+            "UPDATE tasks SET recovery_stage = NULL, updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task_id),
+        )
+
+    def last_completed_run(self, task_id: int) -> Run | None:
+        """The most recent run that completed **cleanly at the runtime level**.
+
+        "Clean" means the runtime reported success without blocked tools or a
+        timeout. This is the evidence that any edits left in the worktree belong to a
+        finished piece of work rather than to a process that was killed mid-edit, and
+        it is why this is a query over ``runs`` rather than a flag someone sets.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM runs WHERE task_id = ? AND outcome = 'succeeded' "
+            "AND tool_hook_blocked = 0 AND timed_out = 0 AND subtype = 'success' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_run(row) if row is not None else None
+
+    def has_unfinished_run(self, task_id: int) -> bool:
+        """Whether the newest run never completed (interrupted or failed).
+
+        Used to refuse auto-committing: a newer unfinished run means the worktree may
+        hold half-written edits, and the newest run is the one that describes the
+        current contents.
+        """
+        runs = self.run_history(task_id)
+        if not runs:
+            return False
+        return runs[-1].outcome != RUN_SUCCEEDED
+
+    def is_run_completed(self, run_row_id: int) -> bool:
+        """Whether one specific run row records a clean runtime completion."""
+        row = self._conn.execute(
+            "SELECT outcome, tool_hook_blocked, timed_out, subtype FROM runs WHERE id = ?",
+            (run_row_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return (
+            str(row["outcome"]) == RUN_SUCCEEDED
+            and not bool(row["tool_hook_blocked"])
+            and not bool(row["timed_out"])
+            and row["subtype"] == "success"
         )
 
     def record_pr_ownership(self, task_id: int, pr_number: int, note: str | None = None) -> None:
@@ -900,6 +1033,7 @@ def _row_to_task(row: Mapping[str, Any]) -> Task:
         pr_url=observed("pr_url", None),
         pr_created_at=observed("pr_created_at", None),
         dispatched_at=observed("dispatched_at", None),
+        recovery_stage=observed("recovery_stage", None),
     )
 
 
