@@ -54,7 +54,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .config import RuntimeConfig
 from .runlogs import run_dir, run_log_path
@@ -145,6 +145,10 @@ class RunResult:
     finished_at: str
     timed_out: bool = False
     spawn_error: str | None = None
+    #: Set when an ``on_session`` callback raised. The run outcome is unaffected —
+    #: the agent's work is still valid — but the caller is told, so it can report
+    #: that the session ID was not persisted rather than leaving it unexplained.
+    session_callback_error: str | None = None
     events_seen: int = 0
     result_lines: int = 0
 
@@ -286,12 +290,19 @@ class CommandCodeDriver:
         instruction: str,
         run_id: str,
         session_id: str | None = None,
+        on_session: Callable[[str], None] | None = None,
     ) -> RunResult:
         """Execute one invocation, streaming NDJSON to a log outside every repo.
 
         The log is written by this process (not by a shell redirect inside the
         worktree), which is what keeps raw transcripts out of the repository where
         ``git add -A`` could sweep them into a PR.
+
+        ``on_session`` is invoked **once**, the first time the stream reveals a
+        session ID (it arrives on the first line). Returning the ID only in the
+        result would lose it in a hard crash — exactly the case where knowing which
+        session was attempted matters — so the caller persists it from the callback
+        while the run is still in flight.
         """
         worktree = Path(worktree)
         log_path = run_log_path(self.run_log_dir, self.repo, self.issue_number, run_id)
@@ -342,6 +353,7 @@ class CommandCodeDriver:
         watchdog.daemon = True
         watchdog.start()
         log_write_error: str | None = None
+        session_callback_error: str | None = None
 
         try:
             with log_path.open("w", encoding="utf-8") as log_file:
@@ -353,7 +365,20 @@ class CommandCodeDriver:
                         log_file.write(line if line.endswith("\n") else line + "\n")
                     event = parse_ndjson_line(line)
                     if event is not None:
+                        had_session = state.session_id is not None
                         state.observe(event)
+                        if on_session and state.session_id and not had_session:
+                            # Persist the ID the moment it appears, so a crash after
+                            # this point still records which session was attempted.
+                            # This does NOT make the run resumable: resumability is
+                            # decided separately, from whether the run completed.
+                            try:
+                                on_session(state.session_id)
+                            except Exception as exc:
+                                # Never fatal, but never swallowed either: the caller
+                                # is told so it can report that the session could not
+                                # be persisted, instead of the ID quietly going missing.
+                                session_callback_error = str(exc)
                 log_file.flush()
         except OSError as exc:
             log_write_error = f"could not write the run log {log_path}: {exc}"
@@ -382,6 +407,7 @@ class CommandCodeDriver:
             finished_at=finished_at,
             timed_out=deadline_hit,
             spawn_error=log_write_error,
+            session_callback_error=session_callback_error,
             events_seen=state.events_seen,
             result_lines=state.result_lines,
         )

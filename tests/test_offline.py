@@ -251,13 +251,31 @@ def issue(
 
 
 def pull(
-    number: int, head_ref: str, *, state: str = "open", merged: bool = False, body: str = ""
+    number: int,
+    head_ref: str,
+    *,
+    state: str = "open",
+    merged: bool = False,
+    body: str = "",
+    head_repo: str = "example/repo",
 ) -> dict:
+    """A pull request fixture shaped like GitHub's response.
+
+    ``head.repo.full_name`` / ``head.user.login`` are real fields and the service
+    uses them to prove a PR is not from a fork whose branch name merely collides
+    with ours, so the fixture must carry them or the check would pass here and fail
+    against live GitHub.
+    """
     return {
         "number": number,
         "state": state,
         "merged_at": "2026-01-01T00:00:00Z" if merged else None,
-        "head": {"ref": head_ref, "sha": "0" * 40},
+        "head": {
+            "ref": head_ref,
+            "sha": "0" * 40,
+            "repo": {"full_name": head_repo, "owner": {"login": head_repo.split("/")[0]}},
+            "user": {"login": head_repo.split("/")[0]},
+        },
         "html_url": f"https://github.com/example/repo/pull/{number}",
         "title": f"PR {number}",
         "body": body,

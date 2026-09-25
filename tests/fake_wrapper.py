@@ -349,11 +349,20 @@ def main(argv: list[str]) -> int:
             )
         pulls = repo.setdefault("pulls", [])
         number = max([int(pr["number"]) for pr in pulls] or [0]) + 1
+        # `head.repo.full_name` and `head.user.login` are what real GitHub returns,
+        # and the service uses them to prove the PR is not from a fork whose branch
+        # name happens to collide with ours. The fake must send them too, or the
+        # adoption checks would pass here and fail live.
         record = {
             "number": number,
             "state": "open",
             "merged_at": None,
-            "head": {"ref": head, "sha": "0" * 40},
+            "head": {
+                "ref": head,
+                "sha": "0" * 40,
+                "repo": {"full_name": slug, "owner": {"login": slug.split("/")[0]}},
+                "user": {"login": slug.split("/")[0]},
+            },
             "html_url": f"https://github.com/{slug}/pull/{number}",
             "title": fields.get("title", ""),
             "body": fields.get("body", ""),

@@ -50,6 +50,23 @@ class WorktreeState:
     untracked_files: list[str] = field(default_factory=list)
     ahead: bool = False
     remote_branch_exists: bool = False
+    #: The branch **actually checked out** in the worktree right now, or ``None``
+    #: when it could not be read (missing directory, detached HEAD reads as
+    #: ``"HEAD"``). Recorded separately from ``branch`` because they can disagree:
+    #: ``branch`` is what the task row records as ours, while this is the truth on
+    #: disk. Committing or pushing without comparing them is how work from one
+    #: branch ends up on another.
+    checked_out_branch: str | None = None
+
+    @property
+    def branch_matches(self) -> bool:
+        """Whether the worktree is really on the branch this task owns.
+
+        A registered worktree that has been switched to another branch still
+        *looks* owned (right path, right registration) while its commits and working
+        tree belong elsewhere. Every commit/push decision is gated on this.
+        """
+        return self.exists and self.checked_out_branch == self.branch
 
     @property
     def dirty(self) -> bool:
@@ -75,6 +92,8 @@ class WorktreeState:
             f"uncommitted={len(self.uncommitted_files)}",
             f"untracked={len(self.untracked_files)}",
         ]
+        if self.checked_out_branch and self.checked_out_branch != self.branch:
+            parts.append(f"checked_out={self.checked_out_branch} (MISMATCH)")
         if self.ahead:
             parts.append("ahead_of_base=yes")
         return " ".join(parts)
@@ -154,12 +173,25 @@ class WorktreeManager:
             else task_worktree_path(self.worktree_root, self.repo_slug, issue_number)
         )
         notes: list[str] = []
+        creating = not path.exists()
 
         fetched = self.fetch_base()
         if not fetched:
+            # A NEW task worktree must start from the configured base, so a failed
+            # fetch is fatal here: branching from a stale local base would silently
+            # build the task on old code, and the PR would look wrong in a way that
+            # is hard to trace back to this moment. For an ALREADY-OWNED worktree the
+            # base only affects the diff comparison, so a transient fetch failure is
+            # reported honestly instead of throwing away existing work.
+            if creating:
+                raise WorktreeError(
+                    f"could not fetch origin/{self.base_branch} from {self.source_path}, so a new "
+                    "task branch would be created from a possibly stale local base; refusing to "
+                    "start the task. Check network/credential access, then retry."
+                )
             notes.append(
-                f"could not fetch origin/{self.base_branch}; using the local base ref "
-                "(the push will fail loudly rather than silently diverging)"
+                f"could not fetch origin/{self.base_branch}; the diff is measured against the "
+                "last known base ref, which may be stale"
             )
 
         created_branch = False
@@ -175,17 +207,24 @@ class WorktreeManager:
                     f"worktree path {path} already exists but is not a registered Git worktree "
                     f"of {self.source_path}; refusing to delete or adopt an unknown path"
                 )
-            if not recorded_path:
-                # A registered worktree at the deterministic path with no task row
-                # entry: possibly a previous run of ours, possibly a foreign one.
-                # Recorded ownership is what decides, so do not guess.
-                existing_branch = self._current_branch(path)
-                if existing_branch and existing_branch != branch:
+            # The registration above proves the worktree belongs to THIS source
+            # clone. Its checked-out branch is checked separately and in both
+            # directions, because a worktree on the wrong branch still looks owned
+            # while its commits and working tree belong somewhere else.
+            existing_branch = self._current_branch(path)
+            if existing_branch != branch:
+                if not recorded_path:
                     raise WorktreeError(
-                        f"worktree {path} is registered on branch {existing_branch!r}, but this task "
-                        f"expects {branch!r}; ownership is not provable, so nothing was changed"
+                        f"worktree {path} is registered on branch {existing_branch!r}, but this "
+                        f"task expects {branch!r}; ownership is not provable, so nothing was "
+                        "changed"
                     )
-                notes.append(f"reusing the registered worktree at {path} (branch {branch})")
+                raise WorktreeError(
+                    f"worktree {path} is registered but checked out on {existing_branch!r} "
+                    f"instead of the recorded branch {branch!r}; refusing to commit or push "
+                    "work from the wrong branch. Switch it back, or reset the task."
+                )
+            notes.append(f"reusing the registered worktree at {path} (branch {branch})")
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._ensure_local_base()
@@ -266,6 +305,8 @@ class WorktreeManager:
             base_ref = self.base_branch
         base_sha = self._rev_parse(base_ref)
 
+        # What is ACTUALLY checked out, which is not necessarily ``branch``.
+        checked_out = self._current_branch(path)
         head_sha = self._rev_parse("HEAD", cwd=path)
         subjects: list[str] = []
         committed = 0
@@ -306,6 +347,7 @@ class WorktreeManager:
             untracked_files=untracked,
             ahead=committed > 0,
             remote_branch_exists=remote_exists,
+            checked_out_branch=checked_out,
         )
 
     def commit_all(self, path: Path | str, branch: str, message: str) -> tuple[bool, str]:

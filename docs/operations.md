@@ -493,11 +493,25 @@ instead of deriving a new name. Layout:
 <run_log_dir>/<owner>__<name>/issue-<N>/<run-id>.ndjson
 ```
 
+The worktree's **checked-out branch is verified against the recorded one** on every
+reuse, not merely its path and registration. A registered worktree that has been
+switched to another branch still looks owned while its commits and working tree
+belong elsewhere, so a mismatch is refused and escalated to `needs_attention`
+rather than silently committed or published.
+
 A directory that exists at the expected path but is **not** a registered Git
 worktree of the configured source is never adopted and never deleted: the task moves
 to `needs_attention` and says so. "Dirty" is not used as a proxy for anything — a
 clean worktree may contain successful commits, and a dirty one is expected after an
 interrupted run.
+
+### New worktrees require a fresh base
+
+A **new** task worktree fails clearly if `origin/<base_branch>` cannot be fetched,
+because branching from a stale local base would build the task on old code with no
+indication anything was wrong. For an **already-owned** worktree the base only
+affects the diff comparison, so a transient fetch failure is reported as a warning
+rather than discarding existing work.
 
 ---
 
@@ -537,11 +551,19 @@ A run is accepted **only if every one** of these holds:
 | On a resume, the returned ID **equals** the pinned one | otherwise the task's conversation is not the one that ran |
 | **Zero `tool_hook_blocked` events** | the false-success guard — see below |
 | The run finished inside the wall-clock timeout | the watchdog kills the process group at the deadline |
+| The worktree is still on the branch this task owns | a switched worktree looks owned while holding someone else's work |
+| Any uncommitted changes **can be committed** | `git push` cannot carry them, so a failed commit must stop before publishing rather than open a PR that omits the run's work |
 
 Produced work is evaluated separately, and deliberately does **not** require a
 dirty tree: commits count, uncommitted edits count, and a successful run that
 changed nothing is recorded as such and escalated to `needs_attention` rather than
 opening an empty PR.
+
+The session ID is persisted **the moment the stream reports it**, via a callback
+while the run is still in flight — not only after the process exits. Without that, a
+hard crash would leave no record of which session was attempted, which is exactly
+the case where that answer is needed. It does **not** make the run resumable: an
+interrupted first run still has no transcript.
 
 ### The silent false-success hazard
 
@@ -618,17 +640,41 @@ would schedule a duplicate implementation of work someone already did.
 ## 11. Crash recovery and intent-before-action
 
 The orchestrator records a side effect as **intended** *before* attempting it and
-**confirmed** only after it succeeded (`operations` table). On restart it repairs
-from evidence instead of repeating the call:
+**confirmed** only after it succeeded (`operations` table).
 
-| Crash point | Reconciliation on the next `run`/`worker` |
+Reconciliation runs **once at startup, under the single-instance lock**, from both
+entry points: the persistent `worker` (the systemd path) and the explicit `run`.
+That matters — without it a crash during a run would leave `phase=running`
+forever, and because the MVP allows one active task globally, *every* future poll
+would refuse to dispatch until someone ran `run` by hand. It is not gated on
+`--no-execute`, since repairing state is not executing and that is the flag an
+operator would reach for to unstick a task safely.
+
+What happens to an interrupted task depends on **evidence, not on its phase**:
+
+| Evidence | Repair |
 |---|---|
-| Process died mid-run | the `running` row is orphaned **by definition** — the single-instance lock proves no other worker is alive — so the open run is closed as `failed`, the worktree is inspected and left untouched, and the task returns to `queued` (or `failed` when the budget is spent) |
-| Branch pushed, PR creation not confirmed | the owned branch is looked up by head; the PR is adopted if it exists, created if it does not, and the **agent is not re-run** because the code already exists |
-| PR created, DB write lost | adoption by exact head-branch match, so `tasks.pr_number` is restored to the real number |
+| The recorded branch is **already on the remote** | **Publish-only**: commit anything still uncommitted, push, and adopt or create the PR. **No second agent run** — the code already exists on the branch |
+| No branch on the remote, or no branch recorded at all | Bounded fresh-session retry in the same owned worktree, with existing edits preserved |
+| Cannot determine whether the branch was published | `needs_attention`, with the reason. Never guessed, because guessing "absent" is how a stale row spends a second model call |
+
+That first row is what makes a crash inside `git push` (or between a successful PR
+POST and the SQLite write) recoverable without paying for the work twice. It is
+also why the dispatcher's messages about PR failures are truthful: a task parked in
+`needs_attention` with a pushed branch is finished off by the next `run` or worker
+start, publish-only.
+
+| Crash point | Reconciliation on the next `worker` start or `run` |
+|---|---|
+| Process died mid-run, nothing pushed | the orphaned `running` row is closed as `failed`; the worktree is inspected and left untouched; the task returns to `queued` (or `failed` when the budget is spent) |
+| Process died during `git push` | publish-only recovery: the branch is already on the remote, so the PR is created or adopted and no agent runs |
+| PR created, DB write lost | adopt by exact head-branch match **and** verified head repository and Issue link, so `tasks.pr_number` is restored to the real number |
+| PR lookup or creation failed after a push | `needs_attention` with the branch preserved; the next start finishes it publish-only |
+| The dispatcher's own commit failed | `needs_attention` **before** any push, so no PR can appear to omit the run's work; the edits stay for a publish-only retry |
 | Duplicate poll | one task row per `(repo, Issue)`; a task not in `queued` is never dispatched |
+| Owned worktree on the wrong branch | refused and escalated: work is never committed or published from a branch this task does not own |
 | PR merged or closed externally | no new rounds; the task ends via the normal reconciliation rules |
-| Owned worktree with uncommitted edits | **preserved** and reported; a retry starts a fresh session there rather than discarding the edits |
+| Owned worktree with uncommitted edits | **preserved** and reported |
 
 An orphaned `running` row needs no PID liveness check precisely *because* of the
 single-instance lock: while this process holds the lock, any `running` row it finds
@@ -733,7 +779,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 152 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 183 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -755,7 +801,13 @@ a mock. The cases most worth knowing about:
 | `TimeoutTests` | a hung run is killed at the deadline, recorded as a timeout, and leaves no live process |
 | `RetryTests` | an interrupted run's edits are preserved and the retry starts a **fresh** session |
 | `IdempotencyTests` | restart adopts the existing PR/branch instead of duplicating work |
-| `EligibilityTests` | a withdrawn label, a paused task or a foreign PR prevents the run — even when named explicitly |
+| `EligibilityTests` | a withdrawn label, a paused task or a foreign PR prevents the run — even when named explicitly; a crash after push recovers **publish-only** |
+| `WorkerStartupReconciliationTests` | the `worker` entry point (not just `run`) repairs an orphaned `running` row, and an orphan no longer blocks dispatch globally |
+| `PublishRecoveryTests` | a `needs_attention` row with a pushed branch is finished off without a second model call |
+| `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |
+| `WorktreeIdentityTests` | a worktree switched to another branch is detected and never published from |
+| `PrAdoptionVerificationTests` | a fork's PR, an unlinked PR and a short payload are refused; a genuine PR is adopted |
+| `SessionCaptureTests` | the session ID reaches SQLite while the run is still in flight, and is still not advertised as resumable |
 | `CredentialEnvironmentMockedTests` | the agent inherits the reset-then-wrapper ordering, and repo-local config is opt-in |
 | `StatusReadOnlyTests` | `status`/`dry-run`/`open` start no agent and create no state |
 

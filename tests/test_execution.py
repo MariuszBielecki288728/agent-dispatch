@@ -35,6 +35,7 @@ import json
 import os
 import stat
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,7 @@ from agent_dispatch.runtime import (  # noqa: E402
     redact_argv,
     validate_run,
 )
+from agent_dispatch.store import Store  # noqa: E402
 from test_offline import (  # noqa: E402
     FAKE_WRAPPER,
     TRIGGER,
@@ -1293,10 +1295,10 @@ class EligibilityTests(ExecutionCase):
         self.assertIn("needs_attention", repaired.stdout)
         self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
 
-    def test_an_orphaned_running_row_is_recovered_without_a_second_run(self) -> None:
-        # A `running` row can only be an artifact of a previous process: the
-        # single-instance lock proves no other worker is alive. Recovery closes the
-        # open run and re-queues the task rather than leaving it stuck.
+    def test_an_orphaned_running_row_whose_work_was_never_pushed_is_retried(self) -> None:
+        # Crash window 1: the process died INSIDE the agent run, before anything was
+        # pushed. Nothing exists on the remote, so the bounded fresh-session retry is
+        # the correct repair and the task goes back to the queue.
         self.set_issues(issue(1, "Interrupted", labels=[TRIGGER]))
         self.assertEqual(self.run_cli("run").returncode, 0)
 
@@ -1305,9 +1307,21 @@ class EligibilityTests(ExecutionCase):
         store = Store(self.world.load_config().worker.state_db)
         self.addCleanup(store.close)
         task = store.get_task(self.slug, 1)
+        branch = task.branch
+
+        # Remove the branch from the real remote so "nothing was published" is true.
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "-D", branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         # Simulate a process that died mid-run: phase running, run row still open.
         store._conn.execute(
-            "UPDATE tasks SET phase = 'running', attempts = 1 WHERE id = ?", (task.id,)
+            "UPDATE tasks SET phase = 'running', attempts = 1, pr_number = NULL WHERE id = ?",
+            (task.id,),
         )
         run_row = store.start_run(
             task.id,
@@ -1318,21 +1332,112 @@ class EligibilityTests(ExecutionCase):
         )
         store.close()
 
-        runs_before = len(self.recorded_argv())
         repaired = self.run_cli("run", "--skip-poll")
         self.assertIn("reconcile", repaired.stdout)
 
         store = Store(self.world.load_config().worker.state_db)
         self.addCleanup(store.close)
-        recovered = store.get_task(self.slug, 1)
-        self.assertEqual(recovered.phase, "queued", "an interrupted task returns to the queue")
         runs = store.run_history(task.id)
         dangling = [run for run in runs if run.id == run_row]
         self.assertEqual(
             dangling[0].outcome, "failed", "the orphaned run row must be closed, not left open"
         )
-        # The recovery itself did not run an agent; the follow-up dispatch did.
-        self.assertLessEqual(len(self.recorded_argv()) - runs_before, 1)
+        # It was retried (queued then dispatched) rather than left stuck in running.
+        self.assertNotEqual(store.get_task(self.slug, 1).phase, "running")
+
+    def test_a_crash_during_push_recovers_publish_only_without_a_second_run(self) -> None:
+        """The real crash-after-push window the review flagged.
+
+        The task stays `running` for the whole of `git push`, so a crash there leaves
+        a `running` row whose branch IS already on the remote. Recovery must finish
+        publishing it — and must NOT spend a second model call, because the code
+        already exists on the branch.
+        """
+        self.set_issues(issue(1, "Crash during push", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        branch = task.branch
+        original_pr = task.pr_number
+        self.assertIsNotNone(original_pr)
+
+        # Reproduce the crash window faithfully: the branch is pushed, the run row is
+        # still open, the task is `running`, and the PR ownership was never recorded.
+        # This is the state the actual code leaves — the earlier version of this test
+        # manually set `awaiting_review`, a phase the code does not reach before push,
+        # which is why it missed the bug.
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        world["repos"][self.slug]["branches"] = [branch]
+        self.world.world = world
+        self.world.write_world()
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.start_run(
+            task.id,
+            run_id="20260101T000000Z-implementation",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "crash.ndjson"),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        repaired = self.run_cli("run", "--skip-poll")
+        self.assertIn("reconcile", repaired.stdout)
+
+        # The whole point: no second agent run was started.
+        self.assertEqual(
+            len(self.recorded_argv()),
+            runs_before,
+            "a crash after push must be recovered publish-only, never by re-running the agent",
+        )
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        repaired_task = store.get_task(self.slug, 1)
+        self.assertEqual(repaired_task.phase, "awaiting_review")
+        self.assertIsNotNone(repaired_task.pr_number, "the missing PR must be created")
+        pulls = self.world.read_world()["repos"][self.slug]["pulls"]
+        self.assertEqual(len(pulls), 1, "exactly one PR, created by recovery")
+        self.assertEqual(pulls[0]["head"]["ref"], branch)
+
+    def test_a_crash_during_push_adopts_an_existing_pr_without_a_second_run(self) -> None:
+        # The other half of that window: the PR POST succeeded but the process died
+        # before recording it. Recovery must adopt it, not create a second one.
+        self.set_issues(issue(1, "PR created then crash", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        original_pr = task.pr_number
+
+        # Lose only the DB write: the PR still exists in the world, as it would after a
+        # crash between a successful POST and the SQLite update.
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        self.run_cli("run", "--skip-poll")
+
+        self.assertEqual(len(self.recorded_argv()), runs_before, "no agent may be re-run")
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        repaired_task = store.get_task(self.slug, 1)
+        self.assertEqual(repaired_task.pr_number, original_pr, "the real PR must be adopted")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
 
     def test_a_foreign_pr_prevents_the_run_and_is_never_owned(self) -> None:
         self.set_issues(issue(1, "Has a PR", labels=[TRIGGER]))
@@ -1579,6 +1684,765 @@ class GitModuleTests(ExecutionCase):
         self.assertTrue(
             (path / "someone-elses-file.txt").is_file(),
             "an unknown path must be left completely untouched",
+        )
+
+
+class WorkerStartupReconciliationTests(ExecutionCase):
+    """Review blocker 1: the persistent service must reconcile its own crashes.
+
+    `Orchestrator.reconcile()` used to be reachable only from the explicit `run`
+    command. The systemd entry point is `worker`, so a crash mid-run left
+    `phase=running` forever: `active_task_count()` stayed above zero and every
+    subsequent poll refused to dispatch, with no way out except running `run` by
+    hand. These tests drive the **worker** entry point, not `run`.
+    """
+
+    def test_worker_once_reconciles_an_orphaned_running_row(self) -> None:
+        self.set_issues(issue(1, "Interrupted", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # A crash mid-run: phase running, run row still open, nothing published.
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "-D", task.branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'running', pr_number = NULL WHERE id = ?", (task.id,)
+        )
+        store.start_run(
+            task.id,
+            run_id="20260101T000000Z-implementation",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "orphan.ndjson"),
+        )
+        store.close()
+
+        result = self.run_cli("worker", "--once", "--no-execute")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("running_row_reconciled", result.stderr)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        recovered = store.get_task(self.slug, 1)
+        self.assertNotEqual(
+            recovered.phase,
+            "running",
+            "the worker must not leave a task stuck in `running` after a crash",
+        )
+        open_runs = [r for r in store.run_history(task.id) if r.outcome == "running"]
+        self.assertEqual(open_runs, [], "the orphaned run row must be closed")
+
+    def test_an_orphan_no_longer_blocks_dispatch_globally(self) -> None:
+        # The observable consequence of the bug: one orphaned row blocked ALL future
+        # dispatch, because the MVP allows a single active task globally.
+        self.set_issues(issue(1, "Interrupted", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "-D", task.branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        store._conn.execute("UPDATE tasks SET phase = 'running' WHERE id = ?", (task.id,))
+        store.close()
+
+        # A second, unrelated Issue must still be dispatchable after the worker
+        # reconciles — before the fix, active_task_count() blocked it forever.
+        self.set_issues(
+            issue(1, "Interrupted", labels=[TRIGGER]),
+            issue(2, "Fresh work", labels=[TRIGGER]),
+        )
+        self.write_scenario(
+            runs=[{"session_id": "sess-fresh", "subtype": "success", "edits": {"f.txt": "ok\n"}}]
+        )
+        result = self.run_cli("worker", "--once")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 2).phase, "awaiting_review")
+
+    def test_a_simulated_poll_never_reconciles(self) -> None:
+        # `status`/`dry-run` have no lock, so they must not attempt repairs.
+        self.set_issues(issue(1, "Interrupted", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        store._conn.execute("UPDATE tasks SET phase = 'running' WHERE id = ?", (task.id,))
+        store.close()
+
+        for args in (("status",), ("dry-run",), ("status", "--no-sync")):
+            with self.subTest(command=args[0]):
+                self.assertEqual(self.run_cli(*args).returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(
+            store.get_task(self.slug, 1).phase,
+            "running",
+            "a read-only command must not repair state",
+        )
+
+
+class PublishRecoveryTests(ExecutionCase):
+    """Review important-item 4: the promised publish-only recovery must be reachable."""
+
+    def test_needs_attention_after_a_pr_lookup_failure_recovers_publish_only(self) -> None:
+        # The dispatcher tells the operator "a later `agent-dispatch run` will adopt or
+        # create it". That promise has to be true: the row is `needs_attention`, and it
+        # must be finished off WITHOUT another model call.
+        self.set_issues(issue(1, "PR lookup fails", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # Simulate the failure: the branch is pushed, the PR was never recorded, and
+        # the dispatcher escalated with the recovery instruction.
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        world["repos"][self.slug]["branches"] = [task.branch]
+        self.world.world = world
+        self.world.write_world()
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'needs_attention', pr_number = NULL, pr_url = NULL, "
+            "last_error = ? WHERE id = ?",
+            ("branch is pushed, but GitHub could not be queried for an existing PR", task.id),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        result = self.run_cli("run", "--skip-poll")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reconcile", result.stdout)
+
+        self.assertEqual(
+            len(self.recorded_argv()),
+            runs_before,
+            "publish-only recovery must not spend a second model call",
+        )
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number, "the PR must actually be created")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
+    def test_needs_attention_with_no_published_branch_is_not_retried_blindly(self) -> None:
+        # Nothing was published, so there is nothing to finish. The task must stay
+        # escalated rather than being reset to `queued` (which would risk a second run)
+        # or silently published.
+        self.set_issues(issue(1, "Nothing published", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "-D", task.branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        self.world.world = world
+        self.world.write_world()
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'needs_attention', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before, "no agent may be re-run")
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "needs_attention")
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+
+    def test_a_publish_only_recovery_commits_pending_edits_first(self) -> None:
+        # A crash between the agent finishing and the dispatcher committing its work is
+        # exactly this window; recovery must commit and publish it, still without a run.
+        self.set_issues(issue(1, "Uncommitted at crash", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # Drop the branch tip and leave a pending edit in the worktree, as a crash
+        # before `commit_all` would.
+        Path(task.worktree_path, "late.txt").write_text("late change\n", encoding="utf-8")
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        world["repos"][self.slug]["branches"] = [task.branch]
+        self.world.world = world
+        self.world.write_world()
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'needs_attention', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        runs_before = len(self.recorded_argv())
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before)
+
+        import subprocess
+
+        show = subprocess.run(
+            ["git", "-C", str(self.remote), "show", f"{task.branch}:late.txt"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            show.returncode,
+            0,
+            "the recovered commit must include the edits left uncommitted at the crash",
+        )
+
+
+class CommitFailureTests(ExecutionCase):
+    """Review blocker 3: a failed commit must not publish a PR that omits the work."""
+
+    def test_a_failed_commit_stops_before_push_and_opens_no_pr(self) -> None:
+        # Force the dispatcher's commit to fail by making the identity unusable, then
+        # confirm nothing is published: `git push` cannot carry uncommitted edits, so
+        # publishing would open a PR missing exactly this run's work.
+        self.write_scenario(
+            runs=[{"session_id": "sess-1", "subtype": "success", "edits": {"work.txt": "new\n"}}]
+        )
+        self.set_issues(issue(1, "Commit fails", labels=[TRIGGER]))
+
+        # An empty Git identity is an override that outranks `-c user.name`, which is
+        # the most realistic way for the commit to fail in production.
+        self.world.env_overrides["GIT_AUTHOR_NAME"] = ""
+        result = self.run_cli("run")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("needs_attention", result.stdout)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertNotEqual(task.phase, "awaiting_review")
+        self.assertIsNone(task.pr_number, "a PR must never omit the run's work")
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+        # The edits are preserved for a publish-only retry, not discarded.
+        self.assertTrue(
+            Path(task.worktree_path, "work.txt").is_file(),
+            "the uncommitted work must be preserved for recovery",
+        )
+        runs = store.run_history(task.id)
+        self.assertEqual(runs[0].outcome, "failed")
+        self.assertIn("could not commit the run's changes", runs[0].detail or "")
+
+    def test_a_failed_commit_does_not_leave_a_branch_behind(self) -> None:
+        self.write_scenario(
+            runs=[{"session_id": "sess-1", "subtype": "success", "edits": {"w.txt": "x\n"}}]
+        )
+        self.set_issues(issue(1, "Commit fails twice", labels=[TRIGGER]))
+        self.world.env_overrides["GIT_AUTHOR_NAME"] = ""
+        self.run_cli("run")
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertNotIn(
+            task.branch,
+            self._remote_branches(),
+            "a failed commit must not push a branch whose tip omits the run's work",
+        )
+
+    def _remote_branches(self) -> list[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+class WorktreeIdentityTests(ExecutionCase):
+    """Review important-item 5: verify the checked-out branch, not just registration."""
+
+    def test_a_worktree_on_the_wrong_branch_is_refused_not_published(self) -> None:
+        """A switched worktree still looks owned, but its work belongs elsewhere.
+
+        This is the failure the review asked about, and the harm is specific: the
+        task's commits and working tree are on some other branch, so a commit or push
+        would publish work that is not this Issue's — or open a PR claiming to
+        implement the Issue while the actual change sits on the wrong branch. Both are
+        worse than refusing. The assertion is therefore that no PR is created and the
+        task is escalated, not merely that a push failed.
+        """
+        self.set_issues(issue(1, "Wrong branch", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        worktree = Path(task.worktree_path)
+        branch = task.branch
+
+        import subprocess
+
+        # Switch the owned worktree to a different branch, as a mis-typed command or a
+        # stray operator session could. Registration and path still look correct.
+        subprocess.run(
+            ["git", "-C", str(worktree), "checkout", "-q", "-b", "somewhere-else"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Re-queue so a second attempt must reuse this same owned worktree.
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'queued', pr_number = NULL, pr_url = NULL WHERE id = ?",
+            (task.id,),
+        )
+        store.close()
+
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        world["repos"][self.slug]["branches"] = [branch]
+        self.world.world = world
+        self.world.write_world()
+
+        # The agent "works", and the run reports success.
+        self.write_scenario(
+            runs=[{"session_id": "sess-2", "subtype": "success", "edits": {"again.txt": "y\n"}}]
+        )
+        result = self.run_cli("run", "--skip-poll")
+
+        self.assertIn("needs_attention", result.stdout)
+        self.assertEqual(
+            len(self.world.read_world()["repos"][self.slug]["pulls"]),
+            0,
+            "no PR may be opened claiming work that sits on a different branch",
+        )
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "needs_attention")
+        self.assertNotIn(
+            "again.txt",
+            self._remote_files(branch),
+            "the run's work must not be attributed to the owned branch from the wrong one",
+        )
+
+    def test_inspect_reports_a_branch_mismatch(self) -> None:
+        from agent_dispatch.gitcmd import Git
+        from agent_dispatch.worktree import WorktreeManager
+
+        manager = WorktreeManager(
+            Git(),
+            source_path=self.source,
+            worktree_root=self.tmp / "mismatch-worktrees",
+            base_branch="main",
+            repo_slug=self.slug,
+        )
+        outcome = manager.ensure(issue_number=11, title="Mismatch")
+        state = manager.inspect(outcome.state.path, outcome.state.branch)
+        self.assertTrue(state.branch_matches)
+        self.assertEqual(state.checked_out_branch, state.branch)
+
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(state.path), "checkout", "-q", "-b", "elsewhere"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        mismatched = manager.inspect(state.path, outcome.state.branch)
+        self.assertFalse(mismatched.branch_matches, "a switched worktree must be detected")
+        self.assertEqual(mismatched.checked_out_branch, "elsewhere")
+        self.assertIn("MISMATCH", mismatched.describe())
+
+    def _remote_files(self, branch: str) -> set[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+class NewWorktreeBaseTests(ExecutionCase):
+    """Review follow-up: a new task worktree must not silently use a stale base."""
+
+    def test_a_failed_fetch_refuses_to_create_a_new_task_worktree(self) -> None:
+        from agent_dispatch.gitcmd import Git
+        from agent_dispatch.worktree import WorktreeError, WorktreeManager
+
+        # A source clone whose `origin` cannot be fetched: branching from it would
+        # build the task on a stale base with no indication anything was wrong.
+        broken = self.tmp / "broken-clone"
+        broken.mkdir()
+        import subprocess
+
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "T",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "T",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        subprocess.run(["git", "-C", str(broken), "init", "-q", "-b", "main"], check=True, env=env)
+        (broken / "f.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(broken), "add", "-A"], check=True, env=env)
+        subprocess.run(
+            ["git", "-C", str(broken), "commit", "-q", "-m", "init"], check=True, env=env
+        )
+        subprocess.run(
+            ["git", "-C", str(broken), "remote", "add", "origin", str(self.tmp / "does-not-exist")],
+            check=True,
+            env=env,
+        )
+
+        manager = WorktreeManager(
+            Git(),
+            source_path=broken,
+            worktree_root=self.tmp / "broken-worktrees",
+            base_branch="main",
+            repo_slug=self.slug,
+        )
+        with self.assertRaises(WorktreeError) as caught:
+            manager.ensure(issue_number=12, title="Stale base")
+        self.assertIn("stale", str(caught.exception))
+
+    def test_a_failed_fetch_only_warns_for_an_already_owned_worktree(self) -> None:
+        # For an existing worktree the base only affects the diff comparison, so a
+        # transient fetch failure must not throw away real work.
+        from agent_dispatch.gitcmd import Git
+        from agent_dispatch.worktree import WorktreeManager
+
+        root = self.tmp / "warn-worktrees"
+        manager = WorktreeManager(
+            Git(),
+            source_path=self.source,
+            worktree_root=root,
+            base_branch="main",
+            repo_slug=self.slug,
+        )
+        first = manager.ensure(issue_number=13, title="Owned already")
+
+        broken = WorktreeManager(
+            Git(),
+            source_path=self.tmp / "does-not-exist-source",
+            worktree_root=root,
+            base_branch="main",
+            repo_slug=self.slug,
+        )
+        # Reached through the real code path: a fetch failure on an existing worktree.
+        broken._is_registered = lambda path: True  # type: ignore[method-assign]
+        broken._current_branch = lambda path: first.state.branch  # type: ignore[method-assign]
+        outcome = broken.ensure(
+            issue_number=13,
+            title="Owned already",
+            recorded_branch=first.state.branch,
+            recorded_path=first.state.path,
+        )
+        self.assertTrue(outcome.state.exists)
+        self.assertFalse(outcome.fetched_base)
+        self.assertTrue(
+            any("could not fetch" in note for note in outcome.notes),
+            f"a stale base for an owned worktree must be reported: {outcome.notes}",
+        )
+
+
+class PrAdoptionVerificationTests(ExecutionCase):
+    """Review follow-up: an exact branch match is not proof a PR is ours.
+
+    Driven at :meth:`Orchestrator._ensure_pull_request`, which is where ownership is
+    actually decided. Both the post-run path and crash recovery delegate to it, so
+    testing it directly covers both callers without having to reconstruct a whole
+    crashed publish for each case — and it keeps the assertions focused on the single
+    decision under review.
+    """
+
+    def orchestrator(self):
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        return Orchestrator(config, store, GitHubClient(config.github.command), log), store, config
+
+    def task_row(self, store, config, *, branch: str = "dispatch/issue-1-adoption"):
+        self.set_issues(issue(1, "Adoption", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="Adoption",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="deepseek/deepseek-v4-flash",
+            runtime_effort="medium",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        row = store.get_task(self.slug, 1)
+        store.set_owned_worktree(
+            row.id, branch=branch, worktree_path=str(self.tmp / "wt"), base_branch="main"
+        )
+        return store.get_task(self.slug, 1)
+
+    def state(self, branch: str):
+        from agent_dispatch.worktree import WorktreeState
+
+        return WorktreeState(
+            path=self.tmp / "wt",
+            branch=branch,
+            exists=False,
+            is_registered_worktree=False,
+            remote_branch_exists=True,
+        )
+
+    def ensure_pr(
+        self, *, pr_body: str, head_repo: str, pr_number: int = 60, omit_head: bool = False
+    ):
+        orchestrator, store, config = self.orchestrator()
+        branch = "dispatch/issue-1-adoption"
+        task = self.task_row(store, config, branch=branch)
+
+        if omit_head:
+            pr = {
+                "number": pr_number,
+                "state": "open",
+                "merged_at": None,
+                # No head.repo / head.user, as a truncated payload would be.
+                "head": {"ref": branch, "sha": "0" * 40},
+                "html_url": f"https://github.com/{self.slug}/pull/{pr_number}",
+                "title": f"PR {pr_number}",
+                "body": pr_body,
+                "base": {"ref": "main"},
+            }
+        else:
+            pr = pull(pr_number, branch, body=pr_body, head_repo=head_repo)
+        world = self.world.read_world()
+        world["repos"][self.slug]["branches"] = [branch]
+        world["repos"][self.slug]["pulls"] = [pr]
+        self.world.world = world
+        self.world.write_world()
+
+        outcome = orchestrator._ensure_pull_request(
+            task, config.repo(self.slug), self.state(branch), result=None, notes=[]
+        )
+        return outcome, store.get_task(self.slug, 1)
+
+    def test_a_genuine_pr_for_this_task_is_adopted(self) -> None:
+        # The positive case first, so the refusals below are proved not to be
+        # refusing everything indiscriminately.
+        outcome, task = self.ensure_pr(pr_body="Closes #1", head_repo=self.slug)
+        self.assertEqual(outcome.action, "adopted_existing_pr")
+        self.assertEqual(task.pr_number, 60, "a genuine PR for this task must be adopted")
+        self.assertEqual(task.phase, "awaiting_review")
+
+    def test_a_fork_pr_on_our_branch_name_is_not_adopted(self) -> None:
+        # A branch *name* is not unique across GitHub, so a fork can host
+        # `dispatch/issue-1-...` too. Adopting it would hand this task someone else's
+        # pull request, which a later review round would then act on.
+        outcome, task = self.ensure_pr(pr_body="Closes #1", head_repo="attacker/fork", pr_number=61)
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "pr_head_owner_mismatch")
+        self.assertIsNone(task.pr_number, "a fork's PR must never be recorded as owned")
+        self.assertIn("attacker", " ".join(outcome.notes), "the refusal must name the foreign head")
+
+    def test_a_pr_on_our_branch_that_does_not_reference_the_issue_is_not_adopted(self) -> None:
+        # A same-repo PR on our branch name with no Issue link is ambiguous: it could
+        # be a human's. Ownership needs a proven link, not a name collision.
+        outcome, task = self.ensure_pr(
+            pr_body="No issue reference here", head_repo=self.slug, pr_number=62
+        )
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "pr_issue_link_unproven")
+        self.assertIsNone(task.pr_number, "an unlinked PR must not be recorded as owned")
+
+    def test_a_pr_with_no_head_repository_information_is_not_adopted(self) -> None:
+        # Unproven ownership fails closed: adopting the wrong PR is worse than asking
+        # a human, so a payload without `head.repo` is refused rather than assumed.
+        outcome, task = self.ensure_pr(
+            pr_body="Closes #1", head_repo=self.slug, pr_number=63, omit_head=True
+        )
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "pr_head_owner_mismatch")
+        self.assertIsNone(task.pr_number)
+
+    def test_a_pr_referencing_a_different_issue_is_not_adopted(self) -> None:
+        # Guards the obvious adjacent mix-up: the PR is on our branch and in our repo,
+        # but it implements a different Issue.
+        outcome, task = self.ensure_pr(pr_body="Closes #999", head_repo=self.slug, pr_number=64)
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "pr_issue_link_unproven")
+        self.assertIsNone(task.pr_number)
+
+    def test_an_adopted_pr_is_recorded_as_owned_and_leaves_review_phase(self) -> None:
+        # Exactly the body shape the dispatcher writes, so this proves a PR this
+        # service created is recognised as its own on a later recovery.
+        outcome, task = self.ensure_pr(
+            pr_body=f"Implements #{1} (https://github.com/{self.slug}/issues/1).",
+            head_repo=self.slug,
+        )
+        self.assertEqual(outcome.action, "adopted_existing_pr")
+        self.assertEqual(outcome.pr_number, 60)
+        self.assertEqual(task.pr_number, 60)
+        self.assertEqual(task.phase, "awaiting_review")
+        # Exactly one PR exists: adoption must not create a second one.
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
+
+class SessionCaptureTests(ExecutionCase):
+    """Review follow-up: the session ID must be persisted while the run is in flight."""
+
+    def test_the_session_id_is_stored_before_the_run_finishes(self) -> None:
+        # The claim in the docs is that the first `run_start` line is persisted
+        # immediately, so a hard crash still records which session was attempted.
+        # Prove it by reading SQLite while the fake runtime is still running.
+        self.write_scenario(runs=[{"session_id": "sess-early", "sleep": 3, "subtype": "success"}])
+        self.set_issues(issue(1, "Slow run", labels=[TRIGGER]))
+
+        import subprocess
+
+        env = self.env()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "agent_dispatch.cli",
+                "--config",
+                str(self.world.config_path),
+                "run",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=str(self.tmp),
+        )
+        try:
+            # The fake emits run_start immediately, then sleeps.
+            deadline = time.monotonic() + 15
+            observed: str | None = None
+            while time.monotonic() < deadline:
+                if self.world.load_config().worker.state_db.is_file():
+                    store = Store(self.world.load_config().worker.state_db)
+                    try:
+                        task = store.get_task(self.slug, 1)
+                        if task is not None and task.session_id:
+                            observed = task.session_id
+                            break
+                    finally:
+                        store.close()
+                time.sleep(0.2)
+
+            self.assertEqual(
+                observed,
+                "sess-early",
+                "the session ID must be persisted as soon as the stream reports it, "
+                "not only after the process exits",
+            )
+        finally:
+            proc.wait(timeout=60)
+
+    def test_an_early_captured_session_is_still_not_advertised_as_resumable(self) -> None:
+        # Capturing the ID early must not blur the distinction that matters: an
+        # interrupted run has no transcript, so it is not resumable.
+        self.write_scenario(runs=[{"session_id": "sess-killed", "hang": True}])
+        self.set_issues(issue(1, "Hangs after start", labels=[TRIGGER]))
+        self.world.write_config(worker_overrides=self.execution_overrides(run_timeout_seconds=30))
+
+        import subprocess
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "agent_dispatch.cli",
+                "--config",
+                str(self.world.config_path),
+                "run",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self.env(),
+            cwd=str(self.tmp),
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if self.world.load_config().worker.state_db.is_file():
+                    store = Store(self.world.load_config().worker.state_db)
+                    try:
+                        task = store.get_task(self.slug, 1)
+                        if task is not None and task.session_id:
+                            break
+                    finally:
+                        store.close()
+                time.sleep(0.2)
+            # Kill the whole CLI, leaving the DB exactly as a crash would.
+            proc.kill()
+        finally:
+            proc.wait(timeout=30)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.session_id, "sess-killed", "the attempted session is recorded")
+        self.assertIsNone(
+            store.resumable_session(task.id),
+            "an interrupted run is not resumable, however early its ID was captured",
         )
 
 

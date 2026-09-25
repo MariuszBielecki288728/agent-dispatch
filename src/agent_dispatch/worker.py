@@ -86,6 +86,9 @@ class Worker:
         self.execute = execute and reconcile
         self._client = client
         self._stop = False
+        #: Set by :meth:`reconcile_once` so crash recovery runs exactly once per
+        #: process rather than on every poll.
+        self._reconciled = False
 
     # -------------------------------------------------------------- the loop
 
@@ -102,6 +105,10 @@ class Worker:
             reconcile=self.reconcile,
         )
 
+        # Reconciliation happens once, inside the first `poll_once` below, which is
+        # also what `worker --once` uses. That is deliberate: the repair must run
+        # before the first dispatch but must NOT run on every poll, because it walks
+        # every task's branch and would otherwise re-check published state forever.
         while not self._stop:
             self.poll_once()
             if self._stop:
@@ -116,9 +123,44 @@ class Worker:
         self.log.info("worker_stopped")
         return 0
 
+    def reconcile_once(self) -> list[str]:
+        """Repair crash-interrupted state once, before any dispatch.
+
+        Runs at most once per Worker instance, and only on the write path: a
+        simulated poll has no lock, so it must not repair state.
+
+        Note this is deliberately NOT gated on ``execute``. Reconciliation repairs
+        state that a crash already left behind, and it never starts an agent, so
+        ``--no-execute`` must still get it: that is exactly the flag an operator
+        would reach for to fix a stuck task safely. Gating it on ``execute`` would
+        also mean a worker started with execution disabled could never clear the
+        ``running`` row that is blocking all future dispatch.
+        """
+        if self._reconciled or not self.reconcile:
+            return []
+        self._reconciled = True
+        client = self._client or GitHubClient(self.config.github.command, timeout_seconds=60.0)
+        try:
+            client.check_available()
+        except GitHubError as exc:
+            # A missing wrapper is a configuration fault. Report it and let the
+            # normal poll surface the same problem consistently.
+            self.log.error("reconcile_skipped", kind=exc.kind, error=str(exc))
+            return []
+        notes = Orchestrator(self.config, self.store, client, self.log).reconcile()
+        for note in notes:
+            self.log.info("reconciled", detail=note)
+        return notes
+
     def poll_once(self) -> PollOutcome:
-        """A single discovery + reconcile cycle, then at most one agent run."""
+        """A single discovery + reconcile cycle, then at most one agent run.
+
+        Reconciliation runs first when this poll is allowed to execute (i.e. the
+        write path the `worker` command uses). It is skipped for a simulated or
+        queue-only poll, which has no lock and must not attempt repairs.
+        """
         started = time.monotonic()
+        self.reconcile_once()
         before = self.store.count_by_phase()
         client = self._client or GitHubClient(self.config.github.command, timeout_seconds=60.0)
 
@@ -177,8 +219,9 @@ class Worker:
             )
 
         dispatch: DispatchOutcome | None = None
-        if self.execute and dispatchable and self.store.active_task_count() == 0:
-            # A missing runtime is a *configuration* fault, exactly like a missing
+        if (
+            self.execute and dispatchable and self.store.active_task_count() == 0
+        ):  # A missing runtime is a *configuration* fault, exactly like a missing
             # GitHub wrapper: it is reported once and touches no task state. Without
             # this check the first task would be claimed and marked `failed` for a
             # reason that is not about the task at all.

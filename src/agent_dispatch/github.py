@@ -29,7 +29,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 #: Hard cap on pagination so a pathological response cannot loop forever.
 MAX_PAGES = 50
@@ -107,6 +107,34 @@ class PullRequest:
     title: str = ""
     body: str = ""
     head_sha: str = ""
+    #: ``owner/name`` that hosts the head branch. For a pull request opened from a
+    #: fork this is the fork, not the base repository, which is why an exact
+    #: branch-name match alone cannot prove a PR is ours.
+    head_repo: str = ""
+    head_owner: str = ""
+
+    @property
+    def head_label(self) -> str:
+        """Human-readable head identity, e.g. ``owner:branch`` or just the branch."""
+        if self.head_owner and self.head_ref:
+            return f"{self.head_owner}:{self.head_ref}"
+        return self.head_ref
+
+    def head_ref_matches_owner(self, repo: str) -> bool:
+        """Whether this PR's head branch lives in ``repo`` rather than a fork.
+
+        A branch *name* is not unique across GitHub: ``dispatch/issue-7-x`` in a fork
+        can collide with ours. Comparing the head repository (and, when reported,
+        the owner) is what keeps a fork's pull request from being adopted as this
+        task's. Unknown head information fails closed when the base repo is known,
+        because adopting the wrong PR is worse than asking a human.
+        """
+        if not self.head_ref:
+            return False
+        if not self.head_repo:
+            # Older/short payloads omit the head repository. Treat as unproven.
+            return False
+        return self.head_repo.lower() == repo.lower()
 
     def references_issue(self, repo: str, issue_number: int) -> bool:
         """Whether this PR appears to implement ``repo#issue_number``.
@@ -116,11 +144,32 @@ class PullRequest:
 
         1. the deterministic dispatch branch name for that Issue, or
         2. a closing keyword / the Issue URL in the PR body.
-        """
-        match = DISPATCH_BRANCH_RE.match(self.head_ref or "")
-        if match and int(match.group(1)) == issue_number:
-            return True
 
+        Signal 1 makes this **unsuitable for deciding ownership**: a branch name is a
+        naming convention, not evidence that a PR implements this Issue. Use
+        :meth:`references_issue_in_text` for that, and see its docstring for why the
+        distinction matters.
+        """
+        if DISPATCH_BRANCH_RE.match(self.head_ref or ""):
+            match = DISPATCH_BRANCH_RE.match(self.head_ref or "")
+            if match and int(match.group(1)) == issue_number:
+                return True
+        return self.references_issue_in_text(repo, issue_number)
+
+    def references_issue_in_text(self, repo: str, issue_number: int) -> bool:
+        """Whether the PR *text* explicitly links to ``repo#issue_number``.
+
+        Deliberately ignores the branch name. For deciding whether a PR is this
+        task's own, a branch-name match is the wrong evidence: anyone can push a
+        branch called ``dispatch/issue-7-...``, and a PR that merely *sits on* such a
+        branch while implementing something else would otherwise be adopted as this
+        task's work. Requiring a closing keyword or the Issue URL in the title/body
+        makes ownership a claim the PR itself makes.
+
+        Used for ownership decisions. The looser :meth:`references_issue` stays for
+        *discovery*, where treating a dispatch-named branch as "this Issue already has
+        work" is the conservative choice.
+        """
         text = f"{self.title}\n{self.body}"
         for closing in _CLOSING_REF_RE.finditer(text):
             if closing.group("urlrepo") and closing.group("urlrepo").lower() == repo.lower():
@@ -570,6 +619,14 @@ def _to_pull(raw: dict[str, Any]) -> PullRequest:
     merged_at = raw.get("merged_at")
     head = raw.get("head") or {}
     body = raw.get("body")
+    head_repo_raw = head.get("repo") or {}
+    head_repo = ""
+    if isinstance(head_repo_raw, Mapping):
+        head_repo = str(head_repo_raw.get("full_name") or "")
+    head_owner = ""
+    head_user = head.get("user") or head_repo_raw.get("owner") or {}
+    if isinstance(head_user, Mapping):
+        head_owner = str(head_user.get("login") or "")
     return PullRequest(
         number=int(raw.get("number", 0)),
         state=str(raw.get("state") or "unknown"),
@@ -579,6 +636,8 @@ def _to_pull(raw: dict[str, Any]) -> PullRequest:
         title=str(raw.get("title") or ""),
         body=str(body) if isinstance(body, str) else "",
         head_sha=str(head.get("sha") or ""),
+        head_repo=head_repo,
+        head_owner=head_owner,
     )
 
 

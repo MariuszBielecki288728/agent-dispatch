@@ -54,6 +54,7 @@ from .runtime import (
 )
 from .store import (
     RUN_FAILED,
+    RUN_RUNNING,
     RUN_SUCCEEDED,
     Store,
     Task,
@@ -75,6 +76,27 @@ OUTCOME_FAILED = "failed"
 OUTCOME_NEEDS_ATTENTION = "needs_attention"
 OUTCOME_ADOPTED = "adopted_existing_pr"
 OUTCOME_BLOCKED = "blocked"
+
+#: Whether publish-only recovery applies to a task, and what it found.
+#: These three must not be collapsed: "handled", "provably nothing published" and
+#: "cannot tell" lead to three different actions, and treating unknown as absent is
+#: how a task ends up spending a second model call on work that already exists.
+PUBLISH_HANDLED = "handled"
+PUBLISH_ABSENT = "absent"
+PUBLISH_UNKNOWN = "unknown"
+PUBLISH_NOT_APPLICABLE = "not_applicable"
+
+
+@dataclass
+class RecoveryResult:
+    """What publish-only recovery found and did for one task."""
+
+    status: str
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def handled(self) -> bool:
+        return self.status == PUBLISH_HANDLED
 
 
 @dataclass
@@ -329,19 +351,7 @@ class Orchestrator:
         """
         title = task.title or issue.title or f"issue-{task.issue_number}"
 
-        manager = WorktreeManager(
-            self.git,
-            source_path=repo.path,
-            worktree_root=self.config.worker.worktree_root,
-            base_branch=repo.base_branch,
-            repo_slug=repo.slug,
-            credential_helper=self.config.github.credential_helper,
-            write_repo_local_config=self.config.worker.write_repo_local_credentials,
-            commit_identity=(
-                self.config.worker.commit_identity_name,
-                self.config.worker.commit_identity_email,
-            ),
-        )
+        manager = self._manager(repo)
 
         try:
             provision = manager.ensure(
@@ -513,6 +523,12 @@ class Orchestrator:
                 instruction=instruction,
                 run_id=run_id,
                 session_id=session_id,
+                # Persist the ID as soon as the stream reports it, not after the
+                # process exits: a hard crash mid-run would otherwise leave no trace
+                # of which session was attempted, which is precisely the case where
+                # that answer is needed. This does NOT make the run resumable — an
+                # interrupted first run still has no transcript.
+                on_session=lambda new_id: self.store.record_session(task.id, new_id),
             )
         except RuntimeSpawnError as exc:
             # The runtime is not installed or cannot start: a configuration fault.
@@ -542,8 +558,17 @@ class Orchestrator:
             )
 
         if result.session_id:
+            # Idempotent with the callback above; this covers a runtime that only
+            # revealed the ID in its final result line.
             self.store.record_session(task.id, result.session_id)
-
+        if result.session_callback_error:
+            self.log.warning(
+                "session_id_not_persisted",
+                repo=repo.slug,
+                issue=task.issue_number,
+                error=result.session_callback_error,
+                detail="the run is unaffected, but the session ID could not be stored",
+            )
         self.log.info(
             "agent_run_finished",
             duration_s=round(time.monotonic() - started),
@@ -586,35 +611,93 @@ class Orchestrator:
             )
             return self._record_failure(task, result, after, attempted, detail)
 
+        # A registered worktree that is no longer on the branch this task owns can
+        # still look owned (right path, right registration) while its commits and
+        # working tree belong to a different branch. Committing or pushing here would
+        # attribute someone else's work to this Issue, so nothing is published until
+        # a human resolves it.
+        if not after.branch_matches:
+            detail = (
+                f"worktree {after.path} is checked out on {after.checked_out_branch!r} but this "
+                f"task owns {after.branch!r}; refusing to commit or push from the wrong branch"
+            )
+            self.store.finish_run(
+                run_row,
+                outcome=RUN_FAILED,
+                session_id=result.session_id,
+                exit_code=result.exit_code,
+                subtype=result.subtype,
+                tool_hook_blocked=result.tool_hook_blocked,
+                timed_out=result.timed_out,
+                produced_work=after.produced_work,
+                detail=detail,
+            )
+            self.store.mark_needs_attention(task.id, detail)
+            return DispatchOutcome(
+                action=OUTCOME_NEEDS_ATTENTION,
+                task_ref=task.ref,
+                reason="worktree_branch_mismatch",
+                session_id=result.session_id,
+                run=result,
+                notes=[detail, "the run's edits are preserved in the worktree"],
+            )
+
         # Accepted run. The work may be committed, uncommitted, or (rarely) absent;
         # all three are recorded, because "the agent decided nothing was needed" is
         # a legitimate outcome while "the agent wrote nothing" after a success is a
         # fact the operator needs to see rather than have smoothed over.
-        if after.dirty:
-            committed, note = manager.commit_all(
-                after.path, after.branch, _commit_message(task, issue)
-            )
-            if committed:
-                after = manager.inspect(after.path, after.branch)
-                self.log.info(
-                    "run_changes_committed", repo=repo.slug, issue=task.issue_number, note=note
-                )
-            else:
-                self.log.warning(
-                    "run_changes_not_committed", repo=repo.slug, issue=task.issue_number, note=note
-                )
+        committed, commit_note = self._commit_pending(task, repo, manager, after, issue=issue)
+        after = manager.inspect(after.path, after.branch)
+        # `commit_note` is non-None only when a commit was attempted, so its presence
+        # with a still-dirty tree means the attempt failed. Checking the tree rather
+        # than trusting the return value keeps this correct if the commit partially
+        # applied (e.g. `git add` succeeded and `git commit` did not).
+        commit_failed = commit_note is not None and not committed and after.dirty
+        if commit_failed:
+            commit_note = f"could not commit the run's changes: {commit_note}"
 
         self.store.finish_run(
             run_row,
-            outcome=RUN_SUCCEEDED,
+            outcome=RUN_FAILED if commit_failed else RUN_SUCCEEDED,
             session_id=result.session_id,
             exit_code=result.exit_code,
             subtype=result.subtype,
             tool_hook_blocked=False,
             timed_out=False,
             produced_work=after.produced_work,
-            detail=None if after.produced_work else "successful run produced no diff",
+            detail=(
+                commit_note
+                if commit_failed
+                else (None if after.produced_work else "successful run produced no diff")
+            ),
         )
+
+        if commit_failed:
+            # STOP before push/PR. `git push` cannot carry uncommitted edits, so
+            # publishing now would either fail confusingly or — if the branch has
+            # earlier commits — open a PR that silently omits exactly the work this
+            # run produced. The edits stay in the worktree and a publish-only
+            # recovery can finish the job once the cause is fixed, with no second
+            # model call.
+            detail = (
+                f"run #{result.run_id} succeeded but its changes could not be committed "
+                f"({commit_note}); nothing was pushed and no PR was created. The edits are "
+                "preserved in the worktree."
+            )
+            self.store.mark_needs_attention(task.id, detail)
+            return DispatchOutcome(
+                action=OUTCOME_NEEDS_ATTENTION,
+                task_ref=task.ref,
+                reason="commit_failed",
+                session_id=result.session_id,
+                run=result,
+                notes=[
+                    detail,
+                    "fix the cause (e.g. worker.commit_identity_email), then run "
+                    "`agent-dispatch run` to commit, push and open the PR without "
+                    "running the agent again",
+                ],
+            )
 
         if not after.produced_work:
             self.store.set_phase(
@@ -635,7 +718,40 @@ class Orchestrator:
                 ],
             )
 
-        return self._publish(task, repo, manager, after, result)
+        return self._publish(task, repo, manager, after, result=result)
+
+    def _commit_pending(
+        self,
+        task: Task,
+        repo: RepoConfig,
+        manager: WorktreeManager,
+        state: WorktreeState,
+        *,
+        issue: Issue | None,
+    ) -> tuple[bool, str | None]:
+        """Commit anything the agent left uncommitted. Returns ``(committed, note)``.
+
+        ``note`` is ``None`` only when there was nothing to commit, so a caller can
+        tell "clean tree" apart from "the commit failed" — the distinction that
+        decides whether publishing may proceed at all.
+        """
+        if not state.dirty:
+            return False, None
+        if not state.branch_matches:
+            return False, (
+                f"refusing to commit: worktree is on {state.checked_out_branch!r}, not "
+                f"{state.branch!r}"
+            )
+        committed, note = manager.commit_all(state.path, state.branch, _commit_message(task, issue))
+        if committed:
+            self.log.info(
+                "run_changes_committed", repo=repo.slug, issue=task.issue_number, note=note
+            )
+        else:
+            self.log.warning(
+                "run_changes_not_committed", repo=repo.slug, issue=task.issue_number, note=note
+            )
+        return committed, note
 
     def _record_failure(
         self, task: Task, result: RunResult, after: WorktreeState, attempted: int, detail: str
@@ -677,9 +793,17 @@ class Orchestrator:
         repo: RepoConfig,
         manager: WorktreeManager,
         state: WorktreeState,
-        result: RunResult,
+        *,
+        result: RunResult | None = None,
     ) -> DispatchOutcome:
-        """Push the owned branch and create or adopt exactly one PR."""
+        """Push the owned branch and create or adopt exactly one PR.
+
+        Shared by the post-run path and publish-only recovery. ``result=None`` means
+        no fresh run happened in this call: either a crash left work that was never
+        published, or the previous run's commit failed and is now retried. The agent
+        is never re-invoked for either, because the code already exists on the
+        branch.
+        """
         notes: list[str] = []
 
         # --- push (intent-before-action) ---
@@ -705,7 +829,7 @@ class Orchestrator:
                     action=OUTCOME_FAILED,
                     task_ref=task.ref,
                     reason="push_failed",
-                    session_id=result.session_id,
+                    session_id=result.session_id if result else task.session_id,
                     run=result,
                     notes=notes,
                 )
@@ -728,6 +852,10 @@ class Orchestrator:
         is pushed but the PR is not confirmed" must behave identically in both: look
         first, adopt what exists, create only what is missing, and **never re-run the
         agent** — the code already exists on the branch (architecture §9).
+
+        An adopted PR is verified to reference this Issue before ownership is
+        recorded: an exact head-branch match proves the PR is on our branch, not that
+        it belongs to this task.
         """
         pr_op = self.store.intend_operation(
             task.id, kind="create_pr", detail=f"{state.branch} -> {repo.base_branch}"
@@ -740,7 +868,8 @@ class Orchestrator:
                 task.id,
                 "needs_attention",
                 f"branch {state.branch} is pushed, but GitHub could not be queried for an existing "
-                f"PR ({exc.kind}); a later `agent-dispatch run` will adopt or create it",
+                f"PR ({exc.kind}); `agent-dispatch run` will retry publish-only recovery (no new "
+                "model call)",
             )
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
@@ -752,6 +881,54 @@ class Orchestrator:
             )
 
         if existing is not None:
+            # An exact head-branch match is strong but not sufficient. The head
+            # repository must be this repo (not a fork whose branch happens to share
+            # the name), and the PR must actually reference this Issue. Anything else
+            # is ambiguous, and ambiguity must stop for a human rather than let the
+            # dispatcher adopt a pull request it did not create.
+            if not existing.head_ref_matches_owner(repo.slug):
+                self.store.fail_operation(pr_op, detail=f"head owner mismatch: {existing.head_ref}")
+                self.store.mark_needs_attention(
+                    task.id,
+                    f"branch {state.branch} resolves to PR #{existing.number} ({existing.url}), but "
+                    f"its head is {existing.head_label!r} rather than {repo.slug!r}; refusing to "
+                    "record it as owned",
+                )
+                return DispatchOutcome(
+                    action=OUTCOME_NEEDS_ATTENTION,
+                    task_ref=task.ref,
+                    reason="pr_head_owner_mismatch",
+                    pr_number=existing.number,
+                    pr_url=existing.url,
+                    notes=notes
+                    + [
+                        f"PR #{existing.number} was NOT adopted: its head is {existing.head_label!r}"
+                    ],
+                )
+
+            if not existing.references_issue_in_text(repo.slug, task.issue_number):
+                self.store.fail_operation(
+                    pr_op, detail=f"PR #{existing.number} does not reference the Issue"
+                )
+                self.store.mark_needs_attention(
+                    task.id,
+                    f"PR #{existing.number} ({existing.url}) is on our branch {state.branch} but "
+                    f"nothing in it references #{task.issue_number}; refusing to record it as "
+                    "owned",
+                )
+                return DispatchOutcome(
+                    action=OUTCOME_NEEDS_ATTENTION,
+                    task_ref=task.ref,
+                    reason="pr_issue_link_unproven",
+                    pr_number=existing.number,
+                    pr_url=existing.url,
+                    notes=notes
+                    + [
+                        f"PR #{existing.number} was NOT adopted: nothing in it references "
+                        f"#{task.issue_number}"
+                    ],
+                )
+
             self.store.confirm_operation(pr_op, external_id=str(existing.number))
             self.store.record_owned_pr(
                 task.id,
@@ -786,13 +963,13 @@ class Orchestrator:
         except GitHubError as exc:
             self.store.fail_operation(pr_op, detail=str(exc))
             # The branch is pushed and the PR is not confirmed: record the intent as
-            # recoverable and let a later run adopt or create it without re-running
-            # the agent.
+            # recoverable and let publish-only recovery adopt or create it without
+            # re-running the agent.
             self.store.set_phase(
                 task.id,
                 "needs_attention",
                 f"branch {state.branch} is pushed but PR creation failed ({exc.kind}): {exc}. "
-                "A later `agent-dispatch run` will adopt the PR if it was in fact created.",
+                "`agent-dispatch run` will retry publish-only recovery (no new model call).",
             )
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
@@ -856,25 +1033,34 @@ class Orchestrator:
     def reconcile(self) -> list[str]:
         """Repair state left by a crash, using GitHub and Git as evidence.
 
-        Called at startup before any dispatch. The cases that matter:
+        Called once under the single-instance lock at worker startup (and by the
+        explicit ``run`` command) before any dispatch, so a crash cannot leave a task
+        permanently stuck. The cases that matter:
 
-        * a ``running`` row is orphaned by definition — the single-instance lock
-          guarantees no other worker is alive, so a live-looking ``running`` row is
-          always this process's own ancestor or a previous crash;
-        * a branch or PR that was created but not confirmed is adopted, never
-          recreated;
-        * a pushed branch with no PR gets its PR created without re-running the
-          agent, because the code already exists.
+        * a ``running`` row is orphaned by definition — the lock guarantees no other
+          worker is alive, so a live-looking ``running`` row is always a previous
+          process's;
+        * work that was already pushed but whose PR was never recorded is published
+          **without re-running the agent**;
+        * only tasks with no published work at all return to the queue for a bounded
+          fresh-session retry.
+
+        The published-work check is what stops a crash during ``git push``/PR creation
+        from spending a second model call on work that already exists on the branch.
         """
         notes: list[str] = []
+        api_available = True
 
         for task in self.store.list_tasks():
             if task.is_terminal:
                 continue
             if task.phase == "running":
-                notes.extend(self._reconcile_running(task))
-            elif task.phase == "awaiting_review" and task.pr_number is None:
-                notes.extend(self._reconcile_awaiting_without_pr(task))
+                notes.extend(self._reconcile_running(task, api_available=api_available))
+            elif task.phase in {"awaiting_review", "needs_attention"}:
+                # A `needs_attention` row may be recoverable: the published-work
+                # check decides. It is NOT reset to `queued` here, because that is
+                # how a stale-queue row silently spends a second model call.
+                notes.extend(self._reconcile_publish_pending(task))
 
         if self.config.worker.run_log_dir.is_dir():
             try:
@@ -883,11 +1069,18 @@ class Orchestrator:
                 self.log.debug("run_log_prune_failed", error=str(exc))
         return notes
 
-    def _reconcile_running(self, task: Task) -> list[str]:
-        """A ``running`` row from a previous process. No agent is started here."""
-        runs = self.store.run_history(task.id)
-        open_runs = [run for run in runs if run.outcome == "running"]
-        for run in open_runs:
+    def _reconcile_running(self, task: Task, *, api_available: bool = True) -> list[str]:
+        """A ``running`` row from a previous process. No agent is started here.
+
+        Closing the open run is unconditional — no process is alive to own it. What
+        happens to the *task* afterwards depends on evidence, not on the phase: a
+        branch that already carries published work is finished off by
+        :meth:`_reconcile_publish_pending` (publish-only), while a task whose work
+        never reached the remote returns to the queue for a bounded retry.
+        """
+        for run in self.store.run_history(task.id):
+            if run.outcome != RUN_RUNNING:
+                continue
             self.store.finish_run(
                 run.id,
                 outcome=RUN_FAILED,
@@ -900,29 +1093,34 @@ class Orchestrator:
                 detail="interrupted: the worker process ended while this run was in flight",
             )
 
-        # An interrupted first run has no transcript, so it is not resumable. The
-        # worktree is left exactly as it is (uncommitted edits are real work) and
-        # the task returns to the queue for a bounded retry.
+        if not task.branch:
+            # Interrupted before a worktree/branch was recorded: nothing can have
+            # been published, so this is a plain retry.
+            return self._requeue_interrupted(task, "interrupted before a branch was recorded")
+
+        # Whether work was already published decides publish-only vs. agent-again.
+        # This is the crash-during-push window: the branch is on the remote and the
+        # PR was never recorded, so the repair must publish WITHOUT another run.
+        recovery = self._recover_publish_only(task)
+        if recovery.handled:
+            return recovery.notes
+        if recovery.status == PUBLISH_UNKNOWN:
+            self.store.mark_needs_attention(
+                task.id,
+                "interrupted run: could not determine whether its branch was published, so it was "
+                "not retried; re-run `agent-dispatch run` when the remote is reachable",
+            )
+            return [f"{task.ref}: publish state unknown after an interruption"]
+
         try:
             repo = self.config.repo(task.repo)
         except Exception:
             self.store.mark_needs_attention(task.id, "repository is no longer allowlisted")
             return [f"{task.ref}: running row left as needs_attention (repo not allowlisted)"]
 
-        if task.branch and task.worktree_path:
-            manager = WorktreeManager(
-                self.git,
-                source_path=repo.path,
-                worktree_root=self.config.worker.worktree_root,
-                base_branch=repo.base_branch,
-                repo_slug=repo.slug,
-                credential_helper=self.config.github.credential_helper,
-                write_repo_local_config=self.config.worker.write_repo_local_credentials,
-                commit_identity=(
-                    self.config.worker.commit_identity_name,
-                    self.config.worker.commit_identity_email,
-                ),
-            )
+        detail = "interrupted run recovered"
+        if task.worktree_path:
+            manager = self._manager(repo)
             state = manager.inspect(Path(task.worktree_path), task.branch)
             detail = (
                 f"interrupted run recovered: previous session {task.session_id or 'unknown'} is not "
@@ -930,9 +1128,10 @@ class Orchestrator:
             )
             if state.produced_work:
                 detail += " — its changes are preserved"
-        else:
-            detail = "interrupted run recovered before a worktree was recorded"
+        return self._requeue_interrupted(task, detail)
 
+    def _requeue_interrupted(self, task: Task, detail: str) -> list[str]:
+        """Return an interrupted task to the queue for a bounded fresh-session retry."""
         budget_left = task.attempts < self.config.worker.max_attempts
         self.store.set_phase(task.id, "queued" if budget_left else "failed", detail)
         self.log.warning(
@@ -940,77 +1139,135 @@ class Orchestrator:
         )
         return [f"{task.ref}: {detail}"]
 
-    def _reconcile_awaiting_without_pr(self, task: Task) -> list[str]:
-        """``awaiting_review`` with no recorded PR: find out what really happened.
+    def _reconcile_publish_pending(self, task: Task) -> list[str]:
+        """Finish publishing work that already exists, or escalate honestly.
 
-        Covers the crash-after-push and crash-after-PR-creation windows. Per
-        architecture §9 the repair is "retry PR creation only, never re-run the
-        agent", so this delegates to the same adopt-or-create path a normal run uses
-        — the code, if any, is already on the branch.
+        Handles the windows that leave a task without an owned PR: a crash after
+        ``git push``, and a PR lookup/creation failure (phase ``needs_attention``,
+        where the dispatcher tells the operator to re-run ``run``). Both resolve
+        through the same publish-only path, so that promise is actually reachable and
+        no second model call is spent on work that already exists on the branch.
+        """
+        if task.pr_number is not None:
+            # Ownership already recorded, so there is nothing to publish. A task left
+            # in needs_attention for an unrelated reason is NOT silently cleared.
+            return []
+
+        result = self._recover_publish_only(task)
+        if result.handled:
+            return result.notes
+        if result.status == PUBLISH_UNKNOWN:
+            # Cannot tell whether work was published. Never guess by re-running the
+            # model: escalate and say exactly what to do.
+            self.store.mark_needs_attention(
+                task.id,
+                f"could not determine whether {task.branch} is published; no agent was started. "
+                "Re-run `agent-dispatch run` when the remote is reachable to retry publish-only "
+                "recovery.",
+            )
+            return [f"{task.ref}: publish state unknown; left for a later attempt"]
+        if result.status == PUBLISH_ABSENT:
+            self.store.mark_needs_attention(
+                task.id,
+                f"recorded {task.phase} but neither {task.branch} nor a PR exists for it; left for "
+                "the maintainer rather than re-running the agent",
+            )
+            return [
+                f"{task.ref}: neither the branch nor a PR exists for {task.branch}; escalated to "
+                "needs_attention"
+            ]
+        return []
+
+    def _recover_publish_only(self, task: Task) -> "RecoveryResult":
+        """Publish already-pushed work without running the agent.
+
+        A task is only recoverable when its recorded branch really is on the remote:
+        that is the evidence a run got far enough to produce shareable work. The
+        result distinguishes the three outcomes that must NOT be treated alike —
+        published-and-handled, provably-absent, and unknown — because collapsing them
+        is how a stale-queue row ends up spending a second model call.
         """
         if not task.branch:
-            return []
+            return RecoveryResult(PUBLISH_NOT_APPLICABLE)
         try:
             repo = self.config.repo(task.repo)
         except Exception:
-            return []
+            return RecoveryResult(PUBLISH_NOT_APPLICABLE)
 
-        try:
-            pull = self.client.find_pull_by_head(repo.slug, task.branch)
-        except GitHubError as exc:
-            self.log.warning(
-                "pr_reconciliation_failed", repo=repo.slug, issue=task.issue_number, detail=str(exc)
-            )
-            return [f"{task.ref}: could not check for PR on {task.branch} ({exc.kind})"]
-
-        if pull is not None:
-            self.store.record_owned_pr(
-                task.id,
-                pr_number=pull.number,
-                pr_url=pull.url,
-                note=f"adopted PR #{pull.number} for owned branch {task.branch} after a restart",
-            )
-            note = (
-                f"{task.ref}: adopted PR #{pull.number} for the owned branch {task.branch}; "
-                "no second agent run was started"
-            )
-            self.log.info(
-                "pr_adopted_on_startup", repo=repo.slug, issue=task.issue_number, pr=pull.number
-            )
-            return [note]
-
-        # No PR exists. Create one only when the branch really is on the remote:
-        # otherwise the pre-crash push never landed, there is nothing to open a PR
-        # for, and inventing that would be worse than asking the maintainer.
         try:
             pushed = self._branch_on_remote(repo, task.branch)
         except GitError as exc:
-            return [f"{task.ref}: could not check whether {task.branch} is pushed ({exc})"]
+            self.log.warning(
+                "publish_state_unknown", repo=task.repo, issue=task.issue_number, detail=str(exc)
+            )
+            return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {exc}"])
 
         if not pushed:
-            self.store.set_phase(
-                task.id,
-                "needs_attention",
-                f"recorded awaiting_review but the owned branch {task.branch} is not on the remote "
-                "and no PR exists; left for the maintainer rather than re-running the agent",
-            )
-            return [
-                f"{task.ref}: neither the branch nor a PR for {task.branch} exists; "
-                "escalated to needs_attention"
-            ]
+            return RecoveryResult(PUBLISH_ABSENT)
 
-        # The worktree path is only used for the PR body's diff description, and a
-        # reconciled PR has no new run to describe, so an absent path is honest.
-        state = WorktreeState(
-            path=Path(task.worktree_path) if task.worktree_path else Path("."),
-            branch=task.branch,
-            exists=False,
-            is_registered_worktree=False,
-            remote_branch_exists=True,
+        # The branch is on the remote, so work exists. Commit anything still
+        # uncommitted first: a crash between the agent finishing and the dispatcher
+        # committing it is exactly this window, and no model call is involved.
+        manager = self._manager(repo)
+        worktree = Path(task.worktree_path) if task.worktree_path else None
+        if worktree is not None and worktree.is_dir():
+            state = manager.inspect(worktree, task.branch)
+            if not state.branch_matches:
+                detail = (
+                    f"cannot publish {task.branch}: worktree {worktree} is checked out on "
+                    f"{state.checked_out_branch!r}; refusing to commit or push from the wrong branch"
+                )
+                self.store.mark_needs_attention(task.id, detail)
+                return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}"])
+            if state.dirty:
+                committed, note = manager.commit_all(
+                    state.path, state.branch, _recovery_commit_message(task)
+                )
+                if not committed:
+                    detail = (
+                        f"cannot publish {task.branch}: committing the pending changes failed "
+                        f"({note}); the edits are preserved in the worktree"
+                    )
+                    self.store.mark_needs_attention(task.id, detail)
+                    return RecoveryResult(PUBLISH_UNKNOWN, [f"{task.ref}: {detail}"])
+                state = manager.inspect(state.path, task.branch)
+        else:
+            # No local worktree to commit from (or it is gone). Publishing an
+            # already-pushed branch is still valid: its commits are on the remote.
+            state = WorktreeState(
+                path=worktree or Path("."),
+                branch=task.branch,
+                exists=False,
+                is_registered_worktree=False,
+                remote_branch_exists=True,
+            )
+
+        outcome = self._publish(task, repo, manager, state, result=None)
+        detail = f"publish-only recovery: {outcome.summary()}"
+        self.log.warning(
+            "publish_only_recovered",
+            repo=task.repo,
+            issue=task.issue_number,
+            action=outcome.action,
+            detail=detail,
         )
-        notes: list[str] = []
-        outcome = self._ensure_pull_request(task, repo, state, result=None, notes=notes)
-        return [f"{task.ref}: {outcome.summary()}", *notes]
+        return RecoveryResult(PUBLISH_HANDLED, [f"{task.ref}: {detail}", *outcome.notes])
+
+    def _manager(self, repo: RepoConfig) -> WorktreeManager:
+        """A WorktreeManager for ``repo``, configured exactly like dispatch uses."""
+        return WorktreeManager(
+            self.git,
+            source_path=repo.path,
+            worktree_root=self.config.worker.worktree_root,
+            base_branch=repo.base_branch,
+            repo_slug=repo.slug,
+            credential_helper=self.config.github.credential_helper,
+            write_repo_local_config=self.config.worker.write_repo_local_credentials,
+            commit_identity=(
+                self.config.worker.commit_identity_name,
+                self.config.worker.commit_identity_email,
+            ),
+        )
 
 
 # --------------------------------------------------------------------- helpers
@@ -1077,7 +1334,12 @@ def _pr_body(task: Task, result: RunResult | None, state: WorktreeState, repo: R
         session = result.session_id or "unknown"
 
     sections = [
-        f"Implements #{task.issue_number}.",
+        # Both a human-readable reference and a repo-qualified URL. The URL is not
+        # decoration: it is what makes the Issue link machine-verifiable later, so a
+        # PR the dispatcher created can be recognised as this task's own (see
+        # `PullRequest.references_issue_in_text`). A bare `#N` is not enough evidence
+        # -- it also appears in prose -- so the full URL is always included.
+        f"Implements #{task.issue_number} ({_issue_url(repo.slug, task.issue_number)}).",
         "",
         "## Commits",
         "",
@@ -1097,8 +1359,15 @@ def _pr_body(task: Task, result: RunResult | None, state: WorktreeState, repo: R
     return "\n".join(sections)
 
 
-def _commit_message(task: Task, issue: Issue) -> str:
-    subject = (task.title or issue.title or f"issue {task.issue_number}").strip()
+def _issue_url(repo: str, issue_number: int) -> str:
+    """The canonical GitHub URL for an Issue, used in PR bodies and prompts."""
+    return f"https://github.com/{repo}/issues/{issue_number}"
+
+
+def _commit_message(task: Task, issue: Issue | None) -> str:
+    subject = (
+        task.title or (issue.title if issue else None) or f"issue {task.issue_number}"
+    ).strip()
     if len(subject) > 68:
         subject = subject[:67] + "…"
     return (
@@ -1106,4 +1375,22 @@ def _commit_message(task: Task, issue: Issue) -> str:
         f"Implemented by agent-dispatch for #{task.issue_number}.\n"
         "The agent left these changes uncommitted; the dispatcher committed them so the branch "
         "could be pushed. See the pull request for the run's own summary.\n"
+    )
+
+
+def _recovery_commit_message(task: Task) -> str:
+    """Message for a commit made by publish-only recovery, not by a fresh run.
+
+    Says so explicitly: the operator reading `git log` should be able to tell that
+    this commit was made while finishing an interrupted publish, not by an agent run
+    that just happened.
+    """
+    subject = (task.title or f"issue {task.issue_number}").strip()
+    if len(subject) > 68:
+        subject = subject[:67] + "…"
+    return (
+        f"{subject}\n\n"
+        f"Implemented by agent-dispatch for #{task.issue_number}.\n"
+        "Committed by publish-only crash recovery: an earlier run left these changes and the "
+        "process ended before they were committed and published. No new agent run was made.\n"
     )
