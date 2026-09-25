@@ -458,6 +458,14 @@ is up the command re-arms the task and hands off, reporting that the worker will
 publish it on its next poll. That hand-off is safe because the worker finishes
 publish-pending work on every poll; it does not depend on a restart.
 
+**Its exit status describes the outcome, not the attempt.** The command exits `0`
+only when the work is actually published (an owned PR exists) or when a live worker
+holds the lock and has explicitly accepted responsibility for the next poll. If the
+commit, push or PR fails *again*, the task stays publish-pending and the command exits
+`1` with `publish_incomplete` and the remaining `recovery_stage` — a script that
+treats `0` as "published" would otherwise act on a lie. The durable task state is
+unchanged and still recoverable either way; only the report differs.
+
 ---
 
 ## 7. What `status` means
@@ -856,7 +864,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 213 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 214 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -888,7 +896,7 @@ a mock. The cases most worth knowing about:
 | `ReconcileRetryTests` | a transient wrapper outage does not consume the single reconciliation attempt |
 | `RecoveryStagePreservationTests` | a second failure during recovery keeps the publishable stage, so the task stays recoverable and the retry succeeds with zero model calls |
 | `PublishTipFailsClosedTests` | an unreadable remote tip opens no PR, while a confirmed matching tip still publishes |
-| `PublishPendingTransitionTests` | `retry`, pause/unpause, `resume-publish` and re-adding `take-it` never queue an implementation run for finished work, and a legacy `queued` row starts no runtime |
+| `PublishPendingTransitionTests` | `retry`, pause/unpause, `resume-publish` and re-adding `take-it` never queue an implementation run for finished work, a legacy `queued` row starts no runtime, and `resume-publish` exits non-zero when publication fails again |
 | `LiveWorkerPublishPickupTests` | one already-running `Worker` finishes publication on its next poll after `take-it` returns or an `unpause` — zero extra runtime calls, exactly one PR — and a maintainer `pause` is never overtaken by a poll |
 | `MigrationRaceTests` | two processes can migrate the same new database without the loser crashing |
 | `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |

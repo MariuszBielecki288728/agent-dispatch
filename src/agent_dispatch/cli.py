@@ -756,6 +756,11 @@ def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -
     happens. When the worker does hold the lock, the command reports that it has
     re-armed the task and the running worker will finish it — which the worker's
     per-poll pass guarantees.
+
+    Exits 0 only when the work is actually published, or when a live worker holds the
+    lock and has explicitly taken responsibility for the next poll. A second failure
+    leaves the task publish-pending, and says so with a non-zero exit rather than
+    reporting success for an attempt that did not land.
     """
     config.repo(args.repo)  # allowlist check before anything else
     store = Store(config.worker.state_db)
@@ -808,13 +813,59 @@ def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -
             notes = orchestrator.reconcile_publish_pending()
             for note in notes:
                 print(f"publish: {note}")
-            if not notes:
-                print("nothing left to publish")
-            return EXIT_OK
+            return _resume_publish_result(args, store, log, notes)
         finally:
             store.close()
     finally:
         lock.release()
+
+
+def _resume_publish_result(
+    args: argparse.Namespace, store: Store, log: Logger, notes: list[str]
+) -> int:
+    """Report whether the attempted publication actually completed.
+
+    The command promises to *finish* publication, so its exit status has to describe
+    the outcome rather than the attempt. A second failure leaves the task exactly where
+    it was — publish-pending with no owned PR — and reporting shell success for that
+    would be a lie an operator or a script could act on. The durable task state is
+    re-read rather than inferred from ``notes``, which describe what was tried.
+    """
+    task = store.get_task(args.repo, args.issue)
+    if task is None:
+        print(f"{args.repo}#{args.issue}: no task row recorded", file=sys.stderr)
+        return EXIT_FAILURE
+    if task.pr_number is not None:
+        if not notes:
+            # Already published before this attempt: nothing was pending after all.
+            print(f"{task.ref}: nothing left to publish")
+        else:
+            print(f"{task.ref}: publication finished → {task.phase} (PR #{task.pr_number})")
+        return EXIT_OK
+
+    # Still publish-pending with no owned PR: the attempt did not get the work
+    # published, whatever the notes said about it.
+    detail = " ".join(notes[-1:]) if notes else "no progress was recorded"
+    log.error(
+        "publish_incomplete",
+        repo=task.repo,
+        issue=task.issue_number,
+        phase=task.phase,
+        recovery_stage=task.recovery_stage,
+        detail=detail,
+    )
+    print(
+        f"{task.ref}: publication is still incomplete → {task.phase}"
+        + (f" (recovery_stage={task.recovery_stage})" if task.recovery_stage else "")
+        + (
+            ". The task is unchanged and remains recoverable; re-run `agent-dispatch run` "
+            "once the cause is fixed, or let the worker's next poll retry it."
+            if task.is_publish_pending
+            else ". It is not awaiting publication any more; check the note above."
+        ),
+        file=sys.stderr,
+    )
+    return EXIT_FAILURE
 
 
 def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) -> int:

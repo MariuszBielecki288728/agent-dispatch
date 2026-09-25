@@ -3557,6 +3557,60 @@ class PublishPendingTransitionTests(ExecutionCase):
         worker.poll_once()
         self.assert_published_once(live_store, runs_before, branch, session)
 
+    def test_resume_publish_reports_failure_when_publication_fails_again(self) -> None:
+        """A second failure must not be reported as success.
+
+        The command promises to finish publication, so its exit status must describe
+        the *outcome*. With the commit still broken the work cannot be published, the
+        task stays publish-pending, and a zero exit would be a lie a script could act
+        on. Durable state was already correct either way; this is about the report.
+
+        The commit is broken from the start so the **real** run leaves a dirty worktree
+        and parks as `commit_failed` — the fixture has to reach the commit path, not a
+        clean worktree that would publish immediately and never fail.
+        """
+        self.break_commits()
+        self.set_issues(issue(1, "Publish pending", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.recovery_stage, "commit_failed", task.last_error)
+        self.assertIsNone(task.pr_number)
+        runs_before = len(self.recorded_argv())
+        self.assertEqual(runs_before, 1, "exactly one implementation run, from the fixture")
+
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        # Force the second attempt to fail too, exactly like the first.
+        failed = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
+
+        self.assertEqual(
+            failed.returncode,
+            1,
+            f"a failed publication must not exit 0\nstdout:{failed.stdout}\nstderr:{failed.stderr}",
+        )
+        self.assertIn("still incomplete", failed.stderr + failed.stdout)
+        self.assertEqual(len(self.recorded_argv()), runs_before, "no runtime may be started")
+
+        # The durable state stays correct and recoverable — only the report changed.
+        after = store.get_task(self.slug, 1)
+        self.assertIsNone(after.pr_number)
+        self.assertEqual(after.recovery_stage, "commit_failed")
+        self.assertTrue(after.is_publish_pending, "the task must stay recoverable")
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+
+        # Fixing the cause and re-running succeeds, and then does exit 0.
+        self.repair_commits()
+        healed = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(healed.returncode, 0, healed.stdout + healed.stderr)
+        published = store.get_task(self.slug, 1)
+        self.assertEqual(published.phase, "awaiting_review")
+        self.assertIsNotNone(published.pr_number)
+        self.assertEqual(len(self.recorded_argv()), runs_before, "still no runtime call")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
     def test_resume_publish_is_refused_when_nothing_awaits_publication(self) -> None:
         self.set_issues(issue(1, "Nothing pending", labels=[TRIGGER]))
         self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
