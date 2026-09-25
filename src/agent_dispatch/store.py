@@ -75,6 +75,22 @@ RECOVERY_INTERRUPTED = "interrupted"
 #: model call. Deliberately excludes `interrupted`.
 PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RECOVERY_PR_FAILED})
 
+#: The one phase a publish-pending task can correctly be in. Publication is finished
+#: work waiting on a push/PR, so it belongs in the same "needs a human or a
+#: reconciliation pass" bucket as other ambiguous states — never in `queued`, which
+#: means "an implementation run is wanted".
+PUBLISH_PENDING_PHASE = "needs_attention"
+
+#: `recovery_stage` values that mean "do not start a model run". Interpolated into one
+#: SQL predicate below; every member is a module-level constant defined in this file,
+#: never caller input, so the interpolation cannot carry anything user-supplied.
+_PUBLISHABLE_STAGE_SQL = "(" + ", ".join(f"'{stage}'" for stage in sorted(PUBLISHABLE_STAGES)) + ")"
+
+#: SQL predicate: true when this task has finished work awaiting publication, so a
+#: model run must not be started for it. Used by every mutation that could otherwise
+#: turn such a task back into an implementation queue entry.
+_IS_PUBLISH_PENDING = f"recovery_stage IN {_PUBLISHABLE_STAGE_SQL}"
+
 #: Phases with no further automatic transitions.
 TERMINAL_PHASES = frozenset({"finished"})
 
@@ -275,6 +291,16 @@ class Task:
         return self.recovery_stage in PUBLISHABLE_STAGES
 
     @property
+    def is_publish_pending(self) -> bool:
+        """Whether finished work is still awaiting publication.
+
+        Such a task must never be dispatched for implementation: the model already
+        completed and only the push/PR step remains, so starting another run would
+        spend credits twice and let a second run modify work that is already done.
+        """
+        return self.has_publishable_stage
+
+    @property
     def ref(self) -> str:
         return f"{self.repo}#{self.issue_number}"
 
@@ -304,6 +330,13 @@ class Task:
             return False, "Issue is closed"
         if not self.trigger_present:
             return False, "label removed (dispatch intent withdrawn)"
+        if self.is_publish_pending:
+            # Reported before the phase check so the reason is the useful one even if a
+            # stale or hand-edited row also happens to be `queued`.
+            return False, (
+                "finished work is awaiting publication; run publish-only recovery "
+                "(`agent-dispatch run`) instead of another implementation run"
+            )
         if self.has_own_pr:
             return False, f"this worker already owns PR #{self.pr_number}"
         if self.linked_pr_number is not None:
@@ -601,14 +634,28 @@ class Store:
         return self._require(repo, issue_number)
 
     def unpause(self, repo: str, issue_number: int) -> Task:
+        """Release a maintainer pause.
+
+        A task with finished work awaiting publication returns to
+        ``needs_attention`` rather than the implementation queue: unpausing a
+        publish-pending task means "carry on with the publication", and putting it in
+        ``queued`` would let the next poll start a second model run on work that is
+        already done.
+        """
         task = self._require(repo, issue_number)
         if task.phase != "paused":
             raise ValueError(f"{task.ref} is {task.phase}, not paused")
-        self._conn.execute(
-            "UPDATE tasks SET phase = 'queued', pause_reason = NULL, updated_at = ? WHERE id = ?",
-            (utcnow_iso(), task.id),
+        return self._release_to(
+            task, PUBLISH_PENDING_PHASE if task.is_publish_pending else "queued"
         )
-        return self._require(repo, issue_number)
+
+    def _release_to(self, task: Task, phase: str) -> Task:
+        """Move a task out of a paused/parked state to ``phase``, clearing the pause."""
+        self._conn.execute(
+            "UPDATE tasks SET phase = ?, pause_reason = NULL, updated_at = ? WHERE id = ?",
+            (phase, utcnow_iso(), task.id),
+        )
+        return self._require(task.repo, task.issue_number)
 
     def pause_for_withdrawn_label(self, task_id: int, note: str) -> None:
         """Suspend a task because the trigger label was removed.
@@ -627,17 +674,38 @@ class Store:
 
         A maintainer pause is left untouched: only a pause that *this* rule
         created is reversed when the trigger label comes back.
+
+        Publish-pending work is released to ``needs_attention`` instead of ``queued``,
+        for the same reason as :meth:`unpause`: re-adding `take-it` restores
+        *dispatch intent*, but a task whose model run already completed does not need
+        another implementation run — it needs its push/PR finished.
         """
         cursor = self._conn.execute(
-            "UPDATE tasks SET phase = 'queued', pause_reason = NULL, updated_at = ? "
+            f"UPDATE tasks SET phase = CASE WHEN {_IS_PUBLISH_PENDING} THEN ? ELSE 'queued' END, "
+            "pause_reason = NULL, updated_at = ? "
             "WHERE id = ? AND phase = 'paused' AND pause_reason = ?",
-            (utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
+            (PUBLISH_PENDING_PHASE, utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
         )
         return cursor.rowcount > 0
 
     def retry(self, repo: str, issue_number: int) -> Task:
-        """Re-queue a failed/needs_attention task with a cleared attempt budget."""
+        """Re-queue a failed/needs_attention task with a cleared attempt budget.
+
+        Refused for a publish-pending task. ``retry`` means "try the implementation
+        again", which is precisely what must not happen when the model already
+        completed and only publishing failed: it would spend credits twice and let a
+        second run modify work that is already finished. The refusal names the action
+        that does help, so the operator is not left guessing.
+        """
         task = self._require(repo, issue_number)
+        if task.is_publish_pending:
+            raise ValueError(
+                f"{task.ref} has finished work awaiting publication "
+                f"(recovery_stage={task.recovery_stage}); retrying would start a second "
+                "implementation run. Use `agent-dispatch run` (or let the worker's "
+                "startup reconciliation) to finish committing, pushing and opening the "
+                "pull request instead."
+            )
         if task.phase not in RETRYABLE_PHASES:
             raise ValueError(
                 f"{task.ref} is {task.phase}; retry applies to {', '.join(sorted(RETRYABLE_PHASES))} only"
@@ -647,6 +715,20 @@ class Store:
             (utcnow_iso(), task.id),
         )
         return self._require(repo, issue_number)
+
+    def resume_publication(self, repo: str, issue_number: int) -> Task:
+        """Return a paused publish-pending task to publication. Returns the task.
+
+        This is the publish-pending counterpart of :meth:`retry`, for an operator who
+        paused such a task and wants it finished without waiting for a worker poll.
+        """
+        task = self._require(repo, issue_number)
+        if not task.is_publish_pending:
+            raise ValueError(
+                f"{task.ref} has no pending publication "
+                f"(recovery_stage={task.recovery_stage or 'none'}); nothing to resume"
+            )
+        return self._release_to(task, PUBLISH_PENDING_PHASE)
 
     def mark_finished(self, task_id: int, note: str) -> None:
         self._conn.execute(
@@ -783,12 +865,19 @@ class Store:
         statement. A stale ``status`` preview is never what authorizes a run, and a
         task whose label was withdrawn (or whose Issue closed) between the poll and
         the claim must lose the race rather than start an agent.
+
+        A publish-pending task is refused here too. This is the last line of defence:
+        several operator paths (``retry``, ``unpause``, re-adding the trigger label)
+        used to be able to put such a task back into ``queued``, and a row left that
+        way by an older build must not start a second model run on work that already
+        completed.
         """
         now = utcnow_iso()
         cursor = self._conn.execute(
             "UPDATE tasks SET phase = 'running', branch = ?, worktree_path = ?, base_branch = ?, "
             "dispatched_at = ?, updated_at = ? "
             "WHERE id = ? AND phase = 'queued' "
+            f"AND COALESCE({_IS_PUBLISH_PENDING}, 0) = 0 "
             "AND (SELECT COALESCE(issue_state, 'open') FROM observed_state WHERE task_id = tasks.id) "
             "     != 'closed' "
             "AND (SELECT trigger_present FROM observed_state WHERE task_id = tasks.id) = 1",

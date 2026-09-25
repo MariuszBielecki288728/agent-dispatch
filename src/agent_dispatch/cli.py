@@ -151,12 +151,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text in (
         ("pause", "pause a queued task (dispatch intent withdrawn locally)"),
-        ("unpause", "return a paused task to the queue"),
-        ("retry", "re-queue a failed or needs_attention task with a fresh attempt budget"),
+        ("unpause", "release a paused task; publish-pending work returns to publication"),
+        (
+            "retry",
+            "re-queue a failed task with a fresh budget (refused while publication is pending)",
+        ),
     ):
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
         sub.add_argument("--issue", type=int, required=True, help="Issue number")
+
+    resume = subparsers.add_parser(
+        "resume-publish",
+        help="return a paused task whose finished work awaits publication (no model call)",
+    )
+    resume.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
+    resume.add_argument("--issue", type=int, required=True, help="Issue number")
 
     prune_parser = subparsers.add_parser(
         "prune-logs", help="delete run logs beyond worker.run_log_keep"
@@ -201,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         "pause": _cmd_pause,
         "unpause": _cmd_unpause,
         "retry": _cmd_retry,
+        "resume-publish": _cmd_resume_publish,
         "prune-logs": _cmd_prune_logs,
         "setup-labels": _cmd_setup_labels,
     }
@@ -730,6 +741,15 @@ def _cmd_unpause(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
 def _cmd_retry(args: argparse.Namespace, config: Config, log: Logger) -> int:
     return _mutate(args, config, log, "retry")
+
+
+def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Return a paused publish-pending task to publication.
+
+    The publish-pending counterpart of ``retry``: it finishes committing, pushing and
+    opening the PR for work the model already completed, and never starts a runtime.
+    """
+    return _mutate(args, config, log, "resume_publication")
 
 
 def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) -> int:

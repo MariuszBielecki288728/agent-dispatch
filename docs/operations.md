@@ -388,6 +388,7 @@ agent-dispatch enqueue --repo owner/name --issue 12
 agent-dispatch pause   --repo owner/name --issue 12
 agent-dispatch unpause --repo owner/name --issue 12
 agent-dispatch retry   --repo owner/name --issue 12
+agent-dispatch resume-publish --repo owner/name --issue 12
 agent-dispatch prune-logs [--dry-run]
 ```
 
@@ -674,6 +675,25 @@ network problem would permanently destroy the task's recoverability. The dispatc
 re-parks as `interrupted` only when there is no publishable stage to preserve, which is
 the honest answer for genuinely ambiguous work.
 
+### Finished work is never queued for another implementation run
+
+A task whose model run completed and only publishing failed (`commit_failed`,
+`push_failed`, `pr_failed`) must never be turned back into an implementation queue
+entry: the work is done, and a second Command Code run would spend credits twice and
+could modify work that is already finished. Every path that could do that is closed:
+
+| Action | Behaviour for publish-pending work |
+|---|---|
+| `retry` | **Refused**, with the reason and the action that does help. Retrying means "run the implementation again", which is exactly wrong here |
+| `unpause` | Returns the task to `needs_attention` — i.e. "carry on with publication" — not to `queued` |
+| Re-adding `take-it` after a label-withdrawn pause | Restores it to `needs_attention`, not `queued`. The label restores *dispatch intent*, but this task does not need another implementation run |
+| `resume-publish` | Returns a paused publish-pending task to publication, the counterpart of `retry` |
+| Any row left `queued` by an older build | The dispatcher **escalates** it and starts no runtime, and the atomic claim additionally refuses it in SQL |
+
+The normal retry behaviour for a genuinely interrupted or failed runtime (no
+publishable stage) is unchanged, and passing `resume-publish` a task with nothing
+pending is refused rather than silently doing nothing.
+
 The "branch is on the remote" check compares **tips**, not existence. A branch pushed
 by an earlier attempt still exists while pointing at older commits, so an existence
 check would accept a failed push and open a PR without the new work. Publishing
@@ -810,7 +830,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 201 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 209 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -842,6 +862,7 @@ a mock. The cases most worth knowing about:
 | `ReconcileRetryTests` | a transient wrapper outage does not consume the single reconciliation attempt |
 | `RecoveryStagePreservationTests` | a second failure during recovery keeps the publishable stage, so the task stays recoverable and the retry succeeds with zero model calls |
 | `PublishTipFailsClosedTests` | an unreadable remote tip opens no PR, while a confirmed matching tip still publishes |
+| `PublishPendingTransitionTests` | `retry`, pause/unpause, `resume-publish` and re-adding `take-it` never queue an implementation run for finished work, and a legacy `queued` row starts no runtime |
 | `MigrationRaceTests` | two processes can migrate the same new database without the loser crashing |
 | `CommitFailureTests` | a failed commit stops before push and opens no PR, preserving the edits |
 | `WorktreeIdentityTests` | a worktree switched to another branch is detected and never published from |

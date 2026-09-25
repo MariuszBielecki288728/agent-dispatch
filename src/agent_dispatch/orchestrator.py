@@ -238,10 +238,32 @@ class Orchestrator:
             allowed, reason = task.dispatchability()
             if allowed:
                 return task
+            if task.is_publish_pending:
+                # Defensive: a publish-pending row found in `queued` is inconsistent
+                # state (an older build, or a path that forgot the invariant). Repair it
+                # rather than leaving it silently undispatchable forever — and never
+                # start a model run for it.
+                self._escalate_publish_pending(task)
+                continue
             self.log.debug(
                 "task_not_dispatchable", repo=task.repo, issue=task.issue_number, reason=reason
             )
         return None
+
+    def _escalate_publish_pending(self, task: Task) -> None:
+        """Move a mis-phased publish-pending task back to where publication expects it."""
+        detail = (
+            f"needs_attention: found in {task.phase!r} with finished work awaiting "
+            f"publication (recovery_stage={task.recovery_stage}); no implementation run was "
+            "started — publication is finished by the next `agent-dispatch run` or worker start"
+        )
+        self.store.set_phase(task.id, "needs_attention", detail)
+        self.log.warning(
+            "publish_pending_escalated",
+            repo=task.repo,
+            issue=task.issue_number,
+            stage=task.recovery_stage,
+        )
 
     def _revalidate(
         self, task: Task, repo: RepoConfig

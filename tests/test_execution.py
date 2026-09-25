@@ -3336,5 +3336,258 @@ class PublishTipFailsClosedTests(ExecutionCase):
         self.assertIsNotNone(store.get_task(self.slug, 1).pr_number)
 
 
+class PublishPendingTransitionTests(ExecutionCase):
+    """Review round 4: finished work must never be turned back into an implementation.
+
+    The recovery contract introduced in earlier rounds relies on
+    ``recovery_stage in {commit_failed, push_failed, pr_failed}`` meaning "the model
+    already completed; only publishing remains". The operator and label transitions
+    ignored that field, so `retry`, `pause`/`unpause` and remove/re-add `take-it` could
+    each put such a task back into `queued` — where the next poll would start a second
+    Command Code run on work that was already finished, spending credits twice and
+    letting a second run modify finished work.
+    """
+
+    def parked(self, *, stage: str, title: str = "Publish pending") -> tuple:
+        """A real task with a completed run, published branch, and the given stage."""
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        self.set_issues(issue(1, title, labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        config = load_config(self.world.config_path)
+        store = Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        # Park it as if publishing had failed, forgetting the PR so publication is
+        # still outstanding.
+        store.park_for_recovery(task.id, stage=stage, note=f"simulated {stage}")
+        store._conn.execute(
+            "UPDATE tasks SET pr_number = NULL, pr_url = NULL WHERE id = ?", (task.id,)
+        )
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = []
+        self.world.world = world
+        self.world.write_world()
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        return orchestrator, store, config
+
+    # Requested regression 1 ------------------------------------------------------
+
+    def test_retry_is_refused_for_publish_pending_work(self) -> None:
+        orchestrator, store, config = self.parked(stage="push_failed")
+        runs_before = len(self.recorded_argv())
+
+        result = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("awaiting publication", result.stderr + result.stdout)
+        self.assertIn("agent-dispatch run", result.stderr + result.stdout)
+
+        # The refusal must not have queued the task, and no runtime may run.
+        task = store.get_task(self.slug, 1)
+        self.assertNotEqual(task.phase, "queued")
+        self.assertTrue(task.has_publishable_stage, "the stage must survive the refusal")
+
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero additional runtime calls")
+
+        # Publication still completes: exactly one PR, and the stage is cleared.
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number)
+        self.assertIsNone(recovered.recovery_stage)
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
+    # Requested regression 2 ------------------------------------------------------
+
+    def test_pause_and_unpause_do_not_queue_publish_pending_work(self) -> None:
+        orchestrator, store, config = self.parked(stage="commit_failed")
+        runs_before = len(self.recorded_argv())
+
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "paused")
+
+        released = self.run_cli("unpause", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        after = store.get_task(self.slug, 1)
+        self.assertEqual(
+            after.phase,
+            "needs_attention",
+            "unpausing publish-pending work must return it to publication, not the queue",
+        )
+        self.assertTrue(after.has_publishable_stage)
+
+        # No runtime call, and publication still completes exactly once.
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before, "zero additional runtime calls")
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNotNone(recovered.pr_number)
+
+    def test_resume_publish_returns_a_paused_task_to_publication(self) -> None:
+        # The explicit publish-pending counterpart of `retry`.
+        orchestrator, store, config = self.parked(stage="push_failed")
+        runs_before = len(self.recorded_argv())
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        resumed = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "needs_attention")
+
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(len(self.recorded_argv()), runs_before)
+        self.assertIsNotNone(store.get_task(self.slug, 1).pr_number)
+
+    def test_resume_publish_is_refused_when_nothing_awaits_publication(self) -> None:
+        self.set_issues(issue(1, "Nothing pending", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        result = self.run_cli("resume-publish", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no pending publication", result.stderr + result.stdout)
+
+    # Requested regression 3 ------------------------------------------------------
+
+    def test_readding_the_trigger_label_does_not_queue_publish_pending_work(self) -> None:
+        """Withdrawing and re-adding `take-it` must restore publication, not dispatch.
+
+        A worker poll legitimately *completes* publication when it can (that is the
+        self-healing path), so this fixture keeps publication genuinely outstanding by
+        holding the dispatcher's commit broken throughout the label dance. That is what
+        makes the release decision observable: without the fix the task is put back in
+        `queued` and the next poll would start a second implementation run.
+        """
+        self.write_scenario(
+            runs=[{"session_id": "sess-1", "subtype": "success", "edits": {"work.txt": "new\n"}}]
+        )
+        self.set_issues(issue(1, "Publish pending", labels=[TRIGGER]))
+
+        # Break the commit so the run completes but publishing cannot finish: the task
+        # parks as `commit_failed` with the stage preserved.
+        self.world.env_overrides["GIT_AUTHOR_NAME"] = ""
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.recovery_stage, "commit_failed")
+        branch = task.branch
+        session = task.session_id
+        runs_before = len(self.recorded_argv())
+
+        # Withdraw `take-it`: the task pauses, and the reason it is publish-pending
+        # must survive so re-adding the label can restore publication.
+        self.set_issues(issue(1, "Publish pending", labels=[]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        paused = store.get_task(self.slug, 1)
+        self.assertEqual(paused.phase, "paused")
+        self.assertEqual(paused.pause_reason, "label_withdrawn")
+        self.assertEqual(
+            paused.recovery_stage,
+            "commit_failed",
+            "pausing for a withdrawn label must not discard the publish-pending reason",
+        )
+
+        # Re-add it.
+        self.set_issues(issue(1, "Publish pending", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        rearmed = store.get_task(self.slug, 1)
+        self.assertEqual(
+            rearmed.phase,
+            "needs_attention",
+            "re-adding the label must restore publication, not queue an implementation run",
+        )
+        self.assertTrue(rearmed.has_publishable_stage)
+
+        # Fix the cause: publication completes with the SAME branch and session, one PR,
+        # and no additional runtime invocation.
+        self.world.env_overrides.pop("GIT_AUTHOR_NAME", None)
+        self.run_cli("run", "--skip-poll")
+        self.assertEqual(
+            len(self.recorded_argv()), runs_before, "zero additional runtime invocations"
+        )
+        recovered = store.get_task(self.slug, 1)
+        self.assertEqual(recovered.branch, branch, "the owned branch must be reused")
+        self.assertEqual(recovered.session_id, session, "the session must not be replaced")
+        self.assertEqual(recovered.phase, "awaiting_review")
+        self.assertIsNone(recovered.recovery_stage)
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+
+    # Requested regression 4 ------------------------------------------------------
+
+    def test_a_legacy_queued_row_with_a_publishable_stage_never_starts_the_runtime(self) -> None:
+        """Defensive guard: old DB state must not reintroduce the bug.
+
+        A row left `queued` by an older build (or any future mutation that forgets the
+        invariant) must not launch Command Code. The dispatcher escalates it to
+        `needs_attention` so publication finishes instead.
+        """
+        orchestrator, store, config = self.parked(stage="push_failed")
+        # Corrupt the phase exactly as a pre-fix build could have left it.
+        store._conn.execute(
+            "UPDATE tasks SET phase = 'queued' WHERE id = ?", (store.get_task(self.slug, 1).id,)
+        )
+        runs_before = len(self.recorded_argv())
+
+        result = self.run_cli("run", "--skip-poll")
+
+        self.assertEqual(
+            len(self.recorded_argv()), runs_before, "no runtime may start for publish-pending work"
+        )
+        after = store.get_task(self.slug, 1)
+        self.assertNotEqual(after.phase, "running")
+        self.assertIn(after.phase, {"needs_attention", "awaiting_review"})
+        self.assertIn("publish_pending_escalated", result.stderr)
+
+    def test_the_claim_itself_refuses_a_queued_publish_pending_row(self) -> None:
+        # The SQL guard is the last line of defence, so it is asserted directly: even
+        # if a caller skips the higher-level checks, the atomic claim must fail.
+        orchestrator, store, config = self.parked(stage="commit_failed")
+        task = store.get_task(self.slug, 1)
+        store._conn.execute("UPDATE tasks SET phase = 'queued' WHERE id = ?", (task.id,))
+
+        claimed = store.claim_for_run(
+            task.id,
+            branch=task.branch or "b",
+            worktree_path=str(self.tmp / "wt"),
+            base_branch="main",
+        )
+        self.assertFalse(claimed, "the claim must refuse publish-pending work")
+        self.assertEqual(store.get_task(self.slug, 1).phase, "queued")
+
+    def test_normal_retry_behaviour_is_unchanged_for_interrupted_work(self) -> None:
+        # Regression guard for the fix itself: a genuinely failed/interrupted task
+        # (no publishable stage) still retries exactly as before.
+        self.write_scenario(
+            runs=[
+                {"session_id": "sess-1", "subtype": "error", "exit_code": 1},
+                {"session_id": "sess-2", "subtype": "success", "edits": {"ok.txt": "done\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Genuine failure", labels=[TRIGGER]))
+        # One attempt only, so the failure exhausts the budget and the task becomes
+        # `failed` — the phase `retry` exists for. (With budget remaining a failed
+        # attempt stays `queued` on purpose, so the next dispatch retries it without
+        # operator action, and `retry` correctly refuses a queued task.)
+        self.world.write_config(worker_overrides=self.execution_overrides(max_attempts=1))
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "failed")
+        self.assertIsNone(task.recovery_stage, "a failed run leaves no publishable stage")
+        self.assertFalse(task.has_publishable_stage)
+
+        # `retry` must still work for this case.
+        self.assertEqual(self.run_cli("retry", "--repo", self.slug, "--issue", "1").returncode, 0)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "queued")
+        self.assertEqual(store.get_task(self.slug, 1).attempts, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
