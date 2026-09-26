@@ -17,20 +17,26 @@ Built for a single trusted personal development VM. Deliberately small: **simpli
 | MVP foundation: service, polling, queue | #3 | ✅ Merged — see [`docs/operations.md`](docs/operations.md) |
 | Developer tooling: uv, Ruff, pre-commit | #14 | ✅ Implemented — see [`docs/operations.md` §2](docs/operations.md) |
 | MVP execution: worktree, session, PR | [#4](https://github.com/MariuszBielecki288728/agent-dispatch/issues/4) | ✅ Implemented — see [`docs/operations.md` §0–§12](docs/operations.md) |
-| Review loop: feedback collection, handoff | #5 | Planned |
+| Review loop: feedback collection, handoff | [#5](https://github.com/MariuszBielecki288728/agent-dispatch/issues/5) | ✅ Implemented — see [`docs/operations.md` §16](docs/operations.md) |
 | Operational release and pilot | #6 | Planned |
 
-**Implemented today: the full one-task loop, Issue → PR.**
+**Implemented today: the full one-task loop, Issue → PR → review rounds.**
 One installable Python package, one CLI entry point, one polling loop, one SQLite
 database, one single-instance lock, and **no third-party dependencies** (stdlib
 `tomllib`/`sqlite3`/`fcntl`). A queued `take-it` Issue is implemented by Command
 Code in a task-owned Git worktree, validated, committed, pushed, and opened as
-exactly one PR owned by that task, then it waits for review.
+exactly one PR owned by that task. Adding the `agent:fix` label to that PR resumes
+the **same session** for one consolidated batch of feedback.
 
 ```
 poll -> queue -> claim (conditional SQL) -> worktree + branch
      -> Command Code run (pinned model/effort/--yolo, bounded turns, wall-clock cap)
      -> validate the stream -> push -> one PR -> awaiting_review
+
+review PR, add `agent:fix` to the PR
+     -> claim one round + snapshot its feedback -> clear the label
+     -> resume the SAME session in the SAME worktree -> validate -> push to the SAME PR
+     -> acknowledge that feedback -> awaiting_review
 ```
 
 What it will **not** do, on purpose:
@@ -43,10 +49,14 @@ What it will **not** do, on purpose:
   is recorded as an observation (`obs#N`), never as owned (`own#N`).
 - **It never resumes an interrupted run.** Command Code writes a transcript only on
   clean completion, so a retry starts a *fresh* session in the same worktree with
-  the existing edits preserved, and says so.
+  the existing edits preserved, and says so. For the same reason a review handoff is
+  **refused** when there is no cleanly completed session, rather than quietly
+  starting a different conversation.
 
-The `agent:fix` review loop is #5 and is documented as future work rather than
-stubbed.
+**The review loop is implemented and needs an explicit handoff.** Review comments
+alone never start an agent work; the `agent:fix` label on an open PR this task owns
+does. See [§16 of the operations guide](docs/operations.md) for the exact workflow,
+including how to ask for a second round.
 
 **`status`, `dry-run` and `open` never write and never start an agent.** They read a
 read-only snapshot, and `status`/`dry-run` simulate the poll in scratch memory, so
@@ -131,9 +141,19 @@ one, `dry-run` writing nothing, and state/log placement outside every repository
 
 Removing it suspends dispatch but keeps the task row, branch and worktree; re-adding it makes the **same** row dispatchable again. An explicit maintainer `pause` is separate and is never released automatically.
 
-**`agent:fix`** on a PR is an explicit handoff. It queues **exactly one** consolidated follow-up round that resumes the task's existing session on the existing branch. This is #5 scope and is **not** implemented yet.
+**`agent:fix`** on a PR is an explicit handoff. It starts **exactly one** consolidated
+follow-up round that resumes the task's existing session on the existing branch and
+pushes to the same PR. The label must be on an **open PR this task owns**.
 
-> PR review comments alone **never** start an agent. Reviewer and implementer may share the same GitHub account, so role is never inferred from login and the agent's own replies never re-trigger work.
+> PR review comments alone **never** start an agent. Reviewer and implementer may
+> share the same GitHub account, so role is never inferred from login and the
+> agent's own replies never re-trigger work.
+
+> **One label, one round.** The round and its feedback snapshot are recorded before
+the label is removed, so a crash cannot lose the handoff. A label that is simply **left
+in place is not a standing request for more rounds** — remove it and add it again for
+another round. Without that rule every poll would start a round against feedback that
+was already applied.
 
 `take-it` and `agent:fix` do not appear automatically: create them deliberately,
 and only in an allowlisted repository, with

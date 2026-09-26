@@ -112,12 +112,23 @@ STATE_PAUSED = "Paused"
 STATE_FAILED = "Failed"
 STATE_INTERRUPTED = "Interrupted"
 STATE_FINISHED = "Finished"
+#: Review round (#5). ``Applying feedback`` is the review counterpart of
+#: ``Running``: the resumed Command Code session is working through one consolidated
+#: batch of PR feedback. ``Publishing feedback changes`` is the counterpart of
+#: ``Publishing``: the turn is done and only the push to the existing PR remains.
+#: They are separate strings from the implementation states on purpose — a maintainer
+#: reading the comment must be able to tell a first implementation from a review round
+#: without knowing what the task's history happens to be.
+STATE_APPLYING_FEEDBACK = "Applying feedback"
+STATE_PUBLISHING_FEEDBACK = "Publishing feedback changes"
 
 ALL_STATES = (
     STATE_QUEUED,
     STATE_STARTING,
     STATE_RUNNING,
     STATE_PUBLISHING,
+    STATE_APPLYING_FEEDBACK,
+    STATE_PUBLISHING_FEEDBACK,
     STATE_AWAITING_REVIEW,
     STATE_RECOVERING,
     STATE_NEEDS_ATTENTION,
@@ -129,11 +140,19 @@ ALL_STATES = (
 
 #: States that assert an agent process is in flight. Only a live dispatcher writes
 #: these, so finding one persisted at startup means a previous heartbeat went stale.
-LIVE_STATES = frozenset({STATE_STARTING, STATE_RUNNING})
+LIVE_STATES = frozenset({STATE_STARTING, STATE_RUNNING, STATE_APPLYING_FEEDBACK})
 
 #: States whose presence in the database means "a status was being updated when the
 #: process disappeared", which is what the reconcile pass has to announce.
-STALE_PRONE_STATES = frozenset({STATE_STARTING, STATE_RUNNING, STATE_PUBLISHING})
+STALE_PRONE_STATES = frozenset(
+    {
+        STATE_STARTING,
+        STATE_RUNNING,
+        STATE_PUBLISHING,
+        STATE_APPLYING_FEEDBACK,
+        STATE_PUBLISHING_FEEDBACK,
+    }
+)
 
 #: Added when a status is re-derived after a process died, so a reader is never left
 #: believing a stale "Running" was current.
@@ -169,6 +188,26 @@ _PUBLICATION_NEXT_ACTION = {
 _DEFAULT_PUBLICATION_NEXT_ACTION = (
     "The model finished and publication is incomplete. The dispatcher will finish committing, "
     "pushing and opening the pull request on its next pass — no further model run."
+)
+
+#: Next-action text for the review-round states. Templates owned by this module, like
+#: every other string a status comment may contain.
+_REVIEW_APPLYING_NEXT_ACTION = (
+    "The original Command Code session is working through one consolidated batch of pull "
+    "request feedback, in the same worktree and on the same branch. Only a "
+    "maintainer-added review-handoff label starts this; comments on their own never do."
+)
+
+_REVIEW_PUBLISHING_NEXT_ACTION = (
+    "Committing and pushing the review round's changes to the existing pull request. "
+    "No further model run is involved."
+)
+
+_REVIEW_UNFINISHED_NEXT_ACTION = (
+    "A review round is unfinished, so the pull request does not yet carry its changes and "
+    "the feedback it was given stays unacknowledged. The dispatcher finishes the push on a "
+    "later pass without another model run; if the round's agent turn failed, a maintainer "
+    "decision is needed first."
 )
 
 _FOOTER = (
@@ -242,7 +281,7 @@ def format_elapsed(seconds: int | None) -> str | None:
     return f"{minutes} min"
 
 
-def describe_task(task: Task) -> tuple[str, str | None]:
+def describe_task(task: Task, *, review_pending: bool = False) -> tuple[str, str | None]:
     """The state label and next action for a durable task row.
 
     This is the **only** place a status comment's state is derived from stored
@@ -263,6 +302,13 @@ def describe_task(task: Task) -> tuple[str, str | None]:
       worker's own PR already exists, so no further implementation run will happen
       for it. This is the state a remove-then-re-add of the trigger label leaves
       behind.
+
+    ``review_pending`` narrows that second rule for the review loop (#5). An owned PR
+    is *not* enough to claim awaiting review while a review round for this task is
+    still unfinished: the PR exists, but the round's changes are not on it, and its
+    feedback has not been acknowledged. Whoever knows a round is open — the round's own
+    publisher, and :meth:`StatusPublisher.sync_from_task` reading the store — passes
+    this so the comment says what is actually true.
     """
     if task.phase == "paused":
         if task.pause_reason == PAUSE_MAINTAINER:
@@ -277,6 +323,12 @@ def describe_task(task: Task) -> tuple[str, str | None]:
 
     if task.phase == "finished":
         return STATE_FINISHED, None
+
+    if review_pending:
+        # An unfinished review round, reported whichever phase it parked in. It is never
+        # `Awaiting review` (the round is not done) and never `Queued` (no
+        # implementation run is wanted).
+        return STATE_NEEDS_ATTENTION, _REVIEW_UNFINISHED_NEXT_ACTION
 
     if task.is_publish_pending:
         # Finished model work waiting on commit/push/PR. Never an implementation run,
@@ -295,7 +347,9 @@ def describe_task(task: Task) -> tuple[str, str | None]:
     if task.pr_number is not None:
         return STATE_AWAITING_REVIEW, (
             f"Pull request #{task.pr_number} is this task's published work. Waiting for a human "
-            "to review and merge; no further agent work starts on its own."
+            "to review. Review comments alone do NOT start agent work: add the configured "
+            "review-handoff label (`agent:fix` by default) to the pull request to ask for one "
+            "consolidated round of fixes on the same conversation."
         )
 
     if task.phase == "awaiting_review":
@@ -367,13 +421,22 @@ class StatusView:
     events_observed: int | None = None
     pr_number: int | None = None
     pr_url: str | None = None
+    #: Which review round the comment is about, when it is about one (#5). Rendered
+    #: as a plain integer; no round content is ever echoed here.
+    review_round: int | None = None
     next_action: str | None = None
     note: str | None = None
 
     @property
     def live(self) -> bool:
         """Whether volatile status timestamps belong in this render."""
-        return self.state in {STATE_STARTING, STATE_RUNNING, STATE_PUBLISHING}
+        return self.state in {
+            STATE_STARTING,
+            STATE_RUNNING,
+            STATE_PUBLISHING,
+            STATE_APPLYING_FEEDBACK,
+            STATE_PUBLISHING_FEEDBACK,
+        }
 
     @property
     def runtime_live(self) -> bool:
@@ -382,9 +445,12 @@ class StatusView:
         Narrower than :attr:`live` on purpose. ``Publishing`` means the runtime has
         already stopped cleanly and publication is what is in flight, so the process
         block must not appear at all: rendering it there said "not started yet",
-        which is the opposite of what actually happened.
+        which is the opposite of what actually happened. ``Applying feedback`` is
+        genuinely live — the resumed session is running — while
+        ``Publishing feedback changes`` is the review counterpart of ``Publishing``
+        and inherits the same exclusion.
         """
-        return self.state in {STATE_STARTING, STATE_RUNNING}
+        return self.state in {STATE_STARTING, STATE_RUNNING, STATE_APPLYING_FEEDBACK}
 
 
 def task_view(
@@ -400,6 +466,7 @@ def task_view(
     now: str | None = None,
     max_attempts: int | None = None,
     interrupted: bool = False,
+    review_pending: bool = False,
 ) -> StatusView:
     """Build the view for a task row, optionally overriding the derived state.
 
@@ -411,10 +478,13 @@ def task_view(
     (:meth:`~agent_dispatch.store.Store.last_run_interrupted`), not from a note that
     happened to be in scope. That is what makes the stale-heartbeat explanation
     survive a restart and appear on every later synchronisation instead of only once.
+
+    ``review_pending`` says an unfinished review round owns this task, which stops an
+    owned PR from making the comment claim ``Awaiting review`` (#5).
     """
     if interrupted and not state:
         state = STATE_INTERRUPTED
-    derived_state, derived_action = describe_task(task)
+    derived_state, derived_action = describe_task(task, review_pending=review_pending)
     resolved_state = state or derived_state
     clock = now or utcnow_iso()
     started = run_started_at or (task.last_run_at if resolved_state in LIVE_STATES else None)
@@ -450,6 +520,10 @@ def task_view(
         events_observed=events_observed,
         pr_number=task.pr_number,
         pr_url=task.pr_url,
+        # The round the task is on, from the row, so a terminal render says which review
+        # round produced the current state. `None` when no round has ever been claimed,
+        # which is the honest answer for a task that was never handed off.
+        review_round=task.review_round or None,
         next_action=next_action if next_action is not None else derived_action,
         note=note,
     )
@@ -519,6 +593,9 @@ def render_comment(view: StatusView) -> str:
         else:
             lines.append(f"- **Pull request:** #{view.pr_number}")
 
+    if view.review_round:
+        lines.append(f"- **Review round:** {view.review_round}")
+
     if view.next_action:
         lines.append(f"- **Next:** {view.next_action}")
     if view.note:
@@ -585,6 +662,10 @@ class StatusPublisher:
         #: unprovable, so nothing may be created.
         self._scan_unprovable = False
         self._create_refused_logged = False
+        # Invalidate the scratch-owned `_run_started_at`, which belongs to the process,
+        # not to the publisher: a second publisher built for a later task in the same
+        # process must not inherit the previous task's start time.
+        self._run_started_at: str | None = None
 
     # ------------------------------------------------------------------ facts
 
@@ -665,6 +746,12 @@ class StatusPublisher:
         periodic synchronisation pass costs nothing on GitHub while nothing is
         running. Safe to call for any task, including one no comment was ever created
         for — in that case it is a no-op rather than a new comment.
+
+        An unfinished review round is read out of the store here rather than passed in,
+        because this method is the one every path funnels through — the poll pass, the
+        CLI mutations, the round's own completion. Deriving it in one place is what
+        stops a caller from forgetting it and rendering ``Awaiting review`` for a round
+        whose changes are not published.
         """
         row = self.recorded()
         if row is None:
@@ -674,26 +761,107 @@ class StatusPublisher:
             # Derived from run history every time, so the explanation is present on
             # every later pass rather than only in the call that first noticed.
             note = STALE_HEARTBEAT_NOTE
+        open_round = self._store.open_round(task.id)
         view = task_view(
-            task, note=note, max_attempts=self._max_attempts or None, interrupted=interrupted
+            task,
+            note=note,
+            max_attempts=self._max_attempts or None,
+            interrupted=interrupted,
+            review_pending=open_round is not None,
         )
         return self._publish_and_record(view, allow_create=True)
 
-    def heartbeat_view(self, task: Task, *, attempt: int, run_started_at: str) -> StatusView:
+    # ----------------------------------------------------- review round (#5)
+
+    def begin_review(self, task: Task, *, round_number: int) -> bool:
+        """Publish ``Applying feedback`` before the resumed session is spawned.
+
+        Same position in the lifecycle as ``Starting`` — after the claim, before the
+        spawn — and the same ownership row is written first, so a crash here is
+        recovered by marker scan rather than by posting a second comment. The state is
+        distinct from ``Running`` so a maintainer can tell that the work in flight is a
+        review round on an existing PR, not a first implementation.
+        """
+        self._store.note_status_intent(
+            repo=self._repo,
+            issue_number=self._issue,
+            task_id=task.id,
+            state=STATE_APPLYING_FEEDBACK,
+        )
+        self._run_started_at = utcnow_iso()
+        view = task_view(
+            task,
+            state=STATE_APPLYING_FEEDBACK,
+            run_started_at=self._run_started_at,
+            max_attempts=self._max_attempts or None,
+            next_action=_REVIEW_APPLYING_NEXT_ACTION,
+        )
+        view = replace(view, review_round=round_number)
+        return self._publish_and_record(view, allow_create=True)
+
+    def publishing_review(self, task: Task, *, round_number: int) -> bool:
+        """Publish ``Publishing feedback changes``: the round's turn stopped cleanly.
+
+        Deliberately distinct from ``Publishing`` and from ``Awaiting review``: the
+        model is done, the changes are not on the pull request yet, and no further model
+        work is involved in finishing them.
+        """
+        view = task_view(
+            task,
+            state=STATE_PUBLISHING_FEEDBACK,
+            run_started_at=self._run_started_at,
+            max_attempts=self._max_attempts or None,
+            next_action=_REVIEW_PUBLISHING_NEXT_ACTION,
+        )
+        view = replace(view, review_round=round_number)
+        return self._publish_and_record(view, allow_create=False)
+
+    def review_unfinished(self, task: Task, *, round_number: int, note: str | None) -> bool:
+        """Publish a parked or retrying review-round state, derived from the row.
+
+        Reads the state out of durable task state rather than asserting one here: the
+        two reasons a round ends unfinished — retryable publication, or a failed turn —
+        leave the task in different phases, and this renderer must agree with whatever
+        the database actually says. Round number and note are layered on top, and
+        ``review_pending`` stops an owned PR from making the comment claim
+        ``Awaiting review`` for a round that has not published.
+        """
+        return self.sync_from_task(task, note=note)
+
+    def heartbeat_view(
+        self,
+        task: Task,
+        *,
+        attempt: int,
+        run_started_at: str,
+        live_state: str = STATE_STARTING,
+        review_round: int | None = None,
+    ) -> StatusView:
         """The base view the heartbeat thread mutates for each tick.
 
         Built once, on the owning thread, from an immutable snapshot: the heartbeat
         never re-reads the task row, so it cannot race a concurrent write, and it
         cannot report metadata that changed underneath it.
+
+        ``live_state``/``review_round`` let a review round's heartbeat render
+        ``Applying feedback`` rather than a generic ``Running``/``Starting``: a tick
+        that published the implementation state would tell the maintainer the wrong
+        thing about work that is, in fact, a review round.
         """
         view = task_view(
             task,
-            state=STATE_STARTING,
+            state=live_state,
             run_started_at=run_started_at,
             process_alive=False,
             max_attempts=self._max_attempts or None,
         )
-        return replace(view, attempt=attempt, model=task.runtime_model, effort=task.runtime_effort)
+        return replace(
+            view,
+            attempt=attempt,
+            model=task.runtime_model,
+            effort=task.runtime_effort,
+            review_round=review_round,
+        )
 
     # -------------------------------------------------------------- transport
 
@@ -978,6 +1146,7 @@ class RunHeartbeat:
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], str] = utcnow_iso,
         poll_seconds: float = 0.05,
+        running_state: str = STATE_RUNNING,
     ) -> None:
         self._publisher = publisher
         self._base_view = base_view
@@ -986,6 +1155,10 @@ class RunHeartbeat:
         self._clock = clock
         self._now = now
         self._poll = max(poll_seconds, 0.001)
+        #: The state one tick publishes. ``Running`` for an implementation run;
+        #: ``Applying feedback`` for a review round, so a heartbeat never relabels a
+        #: review round as the implementation it is not.
+        self._running_state = running_state
         self._stop = threading.Event()
         self._spawned = threading.Event()
         self._state_lock = threading.Lock()
@@ -1104,7 +1277,7 @@ class RunHeartbeat:
             events = self._events_observed
         view = replace(
             self._base_view,
-            state=STATE_RUNNING,
+            state=self._running_state,
             process_alive=True,
             last_checked_at=self._now(),
             last_event_at=last_event_at,

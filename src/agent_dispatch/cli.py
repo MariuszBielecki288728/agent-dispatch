@@ -12,12 +12,14 @@ Operator surface for Issues #3–#4:
 | ``open`` | Print the owned branch, worktree, session and PR for a task |
 | ``enqueue`` | Queue a labelled Issue now, without waiting for the next poll |
 | ``pause`` / ``unpause`` / ``retry`` | Act on a queued task |
+| ``resume-publish`` | Finish a publication the model already produced (no model call) |
+| ``review`` | Start one review round for a PR that carries the handoff label (#5) |
 | ``prune-logs`` | Bounded retention for run logs |
 | ``setup-labels`` | Explicit, idempotent, maintainer-invoked label creation |
 
-Review-loop commands (``agent:fix`` handoff, feedback rounds) are intentionally
-absent: that is Issue #5, and stubbing them with a fake success would be worse
-than their absence.
+The ``agent:fix`` review loop (#5) is implemented here: the label on an **open PR
+this task owns** is the only thing that starts a round, and review comments on their
+own never do.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from .enqueue import enqueue_issue
 from .github import GitHubClient, GitHubError
 from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
-from .orchestrator import OUTCOME_BLOCKED, Orchestrator
+from .orchestrator import OUTCOME_BLOCKED, OUTCOME_REVIEW_DONE, Orchestrator
 from .runlogs import prune
 from .store import Store, phase_summary
 from .worker import PollOutcome, Worker
@@ -168,6 +170,24 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--repo", required=True, help="allowlisted repository (owner/name)")
     resume.add_argument("--issue", type=int, required=True, help="Issue number")
 
+    review = subparsers.add_parser(
+        "review",
+        help=(
+            "start one review round now for a task whose PR carries the review-handoff label "
+            "(resumes the original session; takes the single-instance lock)"
+        ),
+    )
+    review.add_argument("--repo", help="allowlisted repository (owner/name)")
+    review.add_argument("--issue", type=int, help="Issue number to review")
+    review.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "report which handoffs are pending and what each round would carry, without "
+            "claiming a round, clearing a label or starting an agent"
+        ),
+    )
+
     prune_parser = subparsers.add_parser(
         "prune-logs", help="delete run logs beyond worker.run_log_keep"
     )
@@ -212,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         "unpause": _cmd_unpause,
         "retry": _cmd_retry,
         "resume-publish": _cmd_resume_publish,
+        "review": _cmd_review,
         "prune-logs": _cmd_prune_logs,
         "setup-labels": _cmd_setup_labels,
     }
@@ -560,6 +581,15 @@ def _cmd_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
             # Crash recovery before any new work: an orphaned `running` row, or a
             # branch/PR created but not confirmed, is repaired from evidence
             # instead of being repeated.
+            #
+            # Review rounds first, for the ordering reason the worker documents: this
+            # pass settles a round whose turn already ran, and the implementation passes
+            # would misread an open round as an implementation crash — requeuing a
+            # killed review turn as a fresh implementation run, or publishing its
+            # partial work without acknowledging the feedback. This command is where
+            # that matters most, because nothing else here runs the review pass.
+            for note in orchestrator.reconcile_review_rounds():
+                print(f"review reconcile: {note}")
             for note in orchestrator.reconcile():
                 print(f"reconcile: {note}")
 
@@ -864,6 +894,165 @@ def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -
             store.close()
     finally:
         lock.release()
+
+
+# ------------------------------------------------------------------- review
+
+
+def _cmd_review(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Start one review round for a task whose PR carries the handoff label.
+
+    Structured exactly like ``run``: same single-instance lock, same shared code
+    path, and the same "reconcile first, then act" order. The lock matters here for
+    the same reason it does for ``run`` — a review round resumes a session in a task's
+    worktree, and the MVP allows exactly one agent at a time globally. A second
+    process doing this concurrently would put two writers in one worktree.
+
+    ``--dry-run`` reports what each pending handoff *would* carry and claims nothing,
+    so an operator can check why a label that is visibly present is not starting a
+    round without consuming the handoff. It opens the database read-only, so it cannot
+    create or migrate state either.
+    """
+    if args.repo is not None:
+        config.repo(args.repo)  # allowlist check before anything else
+    if args.dry_run:
+        return _review_dry_run(args, config, log)
+
+    lock = WorkerLock(
+        config.worker.lock_file,
+        command=f"agent-dispatch review --config {config.source_path}",
+    )
+    try:
+        lock.acquire()
+    except LockBusyError as exc:
+        log.error(
+            "lock_busy",
+            path=str(exc.path),
+            holder=str(exc.holder),
+            detail="a worker or run holds the lock; refusing to start a second agent",
+        )
+        return EXIT_BUSY
+
+    store = Store(config.worker.state_db)
+    try:
+        client = GitHubClient(config.github.command)
+        try:
+            client.check_available()
+        except GitHubError as exc:
+            log.error("review_failed", kind=exc.kind, error=str(exc))
+            return EXIT_FAILURE
+
+        orchestrator = Orchestrator(config, store, client, log)
+
+        # Crash recovery first, exactly as `run` does: a round interrupted by a dead
+        # process must be settled before a new one is considered, or the new round
+        # would start on top of a task whose state another round still owns.
+        for note in orchestrator.reconcile_review_rounds():
+            print(f"review reconcile: {note}")
+        for note in orchestrator.reconcile_publish_pending():
+            print(f"publish reconcile: {note}")
+
+        if args.issue is not None:
+            if args.repo is None:
+                print("--issue requires --repo so the task can be identified", file=sys.stderr)
+                return EXIT_USAGE
+            task = store.get_task(args.repo, args.issue)
+            if task is None:
+                print(f"{args.repo}#{args.issue}: no task row recorded", file=sys.stderr)
+                return EXIT_FAILURE
+            outcomes = [orchestrator.dispatch_review_round(task)]
+        else:
+            outcomes = orchestrator.dispatch_review_rounds(only_repo=args.repo)
+
+        if not outcomes:
+            print("no task has a pending review handoff (label present, round not yet claimed)")
+            return EXIT_OK
+
+        code = EXIT_OK
+        for outcome in outcomes:
+            print(f"result: {outcome.summary()}")
+            for note in outcome.notes:
+                print(f"  note: {note}")
+            if outcome.run is not None:
+                for name, ok in outcome.run.validation.checks.items():
+                    print(f"  check {name}: {'pass' if ok else 'FAIL'}")
+                if outcome.run.log_path is not None:
+                    print(f"  run log: {outcome.run.log_path}")
+            if outcome.action == OUTCOME_REVIEW_DONE:
+                continue
+            if outcome.action == OUTCOME_BLOCKED:
+                # Deferrals and skips are not failures: nothing was attempted because
+                # nothing was ready. Reporting a non-zero exit for "the label is not
+                # there yet" would make a scheduled invocation look broken.
+                continue
+            code = EXIT_FAILURE
+        return code
+    finally:
+        store.close()
+        lock.release()
+        log.info("lock_released", path=str(config.worker.lock_file))
+
+
+def _review_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Report pending handoffs and what each round would carry. Claims nothing.
+
+    Reads through the read-only store, so it cannot create, migrate or write the state
+    database — the same guarantee ``status`` and ``dry-run`` provide. Nothing is
+    claimed, no label is cleared, and no agent is started; the decision is recomputed
+    from live GitHub state exactly as a real round would see it.
+    """
+
+    store = Store.open_read_only(config.worker.state_db)
+    try:
+        client = GitHubClient(config.github.command, timeout_seconds=30.0)
+        try:
+            client.check_available()
+        except GitHubError as exc:
+            print(f"cannot reach the GitHub wrapper: {exc.kind}: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+
+        orchestrator = Orchestrator(config, store, client, log, status=False)
+        tasks = [
+            task
+            for task in store.list_tasks(args.repo)
+            if task.phase == "awaiting_review" and not task.is_terminal
+        ]
+        if not tasks:
+            print("no task is awaiting review, so no handoff can be pending")
+            return EXIT_OK
+
+        pending = 0
+        for task in tasks:
+            decision = orchestrator.review_loop().evaluate(task, config.repo(task.repo))
+            print(f"{task.ref}: {decision.action} ({decision.reason})")
+            print(f"  {decision.message}")
+            if decision.claimed:
+                pending += 1
+                new = sorted(decision.claimed)
+                print(
+                    f"  would claim {len(new)} feedback item(s), new since the acknowledged cursor:"
+                )
+                print(f"    {len(new)} item id(s) recorded in the round snapshot")
+                print(f"  would resume session {decision.session_id}")
+                print(f"  would push to PR #{decision.pr_number} on branch {task.branch}")
+            for note in decision.notes:
+                print(f"  note: {note}")
+        print()
+        if pending:
+            print(
+                f"{pending} handoff(s) ready. Run `agent-dispatch review` (without --dry-run) to "
+                "start at most one round."
+            )
+        else:
+            print(
+                "No handoff is claimable right now. A round needs the review-handoff label on an "
+                "OPEN PR this task owns, new or edited feedback since the last round, and a cleanly "
+                "completed session. A label left in place is not a repeated request: remove it and "
+                "add it again for another round."
+            )
+        return EXIT_OK
+    finally:
+        store.close()
 
 
 def _resume_publish_result(
