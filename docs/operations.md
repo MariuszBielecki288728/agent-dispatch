@@ -1,9 +1,9 @@
-# agent-dispatch — operations (Issues #3–#4, #17)
+# agent-dispatch — operations (Issues #3–#5, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
-SQLite queue, and **one Command Code run per task in a task-owned Git worktree,
-ending in exactly one pull request**. The `agent:fix` review loop is Issue #5 and
-is not implemented here (§11).
+SQLite queue, and **one Command Code session per task** in a task-owned Git
+worktree — finishing in exactly one pull request, and continuing in that same
+session for explicit review rounds (`agent:fix`, §16).
 
 ---
 
@@ -22,16 +22,30 @@ one PR created (or an existing one adopted)  -> phase `awaiting_review`
                                        -> same comment becomes `Awaiting review`
 ```
 
+Then, if you review the PR and want changes:
+
+```
+add the `agent:fix` label to the PR    -> one round is claimed and recorded
+label removed (the round owns it)      -> the SAME session resumes in the SAME worktree
+                                       -> comment becomes `Applying feedback`
+the round's turn completes cleanly     -> comment becomes `Publishing feedback changes`
+changes pushed to the SAME PR          -> comment becomes `Awaiting review`
+                                       -> the feedback is acknowledged, once
+```
+
 Three things a reader should not assume:
 
 * **`--yolo` is a trust choice, not a sandbox.** The agent runs as your user with
   broad file and shell access. A worktree is Git isolation only — see §12.
 * **A `subtype=success` exit is not proof of work.** A run whose tool calls were
   refused still reports success with exit 0. `agent-dispatch` scans for the
-  `tool_hook_blocked` event and fails the run (§9).
+  `tool_hook_blocked` event and fails the run (§9). A blocked *review* round fails
+  the same way, and acknowledges nothing (§16).
 * **An interrupted run is not resumable.** Command Code writes a session
   transcript only on a clean completion, so a retry starts a *fresh* session in the
-  same worktree with the existing edits preserved (§7).
+  same worktree with the existing edits preserved (§7). For the same reason the
+  review loop **refuses** a handoff when there is no cleanly completed session
+  rather than silently starting a new conversation (§16).
 
 ---
 
@@ -392,6 +406,8 @@ agent-dispatch pause   --repo owner/name --issue 12
 agent-dispatch unpause --repo owner/name --issue 12
 agent-dispatch retry   --repo owner/name --issue 12
 agent-dispatch resume-publish --repo owner/name --issue 12
+agent-dispatch review                  # start one review round now (§16)
+agent-dispatch review --dry-run        # what each pending handoff would carry
 agent-dispatch prune-logs [--dry-run]
 ```
 
@@ -421,6 +437,8 @@ orchestrator holding a writable store.
 | `worker --once --no-execute` | — | yes | **yes** | no |
 | `enqueue` / `pause` / `unpause` / `retry` | — | yes (`enqueue` only) | **yes** | no |
 | `resume-publish` | — | yes | **yes** | no |
+| `review --dry-run` | on-disk state (read-only connection) | yes (read-only) | nothing | no |
+| `review` | — | yes | **yes** | **yes** |
 | `worker` | — | yes | **yes** | **yes** |
 | `run` | — | yes | **yes** | **yes** |
 
@@ -500,7 +518,9 @@ unchanged and still recoverable either way; only the report differs.
 ## 7. What `status` means
 
 Phases: `queued`, `running`, `awaiting_review`, `paused`, `failed`,
-`needs_attention`, `finished`. (`feedback_queued` arrives with #5.)
+`needs_attention`, `finished`. (`feedback_queued` is reserved: a claimed review round
+is recorded in `review_rounds` and started immediately, so the phase is not used as an
+intermediate — see §16.)
 
 A task is **dispatchable** only when the Issue is open, it still carries `take-it`,
 no relevant PR already exists for it, this worker does not already own a PR for it,
@@ -1093,6 +1113,14 @@ a mock. The cases most worth knowing about:
 | `MarkerRecoveryTests` | a crash between comment creation and recording its ID reuses the marked comment, ending with exactly one |
 | `NonFatalDeliveryTests` | an edit timeout / rate limit / denied write leaves the run result correct, logs a warning, and creates no duplicate |
 | `ReadOnlyTests` | `status`/`dry-run` never create or edit a comment and never start a runtime |
+| `OneRoundPerHandoffTests` | the label starts exactly one round in the original session; comments alone start nothing; a label left in place after a claim is inert; remove-and-re-add queues exactly one more round; a handoff with no new feedback is deferred rather than consumed |
+| `FeedbackIngestionTests` | a conversation comment, an inline comment and reply, a submitted review and an edited comment are consolidated into one instruction; the dispatcher's own status comment is never fed back; a shared reviewer/implementer login is never filtered; feedback added during a round belongs to the next one |
+| `FailingClosedTests` | a truncated feedback listing, a missing session, a closed/merged PR, a foreign PR, a withdrawn `take-it`, a paused task and a blocked-tool round all refuse or defer with the feedback neither lost nor acknowledged |
+| `ReviewPublicationTests` | a failed push/PR step is finished on a later pass with the **same PR** and **zero** extra runtime calls, and only then does the cursor advance; a no-op round is accepted; a failed commit parks with its own stage |
+| `ReviewHandoffCrashTests` | a failed label removal cannot start a second round; a claimed-but-unstarted round is re-driven; a round from a dead process is parked with no new model call; a restart after publication leaves exactly one applied round with the same PR and cursor |
+| `FinalisationAtomicityTests` | the handover is one SQLite transaction (asserted on the statement trace), and a failure inside it rolls back every coupled fact |
+| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
+| `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -1118,22 +1146,190 @@ uv lock                                  # refresh it deliberately
 ## 15. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
-Issues #5/#6 and are **not implemented, not stubbed and not faked**:
+Issue #6 and are **not implemented, not stubbed and not faked**:
 
-- the `agent:fix` review handoff, feedback collection, grouping and cursors (#5);
-- same-session follow-up rounds after review feedback, and re-arming the label (#5);
 - multi-repo concurrency above one (configuration rejects it), distributed leases,
   a broker, webhooks, a dashboard, or a provider-plugin system (#6);
 - automatic merge, automatic approval, Issue closure, or deletion of unknown
-  worktrees — permanently out of scope, not deferred.
+  worktrees — permanently out of scope, not deferred;
+- **automatic review generation.** The review loop *accepts* feedback; it never
+  writes it. There is no reviewer agent, no reviewer fleet, no queue of reviewer
+  jobs. A comment or review that the agent did not receive by an explicit
+  `agent:fix` handoff is never acted on (§16).
 
 Also deliberately absent, because the alternative would be a false claim:
 
 - **No native VS Code Chat session handoff.** Inspect and resume CLI sessions in
   the integrated terminal of a Remote SSH window; that is the supported interface.
+  A review round's session is no different — the dispatcher resumes it headlessly
+  through the CLI, and you inspect it in a terminal.
 - **No container or OS sandbox.** `--yolo` plus a worktree is a trust choice on a
   single-user VM, and §12 says so plainly.
-- **No live end-to-end VM run is claimed by this document.** The offline suite
-  proves the orchestration logic against fakes; an actual Command Code run, real
-  push and real PR are an explicit, opt-in operator action
-  (`agent-dispatch run`) and are only "observed" when someone observes them.
+- **No live review round is claimed by this document.** The offline suite proves
+  the orchestration logic against fakes. A real `agent:fix` round on a real PR is
+  an explicit, opt-in operator action (`agent-dispatch review`, or adding the label
+  for the worker to pick up) and is only "observed" when someone observes it — see
+  §16 for exactly which parts that leaves unverified.
+
+---
+
+## 16. The review loop (`agent:fix`)
+
+One maintainer-triggered feedback loop: you review the PR the dispatcher opened,
+add `agent:fix` to it, and the **same Command Code session in the same task
+worktree** receives one consolidated batch of new feedback, implements what it
+accepts, and pushes to **that same PR**. The task then returns to
+`awaiting_review`.
+
+### The trigger is the label, and only the label
+
+* **Review comments never start an agent.** A comment, a reply or a submitted
+  review with no `agent:fix` label is *observed* and nothing else happens.
+* **The label goes on the pull request**, and only an **open PR this task owns**
+  counts. A PR that discovery merely recorded as an observation is never acted on,
+  and a label is never fetched from the Issue to stand in for the PR.
+* **Role is never inferred from a login.** The reviewer and the implementer may be
+  the same GitHub account on this VM, so no comment is accepted or rejected because
+  of who wrote it, and no comment body is scanned for magic words.
+* **One label, one round.** The round is claimed — durably, with its feedback
+  snapshot — *before* the label is removed, so a crash cannot lose the handoff.
+
+### The one workflow to remember
+
+```
+1. Review PR #N (on GitHub).
+2. Add the `agent:fix` label to PR #N.
+3. Wait for the round. Watch the Issue status comment:
+     Applying feedback  ->  Publishing feedback changes  ->  Awaiting review
+4. Inspect the new commits on PR #N.
+
+For another round: REMOVE the label, let the round finish, then ADD it again.
+```
+
+Step 4's "remove and add again" is not a formality — it is the whole mechanism. A
+label that is simply **left in place is not a standing request for more rounds**. A
+permanently present label is inert after its round is claimed, because the service
+only treats a label as a new handoff once it has *observed the label absent* in
+between. Without that rule every poll would start another round and spend another
+model call on feedback that was already applied.
+
+### When a handoff is deferred instead of started
+
+The label stays where it is, nothing is claimed, and the service retries on a later
+poll. Nothing is lost and you do not have to re-add a label you already added:
+
+| Situation | What happens |
+|---|---|
+| Another run is active for the task | Deferred until the task returns to `awaiting_review`. This is the one documented behaviour for "the label arrived during a run" — there is no concurrent reviewer machinery. |
+| A round is already open | Deferred; the open round owns the handoff. |
+| The previous round's publication is incomplete | Deferred until it is finished. |
+| **No new feedback** since the last round | Deferred. Add your comments and the same still-present label starts the round on the next poll. |
+| The feedback listing was incomplete, or the PR could not be read | Deferred and retried. Claiming from a partial read would acknowledge feedback the model never saw. |
+
+### When a handoff is refused
+
+Refused means waiting will not help, so the reason is recorded and the handoff is
+consumed rather than re-reported on every poll. `status`/`open` show the reason:
+
+| Situation | Why it will not start by waiting |
+|---|---|
+| The PR is merged or closed | There is nothing to push a round to. |
+| `take-it` was removed from the Issue | Dispatch intent for the whole task is withdrawn. Re-add it, then re-add `agent:fix`. |
+| No cleanly completed session | An interrupted Command Code run has **no transcript**, so it cannot be resumed. The dispatcher refuses instead of quietly starting a different conversation and calling it a review round. A *first* run interrupted mid-flight is retried fresh by #4's own path; that is a new session, and not a review round. |
+| No recorded worktree, or it is not on the task's branch | A round must resume in the directory the conversation was about. |
+| The PR is not provably this task's | Ownership is re-verified at claim time. Acting on someone else's PR is the one mistake a later poll cannot undo. |
+
+### What the agent is asked to do
+
+One bounded instruction: the new feedback, the earlier already-acknowledged
+feedback as context, the observed commit/file state of the branch, and the
+repository's own `AGENTS.md`. It is explicitly told to verify each request against
+the current code, to **push back** on comments that conflict, are out of scope, or
+that it disagrees with on technical grounds, and to distinguish a question from a
+requested change. A round that correctly produces no code change is a valid
+outcome and is recorded as such.
+
+What the instruction will *not* do: it never presents review text as operator
+instructions. Review bodies, Issue bodies and `AGENTS.md` are fenced and labelled as
+untrusted content, and the prompt states that its permission flags come from your
+configuration rather than from anything in those texts.
+
+### States you will see in the status comment
+
+| State | Meaning |
+|---|---|
+| `Applying feedback` | The resumed session is working through the round's feedback. |
+| `Publishing feedback changes` | The turn completed and the changes are being committed and pushed. No further model run is involved. |
+| `Awaiting review` | The round is published; the feedback it carried is acknowledged. |
+| `Needs attention` | A round is unfinished — either its publication failed and will be retried, or its agent turn failed and a human decision is needed. |
+
+It is deliberately **one** comment, edited in place, exactly as in §13: a review
+round heartbeats the comment the task already owns, and a round never opens a second
+one.
+
+### Recovery: what happens when something fails mid-round
+
+| Failure | What the service does |
+|---|---|
+| The process dies before the round reaches the model | Re-drives the **same** claimed round with the same snapshot and session. No feedback is lost and no second round is minted. |
+| The process dies while the round's turn is running | Parks the round as interrupted and starts **nothing**. A turn may already have been paid for and its commits may be half-written, so a human decides. |
+| The turn completes but the commit/push/PR step fails | Parking reason is preserved and the **next pass finishes the publication with zero further model calls**. The remote tip is checked against the completed local tip first; the round is only marked published once that matches. |
+| The label could not be removed after the claim | The round still runs; the still-present label cannot start a second round, and the warning says to remove it by hand. |
+
+**Feedback is acknowledged exactly once, and only after its round is durably
+published.** Closing the round, advancing the acknowledged-feedback cursor, clearing
+the publication marker and returning to `awaiting_review` happen in **one SQLite
+transaction**. Splitting them produced two states the design forbids — published but
+unacknowledged (so a restart applies the same feedback twice) and acknowledged but
+not `awaiting_review` (so the task is neither reviewable nor dispatchable).
+
+### Commands and manual recovery
+
+```bash
+agent-dispatch review --dry-run         # what each pending handoff would carry; claims nothing
+agent-dispatch review                   # start one round now (takes the worker lock)
+agent-dispatch review --repo owner/name --issue 12
+```
+
+`review` is optional — the polling worker starts rounds on its own — but it is the
+way to act immediately and the way to see *why* a visible label is not starting
+anything without consuming the handoff. `--dry-run` opens the state database
+read-only, so it cannot create, migrate or write it.
+
+Both `review` and the worker take the single-instance lock: one agent at a time
+remains global, and a review round is an agent run like any other. If the worker
+holds the lock, `review` exits `3` (`busy`) rather than starting a second one.
+
+Manual recovery, in order of what you are likely to want:
+
+```bash
+agent-dispatch open --repo owner/name --issue 12   # branch, worktree, session, PR, runs
+agent-dispatch review --dry-run                    # is a handoff claimable, and why not?
+agent-dispatch review                              # finish a round whose publication failed
+agent-dispatch run                                 # finish a failed IMPLEMENTATION publication
+```
+
+For a round parked as interrupted or failed, read the recorded reason first
+(`open` prints it). The worktree keeps whatever the round produced, and the feedback
+stays unacknowledged, so fixing the cause and re-adding the label re-runs the round
+with the same feedback rather than losing it.
+
+### What is not verified for this feature
+
+The offline suite drives this end to end against `tests/fake_wrapper.py` and
+`tests/fake_runtime.py`, including crash and restart windows. It does **not** prove
+anything about a live round against real GitHub and real Command Code:
+
+* **No live `agent:fix` round has been run by this document.** A real round needs a
+  wrapper-authorised disposable repository and model credits, and is an opt-in
+  operator action. Until someone runs one and observes it, "same-session continuity
+  on a real PR" is **not tested live** — the offline suite proves the *argument*
+  passed to `--session`, not that a real runtime honours it with real concurrent
+  feedback.
+* **Real GitHub pagination and rate limits** are modelled, not observed, for the
+  inline-review-comment and submitted-review listings added by this feature.
+* **The handoff label's behaviour on a real PR** (a real `DELETE` on a label that is
+  also used by other tooling) is modelled only.
+
+A CLI session is viewed through the VS Code Remote SSH **terminal**, not native VS
+Code Chat — the same limitation as §15.

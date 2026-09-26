@@ -112,6 +112,17 @@ class PullRequest:
     #: branch-name match alone cannot prove a PR is ours.
     head_repo: str = ""
     head_owner: str = ""
+    #: Labels currently on the PR. The review handoff (#5) is a label on an **open,
+    #: owned** PR, so reading them is what makes "the maintainer asked for a round"
+    #: observable at all — there is no other signal this service accepts.
+    labels: tuple[str, ...] = ()
+    #: ``updated_at`` as GitHub reports it. Recorded so a *later* edit of a PR body or
+    #: title can be told apart from the original claim; never used as a proxy for
+    #: anything the service has not observed itself.
+    updated_at: str = ""
+
+    def has_label(self, label: str) -> bool:
+        return label in self.labels
 
     @property
     def head_label(self) -> str:
@@ -194,19 +205,161 @@ class IssueComment:
     ``body`` is the raw markdown, because the only thing this is used for is finding
     this service's own machine marker. ``url`` is the ``html_url`` a maintainer can
     open, never an API URL.
+
+    ``updated_at`` and ``created_at`` matter to the review loop (#5): they are the
+    **version** of a comment. An edited comment keeps its id, so a cursor keyed only
+    by id would treat an edit as already-processed feedback and silently drop it.
     """
 
     id: int
     body: str = ""
     url: str = ""
+    author: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def version(self) -> str:
+        """A value that changes whenever the comment's content changes.
+
+        Falls back to ``created_at`` when GitHub returns no ``updated_at``, and to a
+        fixed token when it returns neither: "unknown version" is then stable, so an
+        item is not re-processed on every poll merely for lacking a timestamp. A
+        comment whose version cannot be read is handled by the *caller* refusing to
+        claim a round it cannot snapshot honestly.
+        """
+        return self.updated_at or self.created_at or "unknown"
+
+
+@dataclass(frozen=True)
+class ReviewComment:
+    """One **inline** review comment on a pull request (a diff-context comment).
+
+    ``path``/``line``/``original_line`` are the diff context GitHub returned. They
+    are preserved as observed and never re-derived: an outdated comment's original
+    line is what the maintainer actually commented on, and inventing a *current*
+    line for it would be a fabrication (Issue #5: "present the comment honestly
+    instead of fabricating a current line").
+
+    ``in_reply_to_id`` distinguishes a reply inside an existing thread from a new
+    comment, which the consolidated instruction shows so the agent can tell a
+    threaded discussion from a fresh request.
+    """
+
+    id: int
+    body: str = ""
+    url: str = ""
+    author: str = ""
+    path: str = ""
+    line: int | None = None
+    original_line: int | None = None
+    #: ``LEFT``/``RIGHT`` side of the diff, as returned. ``None`` when unknown.
+    side: str | None = None
+    commit_id: str = ""
+    in_reply_to_id: int | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def version(self) -> str:
+        return self.updated_at or self.created_at or "unknown"
+
+    def location(self) -> str:
+        """Honest location string: the original line is labelled as such.
+
+        A review comment whose line no longer exists on the diff reports its
+        ``original_line`` with an explicit ``(outdated)`` marker rather than
+        pretending the comment sits at a current line number.
+        """
+        if not self.path:
+            return "(no file context returned)"
+        if self.line is not None:
+            return f"{self.path}:{self.line}"
+        if self.original_line is not None:
+            return f"{self.path}:{self.original_line} (outdated)"
+        return f"{self.path} (no line context returned)"
+
+
+@dataclass(frozen=True)
+class Review:
+    """One submitted pull-request review, with its own body and verdict.
+
+    A review submission is a distinct feedback surface from the inline comments it
+    carries: the body is the reviewer's overall statement, and ``state`` is their
+    verdict (``APPROVED``/``CHANGES_REQUESTED``/``COMMENTED``/``DISMISSED``).
+    """
+
+    id: int
+    body: str = ""
+    url: str = ""
+    author: str = ""
+    state: str = ""
+    submitted_at: str = ""
+    commit_id: str = ""
+
+    @property
+    def version(self) -> str:
+        """Reviews are not editable through the API, so ``submitted_at`` is the version."""
+        return self.submitted_at or "unknown"
 
 
 def _to_issue_comment(raw: dict[str, Any]) -> IssueComment:
     body = raw.get("body")
+    user = raw.get("user") or {}
+    author = str(user.get("login") or "") if isinstance(user, Mapping) else ""
     return IssueComment(
         id=int(raw.get("id", 0)),
         body=str(body) if isinstance(body, str) else "",
         url=str(raw.get("html_url") or ""),
+        author=author,
+        created_at=str(raw.get("created_at") or ""),
+        updated_at=str(raw.get("updated_at") or ""),
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    """An integer when the API sent one, else ``None``. Never invents a line number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_review_comment(raw: dict[str, Any]) -> ReviewComment:
+    user = raw.get("user") or {}
+    author = str(user.get("login") or "") if isinstance(user, Mapping) else ""
+    body = raw.get("body")
+    side = raw.get("side")
+    return ReviewComment(
+        id=int(raw.get("id", 0)),
+        body=str(body) if isinstance(body, str) else "",
+        url=str(raw.get("html_url") or ""),
+        author=author,
+        path=str(raw.get("path") or ""),
+        line=_optional_int(raw.get("line")),
+        original_line=_optional_int(raw.get("original_line")),
+        side=str(side) if isinstance(side, str) and side else None,
+        commit_id=str(raw.get("commit_id") or ""),
+        in_reply_to_id=_optional_int(raw.get("in_reply_to_id")),
+        created_at=str(raw.get("created_at") or ""),
+        updated_at=str(raw.get("updated_at") or ""),
+    )
+
+
+def _to_review(raw: dict[str, Any]) -> Review:
+    user = raw.get("user") or {}
+    author = str(user.get("login") or "") if isinstance(user, Mapping) else ""
+    body = raw.get("body")
+    return Review(
+        id=int(raw.get("id", 0)),
+        body=str(body) if isinstance(body, str) else "",
+        url=str(raw.get("html_url") or ""),
+        author=author,
+        state=str(raw.get("state") or ""),
+        submitted_at=str(raw.get("submitted_at") or ""),
+        commit_id=str(raw.get("commit_id") or ""),
     )
 
 
@@ -251,6 +404,12 @@ class GitHubClient:
         #: unprovable, so callers must refuse to create another one rather than
         #: risking a duplicate status thread.
         self.comment_scan_truncated = False
+        #: Set when the most recent **review feedback** listing (inline review comments
+        #: or submitted reviews) stopped at the page cap. A truncated feedback scan
+        #: means "this is all the new feedback" is unprovable, so a review round must
+        #: not be claimed from it: claiming would hand the model a subset while the
+        #: cursor advanced past the whole set, losing the rest silently.
+        self.review_scan_truncated = False
         self._last_page_reached_cap = False
 
     # ------------------------------------------------------------------ core
@@ -490,6 +649,81 @@ class GitHubClient:
         if self._last_page_reached_cap:
             self.comment_scan_truncated = True
         return comments
+
+    # ------------------------------------------------- review feedback (#5)
+
+    def list_pull_review_comments(self, slug: str, pr_number: int) -> list[ReviewComment]:
+        """Every **inline** review comment on a PR, and whether the scan was truncated.
+
+        ``review_scan_truncated`` is set when pagination stopped at the page cap. The
+        caller must treat that as "the feedback set is not proven complete" and refuse
+        to claim a round from it, rather than handing the model an unknown subset.
+        """
+        self.review_scan_truncated = False
+        comments: list[ReviewComment] = []
+        endpoint = f"repos/{slug}/pulls/{pr_number}/comments"
+        for raw in self._paginate(endpoint):
+            if isinstance(raw, dict) and "id" in raw:
+                comments.append(_to_review_comment(raw))
+        if self._last_page_reached_cap:
+            self.review_scan_truncated = True
+        return comments
+
+    def list_pull_reviews(self, slug: str, pr_number: int) -> list[Review]:
+        """Every **submitted** review on a PR, and whether the scan was truncated.
+
+        Pending reviews are excluded: they have not been submitted, so they are not
+        feedback the maintainer has handed over yet — and GitHub omits
+        ``submitted_at`` for them, which is also the version this uses. Treating a
+        draft review as feedback would act on text the maintainer was still writing.
+        """
+        self.review_scan_truncated = False
+        reviews: list[Review] = []
+        endpoint = f"repos/{slug}/pulls/{pr_number}/reviews"
+        for raw in self._paginate(endpoint):
+            if not isinstance(raw, dict) or "id" not in raw:
+                continue
+            review = _to_review(raw)
+            if not review.submitted_at:
+                continue
+            reviews.append(review)
+        if self._last_page_reached_cap:
+            self.review_scan_truncated = True
+        return reviews
+
+    def remove_issue_label(self, slug: str, issue_number: int, name: str) -> bool:
+        """Remove one label from an Issue or PR. Idempotent; ``True`` when removed.
+
+        Used exactly once per claimed review round, **after** the round and its
+        feedback snapshot are durable, so a crash cannot lose the handoff. A 404 means
+        the label is already gone, which is the intended end state and therefore
+        success rather than an error: reporting it as a failure would make a correct
+        round look broken and invite a needless retry.
+
+        The review handoff label is documented as being on the PR; GitHub's PR labels
+        and Issue labels are one namespace (the label API is the *issues* endpoint for
+        both), which is why this single call serves both. The caller decides which
+        object the label belongs to.
+        """
+        self.check_available()
+        argv = [
+            "api",
+            "-X",
+            "DELETE",
+            f"repos/{slug}/issues/{issue_number}/labels/{name}",
+        ]
+        try:
+            proc = self._execute(argv)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise GitHubError(f"failed to remove label {name!r} from {slug}: {exc}") from exc
+        if proc.returncode == 0:
+            return True
+        stderr = proc.stderr or ""
+        lowered = stderr.lower()
+        if "not found" in lowered or "http 404" in lowered:
+            # Already absent. The goal is "the label is not there any more".
+            return False
+        raise _classify_failure(proc.returncode, stderr, argv)
 
     def create_issue_comment(self, slug: str, issue_number: int, body: str) -> IssueComment:
         """Post one comment on an Issue and return the real object GitHub created.
@@ -742,6 +976,11 @@ def _to_pull(raw: dict[str, Any]) -> PullRequest:
     head_user = head.get("user") or head_repo_raw.get("owner") or {}
     if isinstance(head_user, Mapping):
         head_owner = str(head_user.get("login") or "")
+    labels = tuple(
+        str(item.get("name"))
+        for item in (raw.get("labels") or [])
+        if isinstance(item, dict) and item.get("name")
+    )
     return PullRequest(
         number=int(raw.get("number", 0)),
         state=str(raw.get("state") or "unknown"),
@@ -753,6 +992,8 @@ def _to_pull(raw: dict[str, Any]) -> PullRequest:
         head_sha=str(head.get("sha") or ""),
         head_repo=head_repo,
         head_owner=head_owner,
+        labels=labels,
+        updated_at=str(raw.get("updated_at") or ""),
     )
 
 

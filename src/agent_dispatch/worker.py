@@ -32,7 +32,11 @@ from .config import Config
 from .discovery import Discovery, DiscoveryResult
 from .github import GitHubClient, GitHubError
 from .logging_setup import Logger
-from .orchestrator import DispatchOutcome, Orchestrator
+from .orchestrator import (
+    OUTCOME_REVIEW_DONE,
+    DispatchOutcome,
+    Orchestrator,
+)
 from .runlogs import prune
 from .runtime import CommandCodeDriver, RuntimeSpawnError
 from .store import Store, phase_summary
@@ -50,6 +54,8 @@ class PollOutcome:
     dispatchable: list[str] = field(default_factory=list)
     #: Set only when this poll actually executed a task (never in a simulated poll).
     dispatch: DispatchOutcome | None = None
+    #: Notes from the review pass (#5): a round that was finished, started, or refused.
+    review_notes: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -222,6 +228,23 @@ class Worker:
                 tasks=",".join(dispatchable[:10]),
             )
 
+        # Review rounds run BEFORE the implementation passes, and the order is the
+        # contract rather than an optimisation:
+        #
+        # * `reconcile_review_rounds` finishes (or parks) a review round whose turn
+        #   already completed. The implementation passes that follow would misread such
+        #   a task: `reconcile_publish_pending` would treat "owned PR + publishable
+        #   stage" as an implementation crash and set `awaiting_review` without
+        #   acknowledging the feedback, and `_reconcile_running` would requeue a killed
+        #   review turn as a fresh *implementation* run. It never starts a model, so it
+        #   belongs on the write path but NOT behind the execute flag.
+        review_notes: list[str] = []
+        if self.reconcile:
+            orchestrator = Orchestrator(self.config, self.store, client, self.log)
+            for note in orchestrator.reconcile_review_rounds():
+                review_notes.append(note)
+                self.log.info("review_reconciled", detail=note)
+
         # Publish-pending reconciliation runs on EVERY poll, not just at startup. Tasks
         # can become publish-pending while the service is alive — re-adding `take-it` to
         # a withdrawn task, a manual `unpause`, or `resume-publish` — and startup
@@ -251,7 +274,7 @@ class Worker:
                 self.log.info("status_reconciled", detail=note)
 
         dispatch: DispatchOutcome | None = None
-        if self.execute and dispatchable and self.store.active_task_count() == 0:
+        if self.execute and self.store.active_task_count() == 0:
             # A missing runtime is a *configuration* fault, exactly like a missing
             # GitHub wrapper: it is reported once and touches no task state. Without
             # this check the first task would be claimed and marked `failed` for a
@@ -260,11 +283,34 @@ class Worker:
             if runtime_problem:
                 self.log.error("dispatch_unavailable", detail=runtime_problem)
             else:
-                # The decision to run belongs to the orchestrator, which re-validates
-                # against GitHub and claims the task under a conditional transition.
-                # This list is only a hint that something *might* be runnable.
-                dispatch = Orchestrator(self.config, self.store, client, self.log).dispatch_next()
-                self.log.info("dispatch_result", action=dispatch.action, detail=dispatch.summary())
+                orchestrator = Orchestrator(self.config, self.store, client, self.log)
+
+                # A review handoff takes precedence over implementation work: it
+                # continues a conversation a maintainer is actively reviewing, and the
+                # global one-active-task rule means only one of the two can run anyway.
+                # Only reached on the execute path, so a `--no-execute` poll can never
+                # spend a model call on a review round.
+                review_outcomes = orchestrator.dispatch_review_rounds()
+                for outcome in review_outcomes:
+                    review_notes.append(outcome.summary())
+                    self.log.info(
+                        "review_round_result", action=outcome.action, detail=outcome.summary()
+                    )
+                if any(
+                    outcome.dispatched or outcome.action == OUTCOME_REVIEW_DONE
+                    for outcome in review_outcomes
+                ):
+                    # A round ran, so this poll's single agent slot is used up. Starting
+                    # an implementation run as well would break the global limit.
+                    dispatch = review_outcomes[0]
+                elif dispatchable and self.store.active_task_count() == 0:
+                    # The decision to run belongs to the orchestrator, which re-validates
+                    # against GitHub and claims the task under a conditional transition.
+                    # This list is only a hint that something *might* be runnable.
+                    dispatch = orchestrator.dispatch_next()
+                    self.log.info(
+                        "dispatch_result", action=dispatch.action, detail=dispatch.summary()
+                    )
 
         if self.reconcile:
             try:
@@ -280,6 +326,7 @@ class Worker:
             after=self.store.count_by_phase(),
             dispatchable=dispatchable,
             dispatch=dispatch,
+            review_notes=review_notes,
         )
 
     def _runtime_preflight(self) -> str | None:
