@@ -276,15 +276,25 @@ class Orchestrator:
             max_attempts=self.config.worker.max_attempts,
         )
 
-    def sync_task_status(self, task: Task, *, note: str | None = None) -> bool:
+    def sync_task_status(
+        self,
+        task: Task,
+        *,
+        note: str | None = None,
+        publisher: StatusPublisher | None = None,
+    ) -> bool:
         """Re-derive one task's status comment from durable state. Never fatal.
 
         Called after any transition that changes what the comment should say
         (pause/unpause/retry/resume-publish, a close, a withdrawal). Editing is
         skipped when the rendered body is unchanged, so this costs nothing on GitHub
         while a task sits still.
+
+        ``publisher`` is supplied by the run lifecycle so the terminal write shares the
+        heartbeat's lock and terminal flag. Callers outside a run omit it and get a
+        short-lived publisher, which is correct there because no heartbeat exists.
         """
-        publisher = self._publisher(task)
+        publisher = publisher or self._publisher(task)
         if publisher is None:
             return False
         try:
@@ -579,6 +589,13 @@ class Orchestrator:
         # pinned identity exists to prevent.
         pinned = self.store.get_task(task.repo, task.issue_number) or task
 
+        # ONE publisher for the whole run lifecycle (Starting -> Running heartbeats ->
+        # Publishing -> terminal sync). Sharing the instance is what shares its lock and
+        # its terminal flag with the heartbeat; constructing a second one for the
+        # terminal write would give that write an unrelated lock and reopen the window
+        # in which a slow heartbeat could overwrite a terminal state.
+        publisher = self._publisher(pinned)
+
         instruction = build_instruction(
             repo_slug=repo.slug,
             issue=issue,
@@ -600,6 +617,7 @@ class Orchestrator:
             kind="implementation",
             session_id=None,
             issue=issue,
+            publisher=publisher,
         )
         if early is not None:
             # The runtime could not be started at all, so `_finish` never runs. The
@@ -610,7 +628,11 @@ class Orchestrator:
             # Re-read first: `_run_once` records the failure, so syncing from the
             # pre-failure object would render the OLD state (e.g. `queued`) for a task
             # the database already knows is `failed`.
-            self.sync_task_status(self.store.get_task(task.repo, task.issue_number) or pinned)
+            if publisher is not None:
+                publisher.begin_terminal()
+            self.sync_task_status(
+                self.store.get_task(task.repo, task.issue_number) or pinned, publisher=publisher
+            )
             return early
         return self._finish(
             pinned,
@@ -620,7 +642,7 @@ class Orchestrator:
             result,
             run_row=run_row,
             issue=issue,
-            publisher=self._publisher(pinned),
+            publisher=publisher,
             run_started_at=self._run_started_at,
         )
 
@@ -634,6 +656,7 @@ class Orchestrator:
         kind: str,
         session_id: str | None,
         issue: Issue | None = None,
+        publisher: StatusPublisher | None = None,
     ) -> tuple[RunResult | None, int, DispatchOutcome | None]:
         """Invoke the runtime once, recording the run's start and end.
 
@@ -646,8 +669,12 @@ class Orchestrator:
         soon as the subprocess exists, and both the heartbeat and the ``Publishing``
         transition happen here because this is the only place that knows a run's real
         start and stop.
+
+        The ``publisher`` is supplied by :meth:`_execute` and used for the whole run
+        lifecycle, so the heartbeat and every terminal write share ONE lock and one
+        terminal flag. That is what makes "no heartbeat lands after a terminal state"
+        structural instead of dependent on the join succeeding.
         """
-        publisher = self._publisher(task) if issue is not None else None
         attempt = task.attempts + 1
         self._run_started_at = utcnow_iso()
         heartbeat: RunHeartbeat | None = None
@@ -812,9 +839,20 @@ class Orchestrator:
             # honest intermediate state: the model is done, the pull request does not
             # exist yet. Claiming `Awaiting review` here is exactly the overstatement
             # this feature is meant to remove.
+            #
+            # This is the first terminal write, so the heartbeat is closed out first:
+            # the flag is set under the shared lock, which is what stops a heartbeat
+            # that is STILL inside a slow status call from landing `Running` after this
+            # point. Merely having joined the thread is not enough, because that join
+            # is allowed to time out.
+            publisher.begin_terminal()
             publisher.publishing(
                 task, run_started_at=run_started_at or "", attempt=task.attempts + 1
             )
+        elif publisher is not None:
+            # A failed run publishes no `Publishing`, but it is still terminal: the
+            # sync below must not race a heartbeat either.
+            publisher.begin_terminal()
         outcome = self._evaluate(
             task,
             repo,
@@ -827,10 +865,11 @@ class Orchestrator:
         if publisher is not None:
             # Re-read rather than reuse `task`: the row was mutated by the path above,
             # and syncing from a stale snapshot is how a comment ends up reporting the
-            # state before the transition instead of after it.
+            # state before the transition instead of after it. The SAME publisher is
+            # passed through so this final write is serialised with the heartbeat.
             fresh = self.store.get_task(task.repo, task.issue_number)
             if fresh is not None:
-                self.sync_task_status(fresh)
+                self.sync_task_status(fresh, publisher=publisher)
         return outcome
 
     def _evaluate(

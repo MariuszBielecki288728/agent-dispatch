@@ -42,9 +42,17 @@ alive without claiming the model is generating tokens.
 **No second scheduler.** :class:`RunHeartbeat` is one daemon thread per live run,
 started by the orchestrator and stopped and joined before any terminal edit, so a
 five-minute update happens while ``CommandCodeDriver.run()`` is blocked reading the
-NDJSON stream. A late heartbeat cannot overwrite a terminal state: the heartbeat
-re-checks its stop flag before each write and every write — heartbeat or terminal —
-is serialised by one lock.
+NDJSON stream.
+
+**A late heartbeat can never overwrite a terminal state — structurally.** One
+:class:`StatusPublisher` is shared by the entire run lifecycle (``Starting``,
+heartbeat, ``Publishing``, terminal sync), so every write takes the same lock and
+sees the same terminal flag. The owning thread sets that flag under the lock before
+its first terminal write, and a background write that begins afterwards is refused.
+Joining the thread is *not* what provides this guarantee: a join is allowed to time
+out while a heartbeat is still inside the transport, so ordering that depended on it
+would leave a real window. A heartbeat tick also only ever PATCHes the comment it
+already owns — marker re-resolution, adoption and recovery stay on the owning thread.
 
 **Stale status is repaired, never left fresh.** A persisted ``Starting``/``Running``
 state is only ever written by a live process, so finding one at startup means the
@@ -556,6 +564,14 @@ class StatusPublisher:
         self._repo = repo
         self._issue = issue_number
         self._max_attempts = max_attempts
+        #: Set once terminal publication has begun. Every write — heartbeat or owning
+        #: thread — re-checks this UNDER the lock below, which is what makes "no
+        #: heartbeat can land after a terminal state" structural rather than a
+        #: consequence of the join succeeding. A join can time out while a heartbeat is
+        #: still inside the transport (a failed PATCH plus a marker re-scan plus a
+        #: second PATCH is several sequential bounded calls), so relying on the join
+        #: alone would leave a real window for `Running` to overwrite `Awaiting review`.
+        self._terminal = False
         #: Serialises comment writes between the heartbeat thread and the terminal
         #: update, which is what stops a late heartbeat from overwriting a terminal
         #: state (it re-checks the stop flag before each write, under this lock).
@@ -678,16 +694,41 @@ class StatusPublisher:
 
     # -------------------------------------------------------------- transport
 
-    def publish(self, view: StatusView, *, allow_create: bool) -> bool:
+    def begin_terminal(self) -> None:
+        """Close the window in which a heartbeat may still write.
+
+        Called by the owning thread once the run has stopped and terminal publication
+        is about to start. After this, any *background* write is refused, and the
+        refusal is decided under the same lock the terminal write takes — so it holds
+        even if `stop_and_join()` timed out and the heartbeat is still inside the
+        transport. A heartbeat that re-checks its stop flag only *before* a call could
+        otherwise land `Running` on top of `Awaiting review`.
+        """
+        with self._lock:
+            self._terminal = True
+
+    def publish(self, view: StatusView, *, allow_create: bool, background: bool = False) -> bool:
         """Edit the owned comment (adopting it by marker if needed) or create it.
 
         Returns whether a write reached GitHub. Never raises: a status update is
         best-effort by contract, and an exception from here could otherwise fail a
         run whose actual work succeeded.
+
+        ``background`` marks a heartbeat write. Such a write is refused outright once
+        terminal publication has begun, and the check happens inside the lock rather
+        than before it, so the ordering does not depend on the join having succeeded.
         """
         body = render_comment(view)
         try:
             with self._lock:
+                if background and self._terminal:
+                    self._log.info(
+                        "status_heartbeat_suppressed",
+                        repo=self._repo,
+                        issue=self._issue,
+                        detail="terminal publication has begun; the heartbeat write was dropped",
+                    )
+                    return False
                 return self._publish_locked(body, allow_create=allow_create)
         except Exception as exc:  # noqa: BLE001 - status reporting is never fatal
             self._log.warning(
@@ -1051,7 +1092,12 @@ class RunHeartbeat:
             view,
             elapsed_seconds=elapsed_seconds(view.run_started_at, view.last_checked_at),
         )
-        if self._publisher.publish(view, allow_create=False):
+        # `background=True`: this tick may only patch the comment it already knows, and
+        # it is dropped outright once terminal publication has begun. Marker
+        # re-resolution, adoption and recovery all stay on the owning thread — a
+        # heartbeat that could re-scan would also be a heartbeat that can make several
+        # sequential API calls and outlive its join budget.
+        if self._publisher.publish(view, allow_create=False, background=True):
             self.ticks += 1
         self.running_published = True
 

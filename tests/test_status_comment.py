@@ -47,6 +47,8 @@ REPO_ROOT = TESTS_DIR.parent
 SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
+from agent_dispatch.github import IssueComment  # noqa: E402
+from agent_dispatch.logging_setup import Logger  # noqa: E402
 from agent_dispatch.statuscomment import (  # noqa: E402
     MARKER_TEMPLATE,
     STATE_AWAITING_REVIEW,
@@ -421,6 +423,43 @@ def _bare_task(**overrides: object):
         recovery_stage=None,
     )
     return replace(base, **overrides)  # type: ignore[arg-type]
+
+
+def _owned_task(**overrides: object):
+    """A task that has already been claimed, for publisher-level tests.
+
+    `_bare_task` describes a queued row; the publisher-level tests here need a task
+    whose phase is `running`, because that is what an owned status comment belongs to.
+    """
+    return _bare_task(phase="running", **overrides)
+
+
+def _owned_store_task(store: Store, **overrides: object):
+    """A real task row in ``store``, plus the matching ``Task`` object.
+
+    Publisher-level tests need a genuine row rather than a detached object: the
+    ``status_comments`` table has a foreign key to ``tasks``, so recording ownership
+    intent (which is what makes the publisher own a comment) requires one to exist.
+    """
+    from dataclasses import replace
+
+    store.upsert_discovered(
+        repo="owner/repo",
+        issue_number=1,
+        title="A task",
+        base_branch="main",
+        runtime_driver="commandcode",
+        runtime_model="model-x",
+        runtime_effort="high",
+        permission_mode="allow-all",
+        trigger_present=True,
+        issue_state="open",
+        linked_pr_number=None,
+        linked_pr_state=None,
+    )
+    task = store.get_task("owner/repo", 1)
+    assert task is not None
+    return replace(task, phase="running", **overrides)  # type: ignore[arg-type]
 
 
 class TaskViewTests(unittest.TestCase):
@@ -1465,10 +1504,70 @@ class _RecordingPublisher:
     def __init__(self, *, comment_id: int | None = 1) -> None:
         self.views: list[StatusView] = []
         self.comment_id = comment_id
+        self.terminal = False
 
-    def publish(self, view: StatusView, *, allow_create: bool) -> bool:
+    def publish(self, view: StatusView, *, allow_create: bool, background: bool = False) -> bool:
+        # Mirrors the real publisher's ordering guarantee so the heartbeat tests
+        # exercise it: a background write is refused once terminal publication began.
+        if background and self.terminal:
+            return False
         self.views.append(view)
         return True
+
+    def begin_terminal(self) -> None:
+        self.terminal = True
+
+
+class _BlockingStatusClient:
+    """A deterministic status client that can hold a write open on demand.
+
+    Used to prove the heartbeat/terminal ordering WITHOUT sleeping: the test controls
+    exactly when the in-flight heartbeat write completes, so the race is reproduced
+    rather than hoped for.
+    """
+
+    def __init__(self) -> None:
+        self.comment_scan_truncated = False
+        self.entered = __import__("threading").Event()
+        self.release = __import__("threading").Event()
+        self.writes: list[str] = []
+        self._block_next_edit = False
+        self._comment_id = 1
+
+    def block_next_edit(self) -> None:
+        self._block_next_edit = True
+
+    # -- GitHubClient surface used by StatusPublisher -------------------------
+
+    def list_issue_comments(self, slug, issue_number):
+        return [
+            IssueComment(
+                id=self._comment_id,
+                body=marker_for(slug, issue_number),
+                url=f"https://github.com/{slug}/issues/{issue_number}#c1",
+            )
+        ]
+
+    def edit_issue_comment(self, slug, comment_id, body):
+        if self._block_next_edit:
+            self._block_next_edit = False
+            # Announce that the write is in flight, then wait for the test.
+            self.entered.set()
+            self.release.wait(timeout=30)
+        self.writes.append(body)
+        return IssueComment(
+            id=comment_id,
+            body=body,
+            url=f"https://github.com/{slug}/issues/1#c{comment_id}",
+        )
+
+    def create_issue_comment(self, slug, issue_number, body):
+        self.writes.append(body)
+        return IssueComment(
+            id=self._comment_id,
+            body=body,
+            url=f"https://github.com/{slug}/issues/{issue_number}#c{self._comment_id}",
+        )
 
 
 class HeartbeatThreadTests(unittest.TestCase):
@@ -1611,6 +1710,164 @@ class HeartbeatThreadTests(unittest.TestCase):
         # enormous — the point is only that it was computed from two real timestamps.
         self.assertIsNotNone(view.elapsed_seconds)
         self.assertGreaterEqual(view.elapsed_seconds or -1, 0)
+
+    def test_a_heartbeat_cannot_write_after_terminal_publication_begins(self) -> None:
+        # The round-2 blocker, made deterministic. `stop_and_join()` is ALLOWED to time
+        # out while a heartbeat is still inside the transport (a failed PATCH plus a
+        # marker re-scan plus a second PATCH is several sequential bounded calls), so the
+        # ordering must not rest on the join succeeding.
+        #
+        # The invariant that holds is: the terminal write is always LAST. An in-flight
+        # heartbeat write is allowed to finish (it began before terminal publication),
+        # and `begin_terminal()` waits for it on the shared lock — so it can never land
+        # *after* the terminal state. Every heartbeat that starts later is refused.
+        import threading
+        from dataclasses import replace
+
+        client = _BlockingStatusClient()
+        store = Store.in_memory()
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        publisher = StatusPublisher(
+            client=client, store=store, log=log, repo="owner/repo", issue_number=1
+        )
+        task = _owned_store_task(store)
+        self.assertTrue(
+            publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        )
+        heartbeat = RunHeartbeat(
+            publisher,
+            base_view=publisher.heartbeat_view(
+                task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00"
+            ),
+            interval_seconds=0.01,
+            log=log,
+            poll_seconds=0.005,
+        )
+        heartbeat.note_spawned()
+        client.block_next_edit()
+        heartbeat.start()
+        self.assertTrue(client.entered.wait(timeout=10), "the heartbeat must reach the transport")
+
+        # The runtime stops while that write is still open. The join is given a
+        # deliberately short budget, so it takes the TIMEOUT path the review identified
+        # as uncovered rather than the happy path.
+        self.assertFalse(
+            heartbeat.stop_and_join(timeout=0.01),
+            "the heartbeat is still inside the transport — the case that made relying "
+            "on the join unsound",
+        )
+
+        # Terminal publication begins while the heartbeat write is in flight. The call
+        # blocks on the shared lock, which is exactly what orders the two writes.
+        terminal_started = threading.Event()
+
+        def begin_terminal() -> None:
+            publisher.begin_terminal()
+            terminal_started.set()
+
+        starter = threading.Thread(target=begin_terminal, daemon=True)
+        starter.start()
+        self.assertFalse(
+            terminal_started.wait(timeout=0.3),
+            "begin_terminal must wait for the in-flight heartbeat write, not race it",
+        )
+
+        # Release the heartbeat. Its write completes, and THEN the terminal flag is set.
+        client.release.set()
+        self.assertTrue(
+            terminal_started.wait(timeout=10),
+            "begin_terminal must proceed once the in-flight write finishes",
+        )
+        starter.join(timeout=5)
+
+        # The owning thread now publishes the terminal state. It must be the LAST write.
+        self.assertTrue(
+            publisher.publish(
+                replace(
+                    publisher.heartbeat_view(
+                        task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00"
+                    ),
+                    state=STATE_AWAITING_REVIEW,
+                ),
+                allow_create=False,
+            )
+        )
+        self.assertIn(STATE_AWAITING_REVIEW, client.writes[-1])
+
+        # And no heartbeat may land after it, however many ticks it attempts.
+        writes_after_terminal = len(client.writes)
+        self.assertTrue(heartbeat.running_published)
+        __import__("time").sleep(0.4)
+        self.assertEqual(
+            len(client.writes),
+            writes_after_terminal,
+            "no heartbeat write may land after the terminal state",
+        )
+        self.assertNotIn(
+            STATE_RUNNING,
+            client.writes[-1],
+            "the last body must be the terminal state, never Running",
+        )
+
+    def test_the_run_lifecycle_shares_one_publisher_instance(self) -> None:
+        # The other half of the round-2 blocker, asserted directly rather than through a
+        # timing scenario. A happy-path ordering test cannot catch this: by the time
+        # `_finish` runs, the heartbeat has already been joined, so a second publisher
+        # there changes nothing observable. The defect IS the second publisher — the
+        # terminal write would take a lock unrelated to the heartbeat's, making the
+        # documented "queues behind the publisher lock" guarantee false whenever a
+        # heartbeat outlives its join budget.
+        #
+        # Source-level assertion so it holds for the real subprocess path too (a
+        # monkeypatch cannot reach a child process, which is why an in-process spy
+        # would silently pass here).
+        source = (SRC / "agent_dispatch" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "publisher=self._publisher(",
+            source,
+            "the run lifecycle must pass its ONE publisher into _finish; constructing a "
+            "second one gives the terminal write an unrelated lock",
+        )
+        # The final durable sync inside `_finish` must reuse that same publisher.
+        self.assertIn("self.sync_task_status(fresh, publisher=publisher)", source)
+
+    def test_a_background_write_is_refused_once_terminal_begins(self) -> None:
+        # The unit-level form of the same invariant: the decision is taken under the
+        # publisher's own lock, so it holds regardless of thread timing.
+        from dataclasses import replace
+
+        client = _BlockingStatusClient()
+        store = Store.in_memory()
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        publisher = StatusPublisher(
+            client=client, store=store, log=log, repo="owner/repo", issue_number=1
+        )
+        task = _owned_store_task(store)
+        view = publisher.heartbeat_view(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        self.assertTrue(
+            publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        )
+
+        publisher.begin_terminal()
+        before = len(client.writes)
+        self.assertFalse(
+            publisher.publish(
+                replace(view, state=STATE_RUNNING), allow_create=False, background=True
+            ),
+            "a background write must be refused once terminal publication began",
+        )
+        self.assertEqual(len(client.writes), before, "and it must not reach GitHub")
+
+        # The owning thread must still be able to publish the terminal state itself.
+        self.assertTrue(
+            publisher.publish(replace(view, state=STATE_AWAITING_REVIEW), allow_create=False),
+            "the owning thread must still publish the terminal state",
+        )
+        self.assertIn(STATE_AWAITING_REVIEW, client.writes[-1])
 
 
 class StaleIdentityTests(StatusCommentCase):

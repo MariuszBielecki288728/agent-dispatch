@@ -926,13 +926,23 @@ when the subprocess is first observed and wakes on the spawn signal — not on a
 sleep — so the first `Running` update is immediate rather than delayed by up to
 one poll. (Without that, a run shorter than the poll interval could finish before
 any tick, and the comment would jump `Starting` → `Publishing` without ever
-reporting `Running`.) It is stopped and joined **before** the terminal write —
-that ordering is what stops a late heartbeat from landing on top of
-`Awaiting review` or `Failed`. It is a thread rather than a poll-time hook
-because `CommandCodeDriver.run()` blocks reading the NDJSON stream: a heartbeat
-tied to the worker's polling loop would not run while the agent is actually
-working. The thread writes to GitHub only and never touches SQLite, so the worker's
-database connection stays owned by one thread.
+reporting `Running`.) It is a thread rather than a poll-time hook because
+`CommandCodeDriver.run()` blocks reading the NDJSON stream: a heartbeat tied to
+the worker's polling loop would not run while the agent is actually working. The
+thread writes to GitHub only and never touches SQLite, so the worker's database
+connection stays owned by one thread.
+
+**"No heartbeat lands after a terminal state" is structural, not a timeout.** One
+`StatusPublisher` is shared by the whole run lifecycle — `Starting`, the heartbeat,
+`Publishing` and the terminal sync — so they all take the *same* lock. When the run
+stops, the owning thread marks terminal publication as begun *under that lock*
+before its first terminal write. A join is deliberately not trusted for this: it is
+allowed to time out while a heartbeat is still inside the transport (a failed PATCH,
+a marker re-scan and a second PATCH are several sequential bounded calls), so relying
+on it would leave a window in which `Running` could overwrite `Awaiting review`. Any
+heartbeat write that starts after the flag is set is refused, and a heartbeat tick
+only ever PATCHes the comment it already knows — marker re-resolution, adoption and
+recovery stay on the owning thread.
 
 ### Ownership survives a crash between create and record
 
