@@ -71,6 +71,12 @@ RECOVERY_PUSH_FAILED = "push_failed"
 RECOVERY_PR_FAILED = "pr_failed"
 RECOVERY_INTERRUPTED = "interrupted"
 
+#: Detail prefix recorded on a run that a previous worker process left in flight.
+#: A stable marker rather than free prose, because the status comment derives
+#: "this task's last attempt was interrupted" from it — and that derivation must not
+#: depend on re-reading a note that only existed during one call.
+INTERRUPTED_RUN_MARKER = "interrupted: the worker process ended while this run was in flight"
+
 #: Stages whose preserved local work is finished work and may be published without a
 #: model call. Deliberately excludes `interrupted`.
 PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RECOVERY_PR_FAILED})
@@ -196,6 +202,33 @@ CREATE TABLE IF NOT EXISTS operations (
   created_at        TEXT    NOT NULL,
   updated_at        TEXT    NOT NULL
 );
+
+-- The one Issue status comment this dispatcher owns per (repo, Issue) (#17).
+--
+-- Same intent-before-action discipline as `operations`: a row is written *before*
+-- the comment is created, with comment_id NULL. A crash between "GitHub created
+-- it" and "the id was recorded" therefore leaves a recoverable intent rather than
+-- an orphan, and the next pass finds the comment by its marker and adopts it
+-- instead of posting a second one.
+--
+-- `last_body` is the rendered text, kept so an unchanged status costs zero GitHub
+-- writes across polls and restarts. It contains only values this service rendered
+-- from its own templates; raw agent output, prompts, stderr and filesystem paths
+-- are never stored here.
+CREATE TABLE IF NOT EXISTS status_comments (
+  repo              TEXT    NOT NULL,
+  issue_number      INTEGER NOT NULL,
+  task_id           INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+  comment_id        INTEGER,                    -- NULL until GitHub confirms the id
+  comment_url       TEXT,
+  last_state        TEXT,                       -- state label last published
+  last_body         TEXT,                       -- rendered body actually published
+  published_at      TEXT,
+  last_error        TEXT,
+  created_at        TEXT    NOT NULL,
+  updated_at        TEXT    NOT NULL,
+  PRIMARY KEY (repo, issue_number)
+);
 """
 
 
@@ -254,6 +287,34 @@ class Operation:
     external_id: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class StatusComment:
+    """The Issue status comment this dispatcher owns for one ``(repo, Issue)``.
+
+    ``comment_id`` is ``None`` while the ownership is *intended* but unconfirmed —
+    the state a crash between creating the comment and recording its id leaves
+    behind, and the reason the next pass scans the Issue for the marker instead of
+    assuming no comment exists.
+    """
+
+    repo: str
+    issue_number: int
+    task_id: int | None
+    comment_id: int | None
+    comment_url: str | None
+    last_state: str | None
+    last_body: str | None
+    published_at: str | None
+    last_error: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def owned(self) -> bool:
+        """Whether a concrete comment id has been confirmed."""
+        return self.comment_id is not None
 
 
 @dataclass(frozen=True)
@@ -407,7 +468,12 @@ class Store:
         written. Returns an empty store when this one does not exist yet.
         """
         clone = Store.in_memory()
-        for table in ("tasks", "observed_state", "runs", "operations"):
+        for table in ("tasks", "observed_state", "runs", "operations", "status_comments"):
+            if not self._table_present(table):
+                # An optional table an older build never created. Skipping it keeps a
+                # read-only `dry-run` working against a pre-#17 database instead of
+                # raising `no such table` mid-copy.
+                continue
             for row in self._conn.execute(f"SELECT * FROM {table}"):
                 columns = list(row.keys())
                 placeholders = ", ".join("?" for _ in columns)
@@ -469,8 +535,32 @@ class Store:
                 self._log_migration_race(table, column, exc)
 
     def _column_present(self, table: str, column: str) -> bool:
-        existing = {str(info["name"]) for info in self._conn.execute(f"PRAGMA table_info({table})")}
+        existing = {
+            str(info["name"])
+            for info in self._conn.execute(f"PRAGMA table_info({table})")
+            if str(info["name"]) not in ("",)
+        }
+        if not existing:
+            # A table that does not exist yet cannot have the column; the caller's
+            # CREATE TABLE already ran, so this is a genuine "needs adding".
+            return False
         return column in existing
+
+    def _table_present(self, table: str) -> bool:
+        """Whether ``table`` exists in this database.
+
+        Read-only stores deliberately do not migrate (that is what makes them
+        read-only), so a database written by an older build can legitimately lack a
+        table this build knows about. Reads have to tolerate that instead of raising
+        ``no such table``, otherwise the first command after an upgrade — e.g.
+        ``status``, which opens the database read-only — would fail before any write
+        path had a chance to add the table.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
 
     def _log_migration_race(self, table: str, column: str, exc: sqlite3.OperationalError) -> None:
         """Record a benign migration race once, without a logger dependency.
@@ -827,6 +917,20 @@ class Store:
             return False
         return runs[-1].outcome != RUN_SUCCEEDED
 
+    def last_run_interrupted(self, task_id: int) -> bool:
+        """Whether this task's newest run was abandoned by a dead worker process.
+
+        Derived from the recorded run rather than from a caller's note, so it stays
+        true across polls, across processes and across a restart — which is what lets
+        the Issue status comment say "the previous heartbeat went stale" durably
+        instead of only in the one call that noticed.
+        """
+        runs = self.run_history(task_id)
+        if not runs:
+            return False
+        newest = runs[-1]
+        return bool(newest.detail and INTERRUPTED_RUN_MARKER in newest.detail)
+
     def is_run_completed(self, run_row_id: int) -> bool:
         """Whether one specific run row records a clean runtime completion."""
         row = self._conn.execute(
@@ -1046,6 +1150,40 @@ class Store:
             (pr_number, pr_url, utcnow_iso(), note, utcnow_iso(), task_id),
         )
 
+    def finalise_publication(
+        self,
+        task_id: int,
+        *,
+        pr_number: int,
+        pr_url: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Record an owned PR, clear the recovery stage and mark it awaiting review.
+
+        **One statement, on purpose.** These three facts are only true together, and
+        the connection is in autocommit mode (``isolation_level=None``), so writing them
+        as three separate statements left two crash windows:
+
+        * after the PR is recorded but before the stage is cleared, the row keeps a
+          publishable ``recovery_stage`` while ``pr_number`` is set. The reconcile pass
+          returns early when a PR is owned, so the stage is never cleared, and
+          ``describe_task`` checks ``is_publish_pending`` *before* ``pr_number`` — so the
+          Issue comment would say "Recovering publication" forever for a task whose PR
+          already exists.
+        * after the stage is cleared but before the phase is set, the row keeps
+          ``needs_attention`` with an owned PR. The renderer still shows "Awaiting
+          review" because it trusts the verified PR, but the *durable* phase is wrong,
+          and the review loop depends on a real ``awaiting_review``.
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE tasks SET pr_number = ?, pr_url = ?, "
+            "pr_created_at = COALESCE(pr_created_at, ?), recovery_stage = NULL, "
+            "phase = 'awaiting_review', last_error = COALESCE(?, last_error), "
+            "updated_at = ? WHERE id = ?",
+            (pr_number, pr_url, now, note, now, task_id),
+        )
+
     # ------------------------------------------------- intent-before-action
 
     def intend_operation(self, task_id: int, *, kind: str, detail: str) -> int:
@@ -1093,6 +1231,116 @@ class Store:
         if task is None:
             raise ValueError(f"no task recorded for {repo}#{issue_number}")
         return task
+
+    # --------------------------------------------------- issue status comment
+
+    def status_comment(self, repo: str, issue_number: int) -> StatusComment | None:
+        """The status-comment row for one ``(repo, Issue)``, if any.
+
+        Scoped to the exact pair rather than to the task id: the row is the record of
+        *which comment this dispatcher owns*, and that ownership must never be
+        inferred for a different repository or Issue.
+
+        A pre-#17 database has no ``status_comments`` table at all, and read-only
+        stores never migrate, so an absent table means "this build has published no
+        status comments yet" rather than an error.
+        """
+        if not self._table_present("status_comments"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM status_comments WHERE repo = ? AND issue_number = ?",
+            (repo, issue_number),
+        ).fetchone()
+        return _row_to_status_comment(row) if row is not None else None
+
+    def note_status_intent(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        task_id: int | None,
+        state: str,
+    ) -> StatusComment:
+        """Record that a status comment is *about* to be created or reused.
+
+        Called before the GitHub call, so a crash in between leaves a row with
+        ``comment_id IS NULL`` — the marker of an unresolved ownership that the next
+        pass must resolve by scanning the Issue, rather than a state that looks like
+        "no comment exists". Never overwrites a confirmed id.
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "INSERT INTO status_comments (repo, issue_number, task_id, last_state, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (repo, issue_number) DO UPDATE SET "
+            "task_id = COALESCE(excluded.task_id, status_comments.task_id), "
+            "last_state = COALESCE(excluded.last_state, status_comments.last_state), "
+            "updated_at = excluded.updated_at",
+            (repo, issue_number, task_id, state, now, now),
+        )
+        return self._require_status_comment(repo, issue_number)
+
+    def record_status_published(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        comment_id: int | None,
+        comment_url: str | None,
+        state: str,
+        body: str,
+        task_id: int | None = None,
+    ) -> None:
+        """Record a status that actually reached GitHub, with its rendered body.
+
+        ``comment_id`` is preserved when this update does not carry one: losing a
+        confirmed id would make the next pass rescan (and, worse, could let it
+        decide the comment does not exist).
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "INSERT INTO status_comments (repo, issue_number, task_id, comment_id, comment_url, "
+            "last_state, last_body, published_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (repo, issue_number) DO UPDATE SET "
+            "task_id = COALESCE(excluded.task_id, status_comments.task_id), "
+            "comment_id = COALESCE(excluded.comment_id, status_comments.comment_id), "
+            "comment_url = COALESCE(excluded.comment_url, status_comments.comment_url), "
+            "last_state = excluded.last_state, last_body = excluded.last_body, "
+            "published_at = excluded.published_at, last_error = NULL, "
+            "updated_at = excluded.updated_at",
+            (
+                repo,
+                issue_number,
+                task_id,
+                comment_id,
+                comment_url,
+                state,
+                body,
+                now,
+                now,
+                now,
+            ),
+        )
+
+    def record_status_error(self, *, repo: str, issue_number: int, detail: str) -> None:
+        """Note that a status update did not reach GitHub. Purely informational.
+
+        A status-write failure must never change the task's phase, claim, attempt
+        budget or run validation, so this touches only the status row.
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE status_comments SET last_error = ?, updated_at = ? "
+            "WHERE repo = ? AND issue_number = ?",
+            (detail, now, repo, issue_number),
+        )
+
+    def _require_status_comment(self, repo: str, issue_number: int) -> StatusComment:
+        row = self.status_comment(repo, issue_number)
+        if row is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"no status comment row for {repo}#{issue_number}")
+        return row
 
 
 def _row_to_task(row: Mapping[str, Any]) -> Task:
@@ -1155,6 +1403,22 @@ def _row_to_run(row: Mapping[str, Any]) -> Run:
         log_path=row["log_path"],
         started_at=str(row["started_at"]),
         finished_at=row["finished_at"],
+    )
+
+
+def _row_to_status_comment(row: Mapping[str, Any]) -> StatusComment:
+    return StatusComment(
+        repo=str(row["repo"]),
+        issue_number=int(row["issue_number"]),
+        task_id=row["task_id"],
+        comment_id=row["comment_id"],
+        comment_url=row["comment_url"],
+        last_state=row["last_state"],
+        last_body=row["last_body"],
+        published_at=row["published_at"],
+        last_error=row["last_error"],
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 

@@ -27,13 +27,21 @@ Scenario shape::
           "events": ["tool_hook_blocked"],   # extra event kinds to emit
           "edits": {"file.txt": "content"},  # files to write into the cwd
           "commit": false,                   # git add/commit the working tree
-          "sleep": 0,                        # seconds to sleep before finishing
+          "sleep": 0,                        # seconds to sleep before starting
+          "stream_seconds": 0,               # seconds to stay in flight AFTER run_start
+          "stream_tick": 0.1,                # interval between streamed events
           "hang": false,                     # never finish (for timeout tests)
           "result_session_id": null          # override the id in the result line
         }
       ],
       "record_argv": "path"                  # append the argv to this file
     }
+
+``stream_seconds`` is what makes a status-heartbeat test meaningful: the process is
+really alive and really emitting for that long, so a heartbeat that only fires from
+the polling loop — rather than while the driver is blocked on the stream — cannot
+pass. The events it emits are ordinary ``tool_completed`` records, which is also how
+a test can show the last *observed event* time is distinct from the heartbeat time.
 
 No network access, no model credits, no GitHub mutation.
 """
@@ -180,6 +188,27 @@ def main(argv: list[str]) -> int:
         time.sleep(sleep_for)
 
     emit({"type": "run_start", "sessionId": session_id, "requestedSession": requested})
+
+    # A run that stays in flight, emitting events as it goes. This happens BEFORE the
+    # scripted `events` list so a scenario can put a blocked-tool event after a period
+    # of ordinary activity, exactly as a real run would.
+    stream_seconds = float(run.get("stream_seconds") or 0)
+    if stream_seconds > 0:
+        tick = max(float(run.get("stream_tick") or 0.1), 0.01)
+        deadline = time.monotonic() + stream_seconds
+        index = 0
+        while time.monotonic() < deadline:
+            emit(
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "tool_completed",
+                        "toolName": f"stream-step-{index}",
+                    },
+                }
+            )
+            index += 1
+            time.sleep(min(tick, max(deadline - time.monotonic(), 0.0)))
 
     for kind in run.get("events") or []:
         if kind == "tool_hook_blocked":

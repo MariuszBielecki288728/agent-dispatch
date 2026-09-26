@@ -187,6 +187,29 @@ class PullRequest:
         return False
 
 
+@dataclass(frozen=True)
+class IssueComment:
+    """One comment on an Issue, as GitHub reports it.
+
+    ``body`` is the raw markdown, because the only thing this is used for is finding
+    this service's own machine marker. ``url`` is the ``html_url`` a maintainer can
+    open, never an API URL.
+    """
+
+    id: int
+    body: str = ""
+    url: str = ""
+
+
+def _to_issue_comment(raw: dict[str, Any]) -> IssueComment:
+    body = raw.get("body")
+    return IssueComment(
+        id=int(raw.get("id", 0)),
+        body=str(body) if isinstance(body, str) else "",
+        url=str(raw.get("html_url") or ""),
+    )
+
+
 @dataclass
 class PreflightReport:
     """What the wrapper can actually prove right now. Nothing is assumed."""
@@ -223,6 +246,11 @@ class GitHubClient:
         #: truncated PR scan means a pre-existing PR might not have been seen, so
         #: callers must surface it instead of assuming "no PR exists".
         self.pr_scan_truncated = False
+        #: Set when the most recent **comment** listing stopped at the page cap. A
+        #: truncated comment scan means "no status comment of mine exists" is
+        #: unprovable, so callers must refuse to create another one rather than
+        #: risking a duplicate status thread.
+        self.comment_scan_truncated = False
         self._last_page_reached_cap = False
 
     # ------------------------------------------------------------------ core
@@ -441,6 +469,93 @@ class GitHubClient:
             if pull.head_ref == head_branch:
                 return pull
         return None
+
+    # -------------------------------------------------------- comment ops (#17)
+
+    def list_issue_comments(self, slug: str, issue_number: int) -> list[IssueComment]:
+        """Every comment on an Issue, and whether the scan hit the page cap.
+
+        ``comment_scan_truncated`` is set when pagination stopped at :data:`MAX_PAGES`
+        with more data pending. This is the recovery primitive for a crash between
+        creating a status comment and recording its id: the marker is found by
+        scanning this list. When the list is truncated, an absence of the marker is
+        **not** evidence of its absence, so the caller must not create a new comment.
+        """
+        self.comment_scan_truncated = False
+        comments: list[IssueComment] = []
+        endpoint = f"repos/{slug}/issues/{issue_number}/comments"
+        for raw in self._paginate(endpoint):
+            if isinstance(raw, dict) and "id" in raw:
+                comments.append(_to_issue_comment(raw))
+        if self._last_page_reached_cap:
+            self.comment_scan_truncated = True
+        return comments
+
+    def create_issue_comment(self, slug: str, issue_number: int, body: str) -> IssueComment:
+        """Post one comment on an Issue and return the real object GitHub created.
+
+        The returned ``id`` is what is recorded as ownership, never a number parsed
+        out of a fragment. A failure is raised, and the caller records the intent as
+        unresolved rather than assuming the comment landed — a create that timed out
+        may well have succeeded, which is why the next pass re-scans by marker.
+        """
+        self.check_available()
+        argv = ["api", "-X", "POST", f"repos/{slug}/issues/{issue_number}/comments"]
+        argv += ["-f", f"body={body}"]
+
+        try:
+            proc = self._execute(argv)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise GitHubError(f"failed to comment on {slug}#{issue_number}: {exc}") from exc
+
+        if proc.returncode != 0:
+            raise _classify_failure(proc.returncode, proc.stderr or "", argv)
+
+        try:
+            raw = json.loads((proc.stdout or "").strip() or "null")
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub accepted the comment but returned an unparseable body, so its id is "
+                "unknown; the next status pass will find it by marker instead of posting again",
+                kind=ErrorKind.MALFORMED,
+                detail=(proc.stdout or "")[:400],
+            ) from exc
+        if not isinstance(raw, dict) or "id" not in raw:
+            raise GitHubError(
+                "GitHub returned no comment id after creating one; the next status pass will "
+                "find it by marker instead of posting again",
+                kind=ErrorKind.MALFORMED,
+            )
+        return _to_issue_comment(raw)
+
+    def edit_issue_comment(self, slug: str, comment_id: int, body: str) -> IssueComment:
+        """Replace the body of one existing comment. Never creates a new one.
+
+        ``PATCH`` on a comment id is the whole point of Issue #17: one comment, edited
+        for every heartbeat. A non-zero exit is reported honestly so the caller can
+        warn and move on — a status edit is never allowed to affect a run.
+        """
+        self.check_available()
+        argv = ["api", "-X", "PATCH", f"repos/{slug}/issues/comments/{comment_id}"]
+        argv += ["-f", f"body={body}"]
+
+        try:
+            proc = self._execute(argv)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise GitHubError(f"failed to edit comment {comment_id} on {slug}: {exc}") from exc
+
+        if proc.returncode != 0:
+            raise _classify_failure(proc.returncode, proc.stderr or "", argv)
+
+        try:
+            raw = json.loads((proc.stdout or "").strip() or "null")
+        except json.JSONDecodeError:
+            # The edit succeeded as far as GitHub is concerned; only the echo is
+            # unparseable, so the caller keeps the id it already has.
+            return IssueComment(id=comment_id)
+        if not isinstance(raw, dict) or "id" not in raw:
+            return IssueComment(id=comment_id)
+        return _to_issue_comment(raw)
 
     def create_pull(
         self,

@@ -1,4 +1,4 @@
-# agent-dispatch — operations (Issues #3–#4)
+# agent-dispatch — operations (Issues #3–#4, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
 SQLite queue, and **one Command Code run per task in a task-owned Git worktree,
@@ -12,11 +12,14 @@ is not implemented here (§11).
 ```
 poll finds a labelled Issue            -> task row, phase `queued`
 claim (conditional SQL transition)     -> phase `running`, branch + worktree recorded
+                                       -> ONE status comment on the Issue (§13)
 Command Code runs in the worktree      -> session ID pinned to the row
+                                       -> comment edited in place every 5 min
 run validated                          -> blocked tools / bad session / timeout all FAIL
 changes committed if the agent left them uncommitted
 branch pushed with the approved credential helper
 one PR created (or an existing one adopted)  -> phase `awaiting_review`
+                                       -> same comment becomes `Awaiting review`
 ```
 
 Three things a reader should not assume:
@@ -458,6 +461,32 @@ is up the command re-arms the task and hands off, reporting that the worker will
 publish it on its next poll. That hand-off is safe because the worker finishes
 publish-pending work on every poll; it does not depend on a restart.
 
+### Publication is finalised in one statement
+
+Recording the owned PR, clearing `recovery_stage` and entering `awaiting_review` are
+written by **one** SQL statement (`Store.finalise_publication`), on both the create
+and adopt paths. These three facts are only true together, and the connection is in
+autocommit mode, so writing them separately left two crash windows:
+
+* crash after the PR was recorded but before the stage was cleared — the reconcile
+  pass returns early when a PR is owned, so the stale stage was never cleared, and the
+  status renderer reads the stage *before* the PR: the comment would say
+  "Recovering publication" indefinitely for a task whose PR already existed;
+* crash after the stage was cleared but before the phase changed — an owned PR beside
+  `needs_attention`, which is not a real `awaiting_review` for anything that gates on
+  the phase.
+
+Rows left inconsistent by an older build are **repaired on reconciliation**: a task
+with an owned PR *and* a publishable stage is the exact old crash signature, so the
+whole publication result is normalised in one statement — the owned PR is kept, the
+stale stage is cleared and the phase becomes `awaiting_review`. Clearing only the stage
+would leave the *other* inconsistent state (an owned PR beside `needs_attention`),
+which is still wrong for anything gating on a real `awaiting_review`.
+
+The repair is deliberately narrow: it applies only to that combination. A
+`needs_attention` row with an owned PR but **no** publishable stage is left alone,
+because that can be a legitimate later intervention rather than this crash signature.
+
 **Its exit status describes the outcome, not the attempt.** The command exits `0`
 only when the work is actually published (an owned PR exists) or when a live worker
 holds the lock and has explicitly accepted responsibility for the next poll. If the
@@ -852,7 +881,159 @@ GIT_CONFIG_VALUE_1='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credenti
 
 ---
 
-## 13. Verifying this release
+## 13. The Issue status comment (one comment, edited in place)
+
+While a task runs, `agent-dispatch` keeps **one status comment on the source
+Issue** current, so progress is visible on GitHub without SSH access to the VM.
+It looks like this (content is illustrative):
+
+```markdown
+### agent-dispatch · task status
+- **Status:** Running
+- **Runtime:** Command Code · model `<pinned model>` · thinking effort `<pinned effort>`
+- **Attempt:** 1 of 3
+- **Run started:** 2026-09-25 00:00 UTC
+- **Last checked:** 2026-09-25 00:10 UTC
+- **Elapsed:** 10 min
+- **Command Code process:** alive — task still running. This reports the subprocess
+  only; it is not a claim that the model is generating tokens, and no progress
+  estimate is available.
+- **Last observed runtime event:** 2026-09-25 00:07 UTC (12 events observed)
+- **Pull request:** #42 (<url>) — created by this task
+```
+
+**It is one comment, edited — not a new comment per heartbeat.** A comment edit is
+not a promise of a GitHub notification, and this is a visibility surface, not an
+alerting channel.
+
+### States
+
+| State | Means |
+|---|---|
+| `Queued` | claimed or re-armed; no process yet |
+| `Starting` | claim taken and the comment exists, but no process has been observed |
+| `Running` | the Command Code subprocess has been observed alive |
+| `Publishing` | the runtime finished cleanly; commit/push/PR has **not** succeeded yet |
+| `Awaiting review` | an **owned** PR exists and was verified |
+| `Recovering publication` | a publish-only failure is being finished off — no model call |
+| `Needs attention` | publication could not complete and needs a human |
+| `Paused` | a maintainer paused it; never overwritten by a heartbeat or auto-recovery |
+| `Failed` / `Interrupted` / `Finished` | terminal |
+
+`Publishing` is deliberately not `Awaiting review`: a clean model result is not a
+pull request, and the maintainer is told which of the two is actually true. The
+publish-only recovery paths from §11 (`commit_failed`, `push_failed`, `pr_failed`)
+surface as `Recovering publication` / `Needs attention`, and converge on the
+**same** comment when a later poll finishes them — with no new model call.
+
+### What it will not say
+
+* **A live PID is not progress.** "Process is alive" describes the subprocess only.
+  Elapsed time and the last *observed* stream event are reported instead of a
+  percentage, a token count or an ETA — none of which the dispatcher can observe.
+* **The last-event line appears only when an event was actually observed.** An
+  unobserved timestamp is omitted entirely rather than printed as a placeholder:
+  an invented timestamp is worse than an absent one.
+* **Terminal states carry no liveness fields at all**, so a finished task cannot be
+  mistaken for a running one.
+* **No transcripts, prompts, secrets or filesystem paths** reach a public Issue.
+
+### Delivery is best-effort by contract
+
+A slow, timed-out, rate-limited or denied GitHub write is logged as a warning
+(`status_comment_unexpected_error`, `status_comment_not_created`) and is otherwise
+inert: it never interrupts, fails, restarts or extends the run, never changes the
+task's phase, claim, attempt budget or run validation, and never switches identity
+to get around a denial. A later poll or reconciliation retries it without creating
+a duplicate.
+
+The heartbeat runs on **one bounded in-process thread per live run**. It starts
+when the subprocess is first observed and wakes on the spawn signal — not on a
+sleep — so the first `Running` update is immediate rather than delayed by up to
+one poll. (Without that, a run shorter than the poll interval could finish before
+any tick, and the comment would jump `Starting` → `Publishing` without ever
+reporting `Running`.) It is a thread rather than a poll-time hook because
+`CommandCodeDriver.run()` blocks reading the NDJSON stream: a heartbeat tied to
+the worker's polling loop would not run while the agent is actually working. The
+thread writes to GitHub only and never touches SQLite, so the worker's database
+connection stays owned by one thread.
+
+**"No heartbeat lands after a terminal state" is structural, not a timeout.** One
+`StatusPublisher` is shared by the whole run lifecycle — `Starting`, the heartbeat,
+`Publishing` and the terminal sync — so they all take the *same* lock. When the run
+stops, the owning thread marks terminal publication as begun *under that lock*
+before its first terminal write. A join is deliberately not trusted for this: it is
+allowed to time out while a heartbeat is still inside the transport (a failed PATCH,
+a marker re-scan and a second PATCH are several sequential bounded calls), so relying
+on it would leave a window in which `Running` could overwrite `Awaiting review`. Any
+heartbeat write that starts after the flag is set is refused, and a heartbeat tick is
+a **strictly narrower operation than a foreground write**: it may only PATCH the
+comment id it already holds. It never resolves ownership, never scans the Issue,
+never adopts and never creates — those stay on the owning thread, and a later poll
+already has that path. Two reasons for the narrowing: a scan is a paginated
+multi-call sequence, so allowing it inside a tick would let one tick outlive its join
+budget *and* make the owning thread's terminal write block behind it — and that write
+sits immediately before commit/push/PR.
+
+### Ownership survives a crash between create and record
+
+Three things keep the comment from being duplicated or hijacked:
+
+1. The comment carries a machine marker scoped to the exact repo and Issue:
+   `<!-- agent-dispatch:status repo="owner/name" issue=17 -->`.
+2. The `status_comments` row is written **before** the create call, so the intent
+   survives a crash inside that window.
+3. On resolution the Issue's comments are scanned for that exact marker, and the
+   owning comment is reused.
+
+Marker matching is exact, so a comment that merely *looks* like a status comment is
+never adopted, and another person's comment is never edited or deleted. Two further
+rules keep that honest:
+
+* **Ambiguity fails closed.** If *more than one* exact marker exists, ownership is
+  genuinely ambiguous, so nothing is edited and nothing is created — the dispatcher
+  logs `status_comment_ambiguous` and waits for an operator to delete the extra
+  comment. Picking one arbitrarily could edit a comment that is not ours, and would
+  compound the duplicate problem this design exists to prevent.
+* **An unprovable scan never creates.** If the comment listing comes back
+  **truncated**, "no marker found" cannot be proven, so nothing is created and a
+  warning is logged rather than risking a duplicate.
+* **A failed edit never creates either.** A rate limit, timeout or network error
+  fails identically to a deleted comment, so a failed edit triggers a re-scan; if
+  that scan finds a marked comment, it is adopted and retried and creation stays
+  refused. Creating is only safe once a **complete** scan proves no marked comment
+  exists.
+
+### Configuration
+
+```toml
+[worker]
+status_heartbeat_seconds = 300   # 5 minutes; lower only for testing
+```
+
+The initial `Starting` and the terminal updates happen immediately and never wait
+for this interval. Nothing is written while a task is merely `awaiting_review`, and
+a poll that changes nothing costs no GitHub write at all.
+
+That last guarantee depends on the body being a function of **durable state only**.
+A non-live status therefore takes its `Status updated` stamp from the task row
+rather than from the moment it was rendered: rendering the current time made the
+body differ on any poll that crossed a minute boundary, so the "body unchanged, skip
+the write" comparison could not recognise an idle comment and re-edited it on every
+such poll.
+
+`status`, `dry-run` and `open` stay **read-only**: they display the comment row but
+never create or edit a comment, and never start a runtime.
+
+Read-only stores deliberately do not migrate, so an **upgraded database has no
+`status_comments` table until a write path opens it**. Reads treat an absent table
+as "this build has published no status comments yet" rather than failing, so
+`status` / `dry-run` / `open` work immediately after an upgrade and the first
+worker or `enqueue` run creates the table normally. A read command never adds it.
+
+---
+
+## 14. Verifying this release
 
 Everything below is available after `uv sync --locked`. The scripts accept a
 `PYTHON=` override so the suite can run on the uv-managed interpreter, which is
@@ -864,7 +1045,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 214 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 280 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -905,6 +1086,13 @@ a mock. The cases most worth knowing about:
 | `SessionCaptureTests` | the session ID reaches SQLite while the run is still in flight, and is still not advertised as resumable |
 | `CredentialEnvironmentMockedTests` | the agent inherits the reset-then-wrapper ordering, and repo-local config is opt-in |
 | `StatusReadOnlyTests` | `status`/`dry-run`/`open` start no agent and create no state |
+| `SingleCommentLifecycleTests` | one comment per task is created at the real start, heartbeats **edit its ID** and never POST another, and no heartbeat edit follows the terminal update |
+| `HeartbeatDuringRunTests` | heartbeats land **while the runtime is blocked**, not merely when the polling loop resumes |
+| `PublicationLifecycleTests` | clean completion → forced `commit_failed`/`push_failed`/`pr_failed` → trouble shown rather than success → the same long-lived worker finishes it on a later poll → the same comment becomes `Awaiting review` with zero extra model calls |
+| `PauseAndTransitionTests` | a manual `pause` stays `Paused` and is never overtaken; `unpause`/re-added `take-it`/`resume-publish` restore publication |
+| `MarkerRecoveryTests` | a crash between comment creation and recording its ID reuses the marked comment, ending with exactly one |
+| `NonFatalDeliveryTests` | an edit timeout / rate limit / denied write leaves the run result correct, logs a warning, and creates no duplicate |
+| `ReadOnlyTests` | `status`/`dry-run` never create or edit a comment and never start a runtime |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -927,7 +1115,7 @@ uv lock                                  # refresh it deliberately
 
 ---
 
-## 14. Not in this release
+## 15. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
 Issues #5/#6 and are **not implemented, not stubbed and not faked**:

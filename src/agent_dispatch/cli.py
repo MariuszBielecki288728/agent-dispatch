@@ -314,6 +314,9 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
                         "last_run_at": task.last_run_at,
                         "pause_reason": task.pause_reason,
                         "observed_at": task.observed_at,
+                        "status_comment_id": _status_column(view, task, "comment_id"),
+                        "status_comment_state": _status_column(view, task, "last_state"),
+                        "status_comment_url": _status_column(view, task, "comment_url"),
                     }
                     for task in tasks
                 ],
@@ -359,6 +362,14 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
             print(f"  {task.ref:<28} {task.phase:<16} {intent:<7} {pr:<7} {state}")
             if task.branch or task.session_id:
                 print(f"      branch: {task.branch or '-'}  session: {task.session_id or '-'}")
+            comment = view.status_comment(task.repo, task.issue_number)
+            if comment is not None:
+                shown = f"#{comment.comment_id}" if comment.comment_id else "pending"
+                print(
+                    f"      status comment: {shown} "
+                    f"({comment.last_state or 'unknown'})"
+                    + (f" — {comment.last_error}" if comment.last_error else "")
+                )
             if task.last_error:
                 print(f"      note: {task.last_error}")
 
@@ -367,6 +378,10 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print(
             "  In this release an eligible task is executed, pushed and opened as one PR; "
             "the review loop is Issue #5."
+        )
+        print(
+            "  Each claimed task has ONE status comment on its Issue, edited in place while it "
+            "runs (Issue #17)."
         )
         return EXIT_OK
     finally:
@@ -406,6 +421,16 @@ def _poll_snapshot(config: Config, base: Store, log: Logger) -> SnapshotPoll:
     tasks = scratch.list_tasks()
     dispatchable = [task.ref for task in tasks if task.dispatchability()[0]]
     return SnapshotPoll(store=scratch, outcome=outcome, dispatchable=dispatchable)
+
+
+def _status_column(view: Store, task, column: str):
+    """One field of a task's status-comment row, or ``None`` when it has none.
+
+    ``status`` is a read-only view: this only reads the row the write paths already
+    recorded, and never resolves, creates or edits a comment.
+    """
+    row = view.status_comment(task.repo, task.issue_number)
+    return getattr(row, column) if row is not None else None
 
 
 def _cmd_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:
@@ -594,6 +619,7 @@ def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
 
         runs = store.run_history(task.id)
         resumable = store.resumable_session(task.id)
+        status_row = store.status_comment(task.repo, task.issue_number)
         print(f"{task.ref} — {task.title or '(no title)'}")
         print(
             f"  phase          : {task.phase}"
@@ -619,6 +645,20 @@ def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
         )
         print(f"  attempts       : {task.attempts}")
         print(f"  session        : {task.session_id or '-'}")
+        if status_row is not None:
+            print(
+                "  status comment : "
+                + (
+                    f"#{status_row.comment_id} {status_row.comment_url or ''}"
+                    if status_row.comment_id
+                    else "not created yet (ownership intended)"
+                )
+            )
+            print(f"  comment state  : {status_row.last_state or '-'}")
+            if status_row.published_at:
+                print(f"  comment edit   : {status_row.published_at}")
+            if status_row.last_error:
+                print(f"  comment warning: {status_row.last_error}")
         print(
             "  resumable      : "
             + (
@@ -813,6 +853,12 @@ def _cmd_resume_publish(args: argparse.Namespace, config: Config, log: Logger) -
             notes = orchestrator.reconcile_publish_pending()
             for note in notes:
                 print(f"publish: {note}")
+            # Publication may have concluded for this task, so its Issue status
+            # comment is brought up to date in the same command rather than waiting
+            # for the next worker poll.
+            fresh = store.get_task(args.repo, args.issue)
+            if fresh is not None:
+                orchestrator.sync_task_status(fresh)
             return _resume_publish_result(args, store, log, notes)
         finally:
             store.close()
@@ -890,9 +936,33 @@ def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) 
             f"{task.ref}: {action} → {task.phase}"
             + (f" ({task.last_error})" if task.last_error else "")
         )
+        # The Issue status comment follows the durable state, so an operator command
+        # cannot leave a comment describing the phase before it. Best-effort by
+        # design: an unreachable GitHub must not fail a command that already changed
+        # local state, and never rolls the change back.
+        _sync_status_after_mutation(config, store, log, task)
         return EXIT_OK
     finally:
         store.close()
+
+
+def _sync_status_after_mutation(config: Config, store: Store, log: Logger, task) -> None:
+    """Update one task's Issue status comment after a local transition.
+
+    Never fatal and never a precondition: the mutation has already been applied and
+    recorded, and a GitHub outage must not turn a successful local change into a
+    reported failure. A task that never owned a comment is a no-op.
+    """
+    try:
+        Orchestrator(config, store, GitHubClient(config.github.command), log).sync_task_status(task)
+    except Exception as exc:  # noqa: BLE001 - status reporting is never fatal
+        log.warning(
+            "status_sync_failed",
+            repo=task.repo,
+            issue=task.issue_number,
+            error=f"{type(exc).__name__}: {exc}",
+            detail="the task's own state was already changed and is unaffected",
+        )
 
 
 # -------------------------------------------------------------- prune-logs

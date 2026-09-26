@@ -84,6 +84,12 @@
           "default": "agent-dispatch@localhost",
           "description": "Author email for orchestrator-made commits. Set this to your GitHub noreply address if you want those commits attributed to you."
         },
+        "status_heartbeat_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "How often, in seconds, the dispatcher edits its single status comment on the source Issue while a Command Code run is alive (Issue #17). Only the comment is edited - one comment per task, never one per heartbeat - and the write is best-effort: a slow, timed-out or denied edit never delays, fails, restarts or extends the run, and never changes the task phase, claim, attempt budget or run validation. Default 300 (5 minutes); the initial (Starting) and terminal (Awaiting review / Failed) updates are immediate and do not wait for this interval."
+        },
         "write_repo_local_credentials": {
           "type": "boolean",
           "default": false,

@@ -183,6 +183,11 @@ def main(argv: list[str]) -> int:
     # runs until its own page cap — the only way to simulate a truncated listing
     # without inventing thousands of real fixtures.
     pad_pages = int(os.environ.get("FAKE_GH_PAD_FULL_PAGES", "0") or 0)
+    # `FAKE_GH_PAD_COMMENTS=N` does the same for the ISSUE COMMENT listing only.
+    # Separate on purpose: padding every endpoint would also truncate the PR listing,
+    # which the discovery path correctly treats as fail-closed, so the task would never
+    # be queued and the comment behaviour under test could not be reached at all.
+    pad_comments = int(os.environ.get("FAKE_GH_PAD_COMMENTS", "0") or 0)
 
     if endpoint == "user":
         spec = consume_failure(world, "user")
@@ -252,6 +257,98 @@ def main(argv: list[str]) -> int:
         labels = repo.get("labels", [])
         page_items = paginate(labels, page, per_page)
         emit(page_items, jq)
+        return 0
+
+    if (
+        resource == "issues"
+        and len(tail) == 3
+        and tail[1] == "comments"
+        and method
+        in {
+            "PATCH",
+            "POST",
+        }
+    ):
+        # `repos/<slug>/issues/comments/<id>` — edit one comment in place. This is
+        # the endpoint the heartbeat uses, so `failures["<slug>:comment_edit"]`
+        # models a rate-limited or denied edit.
+        spec = consume_failure(world, f"{slug}:comment_edit")
+        if spec:
+            fail_with(spec)
+        comment_id = int(tail[2])
+        records = repo.setdefault("comments", [])
+        for record in records:
+            if int(record["id"]) == comment_id:
+                record["body"] = fields.get("body", record.get("body", ""))
+                record["edit_count"] = int(record.get("edit_count", 0)) + 1
+                # The full write history, so a test can prove heartbeats EDITED the
+                # comment (and which states were actually published) rather than
+                # POSTing new ones.
+                repo.setdefault("comment_writes", []).append(
+                    {
+                        "kind": "edit",
+                        "comment_id": comment_id,
+                        "body": record["body"],
+                        "issue_number": int(record.get("issue_number", 0)) or None,
+                    }
+                )
+                save_world(world)
+                emit(record, jq)
+                return 0
+        # A 404 here is exactly what a deleted comment looks like.
+        die(f"gh: Not Found (HTTP 404) — comment {comment_id} in {slug}", 1)
+
+    if resource == "issues" and len(tail) == 3 and tail[2] == "comments":
+        # `repos/<slug>/issues/<n>/comments` — list, or POST to create.
+        if method == "POST":
+            spec = consume_failure(world, f"{slug}:comment_create")
+            if spec:
+                fail_with(spec)
+            records = repo.setdefault("comments", [])
+            number = max([int(record["id"]) for record in records] or [1000]) + 1
+            record = {
+                "id": number,
+                "body": fields.get("body", ""),
+                "html_url": f"https://github.com/{slug}/issues/{tail[1]}#issuecomment-{number}",
+                "issue_url": f"https://api.github.com/repos/{slug}/issues/{tail[1]}",
+                "user": {"login": world.get("identity", "fake-user")},
+                "issue_number": int(tail[1]),
+                "edit_count": 0,
+            }
+            records.append(record)
+            repo.setdefault("comment_writes", []).append(
+                {
+                    "kind": "create",
+                    "comment_id": number,
+                    "body": record["body"],
+                    "issue_number": int(tail[1]),
+                }
+            )
+            save_world(world)
+            emit(record, jq)
+            return 0
+        spec = consume_failure(world, f"{slug}:comments")
+        if spec:
+            fail_with(spec)
+        records = [
+            record
+            for record in repo.get("comments", [])
+            if int(record.get("issue_number", int(tail[1]))) == int(tail[1])
+        ]
+        if pad_comments and page <= pad_comments:
+            # An exactly-full page keeps the client paginating until its own cap: a
+            # genuinely truncated comment scan, which must refuse to create anything.
+            filler = [
+                {
+                    "id": 900000 + (page - 1) * per_page + index,
+                    "body": "unrelated filler",
+                    "html_url": f"https://github.com/{slug}/issues/{tail[1]}#c{index}",
+                }
+                for index in range(len(records[:per_page]), per_page)
+            ]
+            emit(records[:per_page] + filler, jq)
+            return 0
+        emit(paginate(records, page, per_page), jq)
         return 0
 
     if resource == "issues" and len(tail) == 1:

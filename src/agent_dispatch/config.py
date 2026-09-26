@@ -74,6 +74,8 @@ class WorkerConfig:
     write_repo_local_credentials: bool
     commit_identity_name: str
     commit_identity_email: str
+    #: How often the Issue status comment is edited while a run is alive (#17).
+    status_heartbeat_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -233,6 +235,7 @@ def _build(raw: dict[str, Any], source_path: Path) -> Config:
         # them attributed to you.
         commit_identity_name=worker_raw.get("commit_identity_name", "agent-dispatch"),
         commit_identity_email=worker_raw.get("commit_identity_email", "agent-dispatch@localhost"),
+        status_heartbeat_seconds=int(worker_raw.get("status_heartbeat_seconds", 300)),
     )
 
     github = GithubConfig(
