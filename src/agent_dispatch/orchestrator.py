@@ -52,7 +52,16 @@ from .runtime import (
     next_run_id,
     redact_argv,
 )
+from .statuscomment import (
+    STALE_HEARTBEAT_NOTE,
+    STALE_PRONE_STATES,
+    RunHeartbeat,
+    StatusPublisher,
+    status_client,
+    sync_all_status,
+)
 from .store import (
+    INTERRUPTED_RUN_MARKER,
     PUBLISH_RECONCILE_PHASES,
     RECOVERY_COMMIT_FAILED,
     RECOVERY_INTERRUPTED,
@@ -64,6 +73,7 @@ from .store import (
     Store,
     Task,
 )
+from .util import utcnow_iso
 from .worktree import WorktreeError, WorktreeManager, WorktreeState
 
 #: Machine-readable reasons a dispatch attempt did not proceed. Stable codes so
@@ -145,6 +155,8 @@ class Orchestrator:
         *,
         git: Git | None = None,
         runtime_env: dict[str, str] | None = None,
+        status: bool = True,
+        status_github: GitHubClient | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -158,6 +170,19 @@ class Orchestrator:
         #: Git config pairs so Git commands the agent issues inherit the approved
         #: helper ordering without any file being modified.
         self.runtime_env = self.git.env(runtime_env)
+        #: Whether this instance may create/edit Issue status comments (#17). On by
+        #: default on the write paths: a status comment is the point of the feature.
+        #: The read-only commands never construct an Orchestrator at all, so they
+        #: cannot post one by accident.
+        self.status = status
+        #: Client used only for status comments. Deliberately a distinct instance with
+        #: a short timeout: a status edit must not be able to occupy the single task
+        #: lock for as long as a full listing call, and it uses the same configured
+        #: wrapper, so no second credential path exists.
+        self._status_client = status_github or (status_client(config) if status else None)
+        #: UTC start time of the run in flight, for the status comment. Set at the
+        #: start of :meth:`_run_once`, which is the only place that knows it.
+        self._run_started_at: str | None = None
 
     # ------------------------------------------------------------------ entry
 
@@ -231,6 +256,83 @@ class Orchestrator:
 
         return self._execute(task, repo, issue)
 
+    # ------------------------------------------------------- status comment
+
+    def _publisher(self, task: Task) -> StatusPublisher | None:
+        """A status publisher for this task, or ``None`` when status is disabled.
+
+        Constructed per task rather than cached, because the ``(repo, Issue)`` pair is
+        part of what a publisher owns and caching one across tasks is exactly how a
+        status ends up on the wrong Issue.
+        """
+        if not self.status or self._status_client is None:
+            return None
+        return StatusPublisher(
+            client=self._status_client,
+            store=self.store,
+            log=self.log,
+            repo=task.repo,
+            issue_number=task.issue_number,
+            max_attempts=self.config.worker.max_attempts,
+        )
+
+    def sync_task_status(self, task: Task, *, note: str | None = None) -> bool:
+        """Re-derive one task's status comment from durable state. Never fatal.
+
+        Called after any transition that changes what the comment should say
+        (pause/unpause/retry/resume-publish, a close, a withdrawal). Editing is
+        skipped when the rendered body is unchanged, so this costs nothing on GitHub
+        while a task sits still.
+        """
+        publisher = self._publisher(task)
+        if publisher is None:
+            return False
+        try:
+            return publisher.sync_from_task(task, note=note)
+        except Exception as exc:  # noqa: BLE001 - status reporting is never fatal
+            self.log.warning(
+                "status_sync_failed",
+                repo=task.repo,
+                issue=task.issue_number,
+                error=f"{type(exc).__name__}: {exc}",
+                detail="the task's own state, phase and attempt budget are unaffected",
+            )
+            return False
+
+    def sync_status_comments(self, *, notes: dict[str, str] | None = None) -> list[str]:
+        """Refresh every owned status comment from durable state. Never fatal.
+
+        This is the repair path for the cases where nothing else would touch a
+        comment: a stale ``Running`` left by a killed process, a task moved by an
+        operator command, or a publication finished by a later poll. Every comment is
+        edited in place — none is created here, because a task that never claimed a
+        comment never had a status to begin with.
+        """
+        if not self.status or self._status_client is None:
+            return []
+        return sync_all_status(
+            self.config,
+            self.store,
+            self.log,
+            client=self._status_client,
+            notes=notes,
+        )
+
+    def _stale_notes(self) -> dict[str, str]:
+        """Per-task explainer for comments whose last published state was volatile.
+
+        A persisted ``Starting``/``Running``/``Publishing`` can only have been written
+        by a process that is no longer alive (one writer holds the single-instance
+        lock, and dispatch is synchronous), so the first synchronisation after a start
+        says so rather than letting a stale "Running" read as current.
+        """
+        notes: dict[str, str] = {}
+        for task in self.store.list_tasks():
+            row = self.store.status_comment(task.repo, task.issue_number)
+            if row is not None and row.last_state in STALE_PRONE_STATES:
+                notes[task.ref] = STALE_HEARTBEAT_NOTE
+        return notes
+
     # ------------------------------------------------------------ eligibility
 
     def _oldest_eligible(self) -> Task | None:
@@ -265,6 +367,18 @@ class Orchestrator:
             issue=task.issue_number,
             stage=task.recovery_stage,
         )
+        self._sync_after_transition(task)
+
+    def _sync_after_transition(self, task: Task) -> None:
+        """Update this task's status comment from the row a transition just wrote.
+
+        Re-reads the task rather than using the caller's snapshot, so the comment
+        describes the state *after* the transition. A no-op for a task that never
+        owned a comment, and never fatal.
+        """
+        fresh = self.store.get_task(task.repo, task.issue_number)
+        if fresh is not None:
+            self.sync_task_status(fresh)
 
     def _revalidate(
         self, task: Task, repo: RepoConfig
@@ -301,6 +415,7 @@ class Orchestrator:
 
         if issue.state == "closed":
             self.store.mark_finished(task.id, f"Issue closed ({issue.url})")
+            self._sync_after_transition(task)
             return None, DispatchOutcome(
                 action=OUTCOME_BLOCKED, task_ref=task.ref, reason="issue_closed"
             )
@@ -311,6 +426,7 @@ class Orchestrator:
                 task.id,
                 f"label '{trigger}' was removed before dispatch; dispatch intent withdrawn",
             )
+            self._sync_after_transition(task)
             return None, DispatchOutcome(
                 action=OUTCOME_BLOCKED, task_ref=task.ref, reason="trigger_label_missing"
             )
@@ -475,8 +591,14 @@ class Orchestrator:
             instruction=instruction.text,
             kind="implementation",
             session_id=None,
+            issue=issue,
         )
         if early is not None:
+            # The runtime could not be started at all, so `_finish` never runs. The
+            # status comment must still be brought up to date: `Starting` was already
+            # published, and leaving it there would describe a process that does not
+            # exist — the same stale-running lie this feature exists to prevent.
+            self.sync_task_status(task)
             return early
         return self._finish(
             task,
@@ -486,6 +608,8 @@ class Orchestrator:
             result,
             run_row=run_row,
             issue=issue,
+            publisher=self._publisher(task),
+            run_started_at=self._run_started_at,
         )
 
     def _run_once(
@@ -497,13 +621,30 @@ class Orchestrator:
         instruction: str,
         kind: str,
         session_id: str | None,
+        issue: Issue | None = None,
     ) -> tuple[RunResult | None, int, DispatchOutcome | None]:
         """Invoke the runtime once, recording the run's start and end.
 
         Returns ``(result, run_row_id, early_outcome)``. ``early_outcome`` is set
         when the runtime could not be started at all, in which case the failed run
         is already recorded and the caller must not continue to the publish step.
+
+        Also owns the status-comment lifecycle for a run (Issue #17): ``Starting`` is
+        published **after the claim and before the spawn**, the heartbeat starts as
+        soon as the subprocess exists, and both the heartbeat and the ``Publishing``
+        transition happen here because this is the only place that knows a run's real
+        start and stop.
         """
+        publisher = self._publisher(task) if issue is not None else None
+        attempt = task.attempts + 1
+        self._run_started_at = utcnow_iso()
+        heartbeat: RunHeartbeat | None = None
+        if publisher is not None:
+            # After the claim: nothing before this point has done any work, so a
+            # status comment for an Issue that was only *considered* would be a
+            # second, duplicate thread created for no reason.
+            publisher.begin(task, attempt=attempt, run_started_at=self._run_started_at)
+
         driver = CommandCodeDriver(
             repo.runtime,
             run_log_dir=self.config.worker.run_log_dir,
@@ -544,6 +685,21 @@ class Orchestrator:
         )
 
         started = time.monotonic()
+        if publisher is not None:
+            # One bounded thread for the lifetime of this run. Started here — not
+            # before — so `Starting` is published without a live process and the
+            # heartbeat only begins editing once the subprocess really exists. It
+            # keeps working while this thread is blocked reading the stream, which is
+            # why it cannot be driven from the polling loop.
+            heartbeat = RunHeartbeat(
+                publisher,
+                base_view=publisher.heartbeat_view(
+                    task, attempt=attempt, run_started_at=self._run_started_at or ""
+                ),
+                interval_seconds=self.config.worker.status_heartbeat_seconds,
+                log=self.log,
+            )
+            heartbeat.start()
         try:
             result = driver.run(
                 worktree=worktree,
@@ -556,10 +712,19 @@ class Orchestrator:
                 # that answer is needed. This does NOT make the run resumable — an
                 # interrupted first run still has no transcript.
                 on_session=lambda new_id: self.store.record_session(task.id, new_id),
+                # The two progress signals the status comment needs. Both are
+                # informational: the driver swallows any exception either raises, so
+                # a misbehaving reporter cannot change this run's outcome.
+                on_spawn=(heartbeat.note_spawned if heartbeat is not None else None),
+                on_event=(heartbeat.note_event if heartbeat is not None else None),
             )
         except RuntimeSpawnError as exc:
             # The runtime is not installed or cannot start: a configuration fault.
             # Recorded as a failed run so the attempt budget still advances.
+            if heartbeat is not None:
+                # Stop and join before the terminal edit so a late heartbeat cannot
+                # overwrite it.
+                heartbeat.stop_and_join()
             self.store.finish_run(
                 run_row,
                 outcome=RUN_FAILED,
@@ -596,6 +761,11 @@ class Orchestrator:
                 error=result.session_callback_error,
                 detail="the run is unaffected, but the session ID could not be stored",
             )
+        # The subprocess has stopped, so nothing may describe it as alive any more.
+        # Joining here — before any terminal edit — is what guarantees a late
+        # heartbeat cannot land on top of `Publishing` / `Failed`.
+        if heartbeat is not None:
+            heartbeat.stop_and_join()
         self.log.info(
             "agent_run_finished",
             duration_s=round(time.monotonic() - started),
@@ -606,6 +776,52 @@ class Orchestrator:
     # -------------------------------------------------------------- post-run
 
     def _finish(
+        self,
+        task: Task,
+        repo: RepoConfig,
+        manager: WorktreeManager,
+        before: WorktreeState,
+        result: RunResult | None,
+        *,
+        run_row: int,
+        issue: Issue,
+        publisher: StatusPublisher | None = None,
+        run_started_at: str | None = None,
+    ) -> DispatchOutcome:
+        """Evaluate a finished run, publish its status, then push and open one PR.
+
+        Wraps :meth:`_evaluate` so that **every** exit path updates the same Issue
+        comment from the durable row that path just wrote. Doing it here, rather than
+        after each individual return, is what makes it impossible for a new failure
+        branch to be added later that silently leaves the comment saying `Running`.
+        """
+        if result is not None and result.ok and publisher is not None:
+            # Runtime completion is not publication completion. `Publishing` is an
+            # honest intermediate state: the model is done, the pull request does not
+            # exist yet. Claiming `Awaiting review` here is exactly the overstatement
+            # this feature is meant to remove.
+            publisher.publishing(
+                task, run_started_at=run_started_at or "", attempt=task.attempts + 1
+            )
+        outcome = self._evaluate(
+            task,
+            repo,
+            manager,
+            before,
+            result,
+            run_row=run_row,
+            issue=issue,
+        )
+        if publisher is not None:
+            # Re-read rather than reuse `task`: the row was mutated by the path above,
+            # and syncing from a stale snapshot is how a comment ends up reporting the
+            # state before the transition instead of after it.
+            fresh = self.store.get_task(task.repo, task.issue_number)
+            if fresh is not None:
+                self.sync_task_status(fresh)
+        return outcome
+
+    def _evaluate(
         self,
         task: Task,
         repo: RepoConfig,
@@ -1151,7 +1367,15 @@ class Orchestrator:
                 continue
             if task.phase not in PUBLISH_RECONCILE_PHASES:
                 continue
-            notes.extend(self._reconcile_publish_pending(task))
+            task_notes = self._reconcile_publish_pending(task)
+            notes.extend(task_notes)
+            if task_notes:
+                # Publication reached a new conclusion for this task, so its status
+                # comment is updated in the same pass — the maintainer should not have
+                # to wait another poll to see that recovery succeeded or failed.
+                fresh = self.store.get_task(task.repo, task.issue_number)
+                if fresh is not None:
+                    self.sync_task_status(fresh)
         return notes
 
     def reconcile(self) -> list[str]:
@@ -1171,6 +1395,10 @@ class Orchestrator:
 
         The published-work check is what stops a crash during ``git push``/PR creation
         from spending a second model call on work that already exists on the branch.
+
+        The status-comment pass runs afterwards, over every task that owns a comment,
+        so a status left by a killed process is re-derived from the repaired state and
+        explicitly marked as having replaced a stale heartbeat.
         """
         notes: list[str] = []
 
@@ -1188,6 +1416,11 @@ class Orchestrator:
                 # preserved so that unpausing can restore publication, and acting on it
                 # here would publish work the operator had stopped.
                 notes.extend(self._reconcile_publish_pending(task))
+
+        # One status synchronisation for every owned comment, after every task above
+        # has its final phase. Parked or interrupted comments are the case a
+        # heartbeat structurally cannot cover: the process that owned them is gone.
+        notes.extend(self.sync_status_comments(notes=self._stale_notes()))
 
         if self.config.worker.run_log_dir.is_dir():
             try:
@@ -1232,7 +1465,7 @@ class Orchestrator:
                 tool_hook_blocked=False,
                 timed_out=False,
                 produced_work=None,
-                detail="interrupted: the worker process ended while this run was in flight",
+                detail=INTERRUPTED_RUN_MARKER,
             )
 
         if not task.branch:

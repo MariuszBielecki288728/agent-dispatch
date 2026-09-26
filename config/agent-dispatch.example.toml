@@ -102,6 +102,25 @@ lock_file = "~/.local/state/agent-dispatch/worker.lock"
 # is an extra, not a requirement.
 write_repo_local_credentials = false
 
+# How often, in seconds, the dispatcher EDITS its single status comment on the
+# source Issue while a Command Code run is alive (Issue #17).
+#
+# "Edits" is the point: one comment per task, updated in place. A new comment per
+# heartbeat is explicitly not what this does, and a comment edit is not a promise
+# of a GitHub notification.
+#
+# This runs on one bounded in-process thread per live run, so it keeps working
+# while the driver is blocked reading the runtime's NDJSON stream — it does not
+# wait for the worker's next poll. It is also strictly non-fatal: a slow,
+# timed-out, rate-limited or denied edit is logged as a warning and never delays,
+# fails, restarts or extends the run, and never changes the task phase, claim,
+# attempt budget or run validation. The initial `Starting` and terminal
+# `Awaiting review` / `Failed` updates are immediate and do not wait for this
+# interval. While a task is merely awaiting review, no heartbeats are sent.
+#
+# Lower this only for local testing.
+status_heartbeat_seconds = 300
+
 
 [github]
 # The ONLY sanctioned GitHub access path on this development VM.

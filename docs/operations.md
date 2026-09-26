@@ -1,4 +1,4 @@
-# agent-dispatch — operations (Issues #3–#4)
+# agent-dispatch — operations (Issues #3–#4, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
 SQLite queue, and **one Command Code run per task in a task-owned Git worktree,
@@ -12,11 +12,14 @@ is not implemented here (§11).
 ```
 poll finds a labelled Issue            -> task row, phase `queued`
 claim (conditional SQL transition)     -> phase `running`, branch + worktree recorded
+                                       -> ONE status comment on the Issue (§13)
 Command Code runs in the worktree      -> session ID pinned to the row
+                                       -> comment edited in place every 5 min
 run validated                          -> blocked tools / bad session / timeout all FAIL
 changes committed if the agent left them uncommitted
 branch pushed with the approved credential helper
 one PR created (or an existing one adopted)  -> phase `awaiting_review`
+                                       -> same comment becomes `Awaiting review`
 ```
 
 Three things a reader should not assume:
@@ -852,7 +855,114 @@ GIT_CONFIG_VALUE_1='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credenti
 
 ---
 
-## 13. Verifying this release
+## 13. The Issue status comment (one comment, edited in place)
+
+While a task runs, `agent-dispatch` keeps **one status comment on the source
+Issue** current, so progress is visible on GitHub without SSH access to the VM.
+It looks like this (content is illustrative):
+
+```markdown
+### agent-dispatch · task status
+- **Status:** Running
+- **Runtime:** Command Code · model `<pinned model>` · thinking effort `<pinned effort>`
+- **Attempt:** 1 of 3
+- **Run started:** 2026-09-25 00:00 UTC
+- **Last checked:** 2026-09-25 00:10 UTC
+- **Elapsed:** 10 min
+- **Command Code process:** alive — task still running. This reports the subprocess
+  only; it is not a claim that the model is generating tokens, and no progress
+  estimate is available.
+- **Last observed runtime event:** 2026-09-25 00:07 UTC (12 events observed)
+- **Pull request:** #42 (<url>) — created by this task
+```
+
+**It is one comment, edited — not a new comment per heartbeat.** A comment edit is
+not a promise of a GitHub notification, and this is a visibility surface, not an
+alerting channel.
+
+### States
+
+| State | Means |
+|---|---|
+| `Queued` | claimed or re-armed; no process yet |
+| `Starting` | claim taken and the comment exists, but no process has been observed |
+| `Running` | the Command Code subprocess has been observed alive |
+| `Publishing` | the runtime finished cleanly; commit/push/PR has **not** succeeded yet |
+| `Awaiting review` | an **owned** PR exists and was verified |
+| `Recovering publication` | a publish-only failure is being finished off — no model call |
+| `Needs attention` | publication could not complete and needs a human |
+| `Paused` | a maintainer paused it; never overwritten by a heartbeat or auto-recovery |
+| `Failed` / `Interrupted` / `Finished` | terminal |
+
+`Publishing` is deliberately not `Awaiting review`: a clean model result is not a
+pull request, and the maintainer is told which of the two is actually true. The
+publish-only recovery paths from §11 (`commit_failed`, `push_failed`, `pr_failed`)
+surface as `Recovering publication` / `Needs attention`, and converge on the
+**same** comment when a later poll finishes them — with no new model call.
+
+### What it will not say
+
+* **A live PID is not progress.** "Process is alive" describes the subprocess only.
+  Elapsed time and the last *observed* stream event are reported instead of a
+  percentage, a token count or an ETA — none of which the dispatcher can observe.
+* **The last-event line appears only when an event was actually observed.** An
+  unobserved timestamp is omitted entirely rather than printed as a placeholder:
+  an invented timestamp is worse than an absent one.
+* **Terminal states carry no liveness fields at all**, so a finished task cannot be
+  mistaken for a running one.
+* **No transcripts, prompts, secrets or filesystem paths** reach a public Issue.
+
+### Delivery is best-effort by contract
+
+A slow, timed-out, rate-limited or denied GitHub write is logged as a warning
+(`status_comment_unexpected_error`, `status_comment_not_created`) and is otherwise
+inert: it never interrupts, fails, restarts or extends the run, never changes the
+task's phase, claim, attempt budget or run validation, and never switches identity
+to get around a denial. A later poll or reconciliation retries it without creating
+a duplicate.
+
+The heartbeat runs on **one bounded in-process thread per live run**. It starts
+when the subprocess is first observed and is stopped and joined **before** the
+terminal write — that ordering is what stops a late heartbeat from landing on top
+of `Awaiting review` or `Failed`. It is a thread rather than a poll-time hook
+because `CommandCodeDriver.run()` blocks reading the NDJSON stream: a heartbeat
+tied to the worker's polling loop would not run while the agent is actually
+working. The thread writes to GitHub only and never touches SQLite, so the worker's
+database connection stays owned by one thread.
+
+### Ownership survives a crash between create and record
+
+Three things keep the comment from being duplicated or hijacked:
+
+1. The comment carries a machine marker scoped to the exact repo and Issue:
+   `<!-- agent-dispatch:status repo="owner/name" issue=17 -->`.
+2. The `status_comments` row is written **before** the create call, so the intent
+   survives a crash inside that window.
+3. On resolution the Issue's comments are scanned for that exact marker, and the
+   owning comment is reused.
+
+Marker matching is exact, so a comment that merely *looks* like a status comment is
+never adopted, and another person's comment is never edited or deleted. If the
+comment listing comes back **truncated**, "no marker found" is unprovable — so
+nothing is created and a warning is logged, rather than risking a duplicate.
+
+### Configuration
+
+```toml
+[worker]
+status_heartbeat_seconds = 300   # 5 minutes; lower only for testing
+```
+
+The initial `Starting` and the terminal updates happen immediately and never wait
+for this interval. Nothing is written while a task is merely `awaiting_review`, and
+a poll that changes nothing costs no GitHub write at all.
+
+`status`, `dry-run` and `open` stay **read-only**: they display the comment row but
+never create or edit a comment, and never start a runtime.
+
+---
+
+## 14. Verifying this release
 
 Everything below is available after `uv sync --locked`. The scripts accept a
 `PYTHON=` override so the suite can run on the uv-managed interpreter, which is
@@ -864,7 +974,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 214 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 280 tests, no network, no credits
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -905,6 +1015,13 @@ a mock. The cases most worth knowing about:
 | `SessionCaptureTests` | the session ID reaches SQLite while the run is still in flight, and is still not advertised as resumable |
 | `CredentialEnvironmentMockedTests` | the agent inherits the reset-then-wrapper ordering, and repo-local config is opt-in |
 | `StatusReadOnlyTests` | `status`/`dry-run`/`open` start no agent and create no state |
+| `SingleCommentLifecycleTests` | one comment per task is created at the real start, heartbeats **edit its ID** and never POST another, and no heartbeat edit follows the terminal update |
+| `HeartbeatDuringRunTests` | heartbeats land **while the runtime is blocked**, not merely when the polling loop resumes |
+| `PublicationLifecycleTests` | clean completion → forced `commit_failed`/`push_failed`/`pr_failed` → trouble shown rather than success → the same long-lived worker finishes it on a later poll → the same comment becomes `Awaiting review` with zero extra model calls |
+| `PauseAndTransitionTests` | a manual `pause` stays `Paused` and is never overtaken; `unpause`/re-added `take-it`/`resume-publish` restore publication |
+| `MarkerRecoveryTests` | a crash between comment creation and recording its ID reuses the marked comment, ending with exactly one |
+| `NonFatalDeliveryTests` | an edit timeout / rate limit / denied write leaves the run result correct, logs a warning, and creates no duplicate |
+| `ReadOnlyTests` | `status`/`dry-run` never create or edit a comment and never start a runtime |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -927,7 +1044,7 @@ uv lock                                  # refresh it deliberately
 
 ---
 
-## 14. Not in this release
+## 15. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
 Issues #5/#6 and are **not implemented, not stubbed and not faked**:

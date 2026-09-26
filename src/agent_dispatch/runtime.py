@@ -291,6 +291,8 @@ class CommandCodeDriver:
         run_id: str,
         session_id: str | None = None,
         on_session: Callable[[str], None] | None = None,
+        on_spawn: Callable[[], None] | None = None,
+        on_event: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> RunResult:
         """Execute one invocation, streaming NDJSON to a log outside every repo.
 
@@ -303,6 +305,14 @@ class CommandCodeDriver:
         result would lose it in a hard crash — exactly the case where knowing which
         session was attempted matters — so the caller persists it from the callback
         while the run is still in flight.
+
+        ``on_spawn`` fires the moment the subprocess exists, and ``on_event`` for
+        every parsed stream record. Both exist for Issue #17's status heartbeat,
+        which must be able to say "the process is alive" and "the last observed
+        event was at T" without inventing either. Both are strictly informational:
+        an exception from either is swallowed, because a progress callback must never
+        be able to change a run's outcome. ``on_event`` receives the parsed event as
+        data and must not evaluate it.
         """
         worktree = Path(worktree)
         log_path = run_log_path(self.run_log_dir, self.repo, self.issue_number, run_id)
@@ -342,6 +352,11 @@ class CommandCodeDriver:
         except OSError as exc:  # pragma: no cover - environment specific
             raise RuntimeSpawnError(f"could not start runtime {self.binary!r}: {exc}") from exc
 
+        # The subprocess exists: this is the first moment a status may truthfully claim
+        # that anything is running. Fired before the stream loop so it cannot be
+        # delayed by a run that emits nothing for a while.
+        _safe_callback(on_spawn)
+
         def on_deadline() -> None:
             # The flag is set only by this callback, so the timeout verdict cannot
             # be a race against a run that finished on its own at the same instant.
@@ -367,6 +382,7 @@ class CommandCodeDriver:
                     if event is not None:
                         had_session = state.session_id is not None
                         state.observe(event)
+                        _notify_event(on_event, event)
                         if on_session and state.session_id and not had_session:
                             # Persist the ID the moment it appears, so a crash after
                             # this point still records which session was attempted.
@@ -578,6 +594,37 @@ def validate_run(result: RunResult, *, expected_session: str | None) -> RunValid
         )
 
     return RunValidation(ok=not problems, problems=problems, checks=checks)
+
+
+def _safe_callback(callback: Callable[[], None] | None) -> None:
+    """Invoke a zero-argument progress callback, never letting it affect the run.
+
+    A status or progress notification is strictly informational. If one raises, the
+    run's own outcome must be unchanged — and, just as importantly, the run must not
+    be aborted part-way through a stream just because a reporter misbehaved.
+    """
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:  # noqa: BLE001 - reporting must never change a run's outcome
+        return
+
+
+def _notify_event(
+    callback: Callable[[Mapping[str, Any]], None] | None, event: Mapping[str, Any]
+) -> None:
+    """Hand one parsed stream event to a progress callback, ignoring failures.
+
+    The event is passed as parsed data. Nothing here evaluates it, and a raising
+    callback is swallowed for the same reason as :func:`_safe_callback`.
+    """
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:  # noqa: BLE001 - reporting must never change a run's outcome
+        return
 
 
 def _signal_group(process: "subprocess.Popen[str]", sig: int) -> bool:

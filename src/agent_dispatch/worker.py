@@ -236,6 +236,20 @@ class Worker:
             for note in publish_notes:
                 self.log.info("publish_reconciled", detail=note)
 
+        # Status comments are synchronised on every poll, for the same reason the
+        # publish-pending pass is: a task's state can change while the service is
+        # alive (a label removed or re-added, an operator pause, a publication that
+        # completed on an earlier poll) and the comment is derived from that state.
+        # This only ever EDITS a comment the dispatcher already owns — it never
+        # creates one — and an unchanged body costs no GitHub write at all, so a poll
+        # with nothing running stays silent.
+        if self.reconcile:
+            status_notes = Orchestrator(
+                self.config, self.store, client, self.log
+            ).sync_status_comments()
+            for note in status_notes:
+                self.log.info("status_reconciled", detail=note)
+
         dispatch: DispatchOutcome | None = None
         if self.execute and dispatchable and self.store.active_task_count() == 0:
             # A missing runtime is a *configuration* fault, exactly like a missing
