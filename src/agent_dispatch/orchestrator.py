@@ -1397,10 +1397,18 @@ class Orchestrator:
             )
 
         # The `push_branch` operation was already recorded and confirmed by `_publish`.
-        if on_confirmed is not None:
-            on_confirmed(pull.number, pull.url)
-        else:  # pragma: no cover - every review caller supplies one
-            self.store.finalise_publication(task.id, pr_number=pull.number, pr_url=pull.url)
+        if on_confirmed is None:
+            # Not a fallback to `finalise_publication`: for a review round that write
+            # would enter `awaiting_review` while the round stayed open and the feedback
+            # cursor stayed put — the *published-but-unacknowledged* state #5 forbids.
+            # Every caller supplies the hook, and a missing one is a programming error
+            # rather than something to paper over with a completion step that is wrong
+            # by construction.
+            raise ValueError(
+                "_confirm_exact_pull_request requires on_confirmed: a review round's "
+                "completion must close the round and advance its cursor atomically"
+            )
+        on_confirmed(pull.number, pull.url)
         notes.append(
             f"published to the round's own PR #{pull.number}; no replacement PR was created"
         )
