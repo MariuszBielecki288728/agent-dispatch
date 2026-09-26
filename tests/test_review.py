@@ -394,11 +394,88 @@ class ReviewCase(ExecutionCase):
             recovery_stage=ROUND_STAGE_PR,
         )
 
+    def _remote_tip(self, branch: str) -> str | None:
+        """The remote tip of ``branch``, asked through Git.
+
+        Lives on the base class because three classes now assert "nothing was pushed".
+        A per-class copy is how those assertions drift apart.
+        """
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        line = (proc.stdout or "").strip()
+        return line.split()[0] if line else None
+
     def _label_names(self) -> list[str]:
         return [
             str(item["name"]) if isinstance(item, dict) else str(item)
             for item in self.pr().get("labels", [])
         ]
+
+    def live_orchestrator(self, store):
+        """An Orchestrator wired to the fake wrapper, for driving reconcile passes.
+
+        Used by the tests that must run a pass *directly*: going through the `review`
+        CLI would also poll discovery and run the round pass, so a "did this pass push
+        anything?" assertion could be satisfied by some other pass doing nothing.
+        """
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        stream = open(os.devnull, "w")  # noqa: SIM115
+        self.addCleanup(stream.close)
+        return Orchestrator(
+            config, store, GitHubClient(config.github.command), Logger(fmt="text", stream=stream)
+        )
+
+    def run_all_reconcile_passes(self, store) -> None:
+        """One poll's worth of the automatic passes, in the worker's real order.
+
+        Discovery runs FIRST, exactly as `Worker.poll_once` does, and that ordering is
+        part of what the pause tests are about: removing `take-it` is applied *by* the
+        discovery pass, so a poll driven without it would never see the withdrawal at
+        all and the assertion would pass for the wrong reason.
+
+        Then the review pass, then the implementation passes. A guard that only the
+        review pass honours would still push a paused round's commits the moment the
+        implementation passes ran — which is why this drives all of them rather than
+        calling one directly.
+        """
+        from agent_dispatch.config import load_config
+        from agent_dispatch.discovery import Discovery
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        stream = open(os.devnull, "w")  # noqa: SIM115
+        self.addCleanup(stream.close)
+        log = Logger(fmt="text", stream=stream)
+        client = GitHubClient(config.github.command)
+
+        Discovery(config, store, client, log).poll_once()
+
+        orchestrator = self.live_orchestrator(store)
+        orchestrator.reconcile_review_rounds()
+        orchestrator.reconcile_publish_pending()
+        orchestrator.reconcile()
 
     def review_scenario(self, **overrides: object) -> None:
         """Script a second run: the resumed review round."""
@@ -1811,6 +1888,48 @@ class ExactPullRequestTests(ReviewCase):
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
 
+    def test_recovery_never_adopts_another_open_pr_on_the_branch(self) -> None:
+        """The ADOPT variant of the recovery case, which the create variant does not cover.
+
+        A closed claimed PR and a *replaced* claimed PR fail differently: the first makes
+        the create path tempting, the second makes the adopt path tempting. The second is
+        the quieter mistake — it looks like a successful recovery and publishes the
+        round's work onto a pull request that may not be this task's.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round(stage=ROUND_STAGE_PUSH)
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+        # The claimed PR is closed, and a DIFFERENT open PR that also references the Issue
+        # now sits on the same head branch.
+        self.mutate(
+            pulls=[
+                {**self.pr(), "state": "closed"},
+                {
+                    **self.pr(),
+                    "number": 77,
+                    "html_url": f"https://github.com/{self.slug}/pull/77",
+                    "body": f"Fixes https://github.com/{self.slug}/issues/1",
+                },
+            ]
+        )
+
+        calls = self.runtime_calls()
+        self.live_orchestrator(store).reconcile_review_rounds()
+
+        self.assertEqual(self.runtime_calls(), calls, "recovery must not call the model")
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before + 1,
+            "the only new PR is the fixture's: recovery neither created nor adopted one",
+        )
+        self.assertEqual(
+            self.task_row().pr_number,
+            PR_NUMBER,
+            "the task must keep its own PR number, not the replacement's",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+
 
 class SnapshotReproductionTests(ReviewCase):
     """A restarted round may only run when its claimed snapshot is reproducible (#5).
@@ -1994,6 +2113,62 @@ class PausedTaskReviewTests(ReviewCase):
         self.assertEqual(self.rounds()[0].state, ROUND_CLAIMED)
         self.assertEqual(self.task_row().pause_reason, "label_withdrawn")
 
+    def test_a_paused_task_is_left_alone_by_every_real_poll_pass(self) -> None:
+        """The pause case driven through the actual passes, not just the round pass.
+
+        The reviewer asked for this through a *poll*, and the distinction is real: three
+        passes run per poll, and an earlier version of this suite asserted against one of
+        them directly. A guard that only the review pass honours would still push a
+        paused round's commits the moment the implementation passes ran.
+        """
+        store, task, claimed = self._claimed_round(started=True)
+        self.parked = True
+        store.mark_round_publish_pending(claimed.id, head_sha="a" * 40, stage=ROUND_STAGE_PUSH)
+        store.park_for_recovery(task.id, stage=ROUND_STAGE_PUSH, note="mid-publication")
+        store.pause(task.repo, task.issue_number)
+
+        tips_before = self._remote_tip(task.branch)
+        calls_before = self.runtime_calls()
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+        self.run_all_reconcile_passes(store)
+
+        self.assertEqual(self.runtime_calls(), calls_before, "no pass may spend a model call")
+        self.assertEqual(self._remote_tip(task.branch), tips_before, "no pass may push")
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "no pass may create a pull request",
+        )
+        after = self.task_row()
+        self.assertEqual(after.phase, "paused", "the pause must survive every pass")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(after.feedback_cursor, "nothing may be acknowledged")
+
+    def test_a_withdrawn_label_stops_a_paused_publication(self) -> None:
+        """The same invariant for the other pause: `take-it` removed mid-publication.
+
+        A publish-pending round with the label withdrawn is the case the #16/#18 rule is
+        really about, and it is separate from an explicit `pause` because it arrives
+        through discovery rather than through a command.
+        """
+        store, task, claimed = self._claimed_round(started=True)
+        store.mark_round_publish_pending(claimed.id, head_sha="a" * 40, stage=ROUND_STAGE_PUSH)
+        store.park_for_recovery(task.id, stage=ROUND_STAGE_PUSH, note="mid-publication")
+        self.set_issues(issue(1, "Feature work", labels=[]))
+
+        tips_before = self._remote_tip(task.branch)
+        calls_before = self.runtime_calls()
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+        self.run_all_reconcile_passes(store)
+
+        self.assertEqual(self.runtime_calls(), calls_before, "no model call without intent")
+        self.assertEqual(self._remote_tip(task.branch), tips_before, "nothing may be pushed")
+        self.assertEqual(len(self.current_world()["repos"][self.slug]["pulls"]), pulls_before)
+        after = self.task_row()
+        self.assertEqual(after.pause_reason, "label_withdrawn")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(after.feedback_cursor, "nothing may be acknowledged")
+
     def test_restoring_intent_resumes_the_review_path_not_an_implementation(self) -> None:
         store, task, claimed = self._claimed_round(started=False)
         self.set_issues(issue(1, "Feature work", labels=[]))
@@ -2015,26 +2190,6 @@ class PausedTaskReviewTests(ReviewCase):
         self.assertEqual(task_row.phase, "awaiting_review")
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
         self.assertNotIn("queued", task_row.phase)
-
-    def _remote_tip(self, branch: str) -> str | None:
-        import subprocess
-
-        proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.source),
-                "ls-remote",
-                "--heads",
-                "origin",
-                f"refs/heads/{branch}",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        line = (proc.stdout or "").strip()
-        return line.split()[0] if line else None
 
 
 class ParkedRoundRecoveryTests(ReviewCase):
@@ -2137,6 +2292,28 @@ class ParkedRoundRecoveryTests(ReviewCase):
             parse_cursor(self.task_row().feedback_cursor),
             parse_cursor(rounds[0].cursor),
         )
+
+    def test_retry_round_works_for_an_interrupted_round_too(self) -> None:
+        """`--retry-round` from BOTH parked states, not just `failed`.
+
+        The two arrive from different causes — a failed turn versus a process that died
+        mid-turn — and they are the states the command exists for. Pinning only one
+        leaves the other free to regress.
+        """
+        store, task, claimed = self._park(state=ROUND_INTERRUPTED)
+        self.review_scenario()
+        calls = self.runtime_calls()
+
+        self.assertEqual(
+            self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1").returncode,
+            0,
+        )
+        rounds = self.rounds()
+        self.assertEqual(len(rounds), 1, "the SAME round is retried")
+        self.assertEqual(rounds[0].id, claimed.id)
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+        self.assertEqual(self.runtime_calls(), calls + 1)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
 
     def test_release_is_refused_when_nothing_is_parked(self) -> None:
         self.first_run()
