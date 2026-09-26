@@ -476,7 +476,24 @@ class SingleCommentLifecycleTests(StatusCommentCase):
     def test_every_state_the_maintainer_watches_for_is_actually_published(self) -> None:
         # A single terminal edit would mean nobody could see progress, so the write
         # history itself is asserted rather than only the final body.
+        #
+        # The run must be genuinely in flight: `Running` describes a live subprocess,
+        # so a run that finishes instantly may legitimately go straight from `Starting`
+        # to the terminal state — the 300s heartbeat interval never comes due. Keeping
+        # the run alive across at least one injected interval is what makes this
+        # assertion about the implementation rather than about machine speed.
         self.set_issues(issue(1, "States", labels=[TRIGGER]))
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "success",
+                    "stream_seconds": 2.5,
+                    "stream_tick": 0.2,
+                    "edits": {"impl.txt": "done\n"},
+                }
+            ]
+        )
         self.assertEqual(self.run_cli("run").returncode, 0)
         states = self.published_states()
         for expected in (STATE_STARTING, STATE_RUNNING, STATE_PUBLISHING, STATE_AWAITING_REVIEW):
@@ -811,6 +828,41 @@ class PauseAndTransitionTests(StatusCommentCase):
             pulls_before,
             "no poll may push or open anything for a paused task",
         )
+
+    def test_an_unchanged_body_is_recognised_across_a_minute_boundary(self) -> None:
+        # The dedupe that makes "a poll with nothing running costs no GitHub write"
+        # true is a comparison of the rendered body against the persisted one. That
+        # only works if the body is a function of durable state: rendering the CURRENT
+        # time into a non-live status made the body differ on any poll that crossed a
+        # minute boundary, so an idle comment was re-edited on every such poll.
+        #
+        # The render clock is moved instead of sleeping, so this is decided by the
+        # code rather than by when the test happens to run.
+        self.set_issues(issue(1, "Stable body", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        from agent_dispatch.config import load_config
+        from agent_dispatch.statuscomment import task_view
+
+        store = self.store_rows(load_config(self.world.config_path))
+        task = store.get_task(self.slug, 1)
+
+        first, second = (task_view(task, now=now) for now in self._two_different_minutes())
+        self.assertEqual(
+            render_comment(first),
+            render_comment(second),
+            "a non-live body must not change just because the clock advanced",
+        )
+
+        # And the live case must still move: a heartbeat has to report fresh liveness.
+        live_first = task_view(task, state=STATE_RUNNING, now="2026-09-25T00:00:00+00:00")
+        live_second = task_view(task, state=STATE_RUNNING, now="2026-09-25T00:01:00+00:00")
+        self.assertNotEqual(render_comment(live_first), render_comment(live_second))
+
+    @staticmethod
+    def _two_different_minutes() -> tuple[str, str]:
+        """Two ISO timestamps that render to different minutes."""
+        return ("2026-09-25T00:00:00+00:00", "2026-09-25T00:01:00+00:00")
 
     def test_label_withdrawal_pauses_the_comment_and_readding_requeues_it(self) -> None:
         self.set_issues(issue(1, "Withdrawn", labels=[TRIGGER]))
@@ -1282,6 +1334,34 @@ class HeartbeatThreadTests(unittest.TestCase):
             self.assertFalse(heartbeat.running_published)
         finally:
             heartbeat.stop_and_join()
+
+    def test_the_first_tick_does_not_wait_for_the_poll_interval(self) -> None:
+        # The regression CI caught, and the reason it only appeared there: the loop
+        # slept a whole poll interval BEFORE its first check, so the first `Running`
+        # tick was delayed by up to `_poll`. A run that finished inside that window
+        # was stopped before any tick, and the comment went straight from `Starting`
+        # to the terminal state without ever reporting `Running`.
+        #
+        # A deliberately huge poll interval makes the ordering decidable rather than
+        # a matter of machine speed: if the first tick still waited for a poll,
+        # nothing at all would be published for the whole 30s, far longer than this
+        # test is prepared to wait.
+        publisher = _RecordingPublisher()
+        heartbeat = self._heartbeat(publisher, poll_seconds=30.0)
+        heartbeat.note_spawned()
+        heartbeat.start()
+        try:
+            deadline = __import__("time").monotonic() + 2.0
+            while not publisher.views and __import__("time").monotonic() < deadline:
+                __import__("time").sleep(0.01)
+        finally:
+            self.assertTrue(heartbeat.stop_and_join(), "the thread must be confirmed finished")
+        self.assertTrue(
+            publisher.views,
+            "the first Running tick must follow the spawn, not the poll interval",
+        )
+        self.assertEqual(publisher.views[0].state, STATE_RUNNING)
+        self.assertTrue(heartbeat.running_published)
 
     def test_a_tick_reports_running_with_process_alive(self) -> None:
         publisher = _RecordingPublisher()

@@ -922,9 +922,13 @@ to get around a denial. A later poll or reconciliation retries it without creati
 a duplicate.
 
 The heartbeat runs on **one bounded in-process thread per live run**. It starts
-when the subprocess is first observed and is stopped and joined **before** the
-terminal write — that ordering is what stops a late heartbeat from landing on top
-of `Awaiting review` or `Failed`. It is a thread rather than a poll-time hook
+when the subprocess is first observed and wakes on the spawn signal — not on a
+sleep — so the first `Running` update is immediate rather than delayed by up to
+one poll. (Without that, a run shorter than the poll interval could finish before
+any tick, and the comment would jump `Starting` → `Publishing` without ever
+reporting `Running`.) It is stopped and joined **before** the terminal write —
+that ordering is what stops a late heartbeat from landing on top of
+`Awaiting review` or `Failed`. It is a thread rather than a poll-time hook
 because `CommandCodeDriver.run()` blocks reading the NDJSON stream: a heartbeat
 tied to the worker's polling loop would not run while the agent is actually
 working. The thread writes to GitHub only and never touches SQLite, so the worker's
@@ -956,6 +960,13 @@ status_heartbeat_seconds = 300   # 5 minutes; lower only for testing
 The initial `Starting` and the terminal updates happen immediately and never wait
 for this interval. Nothing is written while a task is merely `awaiting_review`, and
 a poll that changes nothing costs no GitHub write at all.
+
+That last guarantee depends on the body being a function of **durable state only**.
+A non-live status therefore takes its `Status updated` stamp from the task row
+rather than from the moment it was rendered: rendering the current time made the
+body differ on any poll that crossed a minute boundary, so the "body unchanged, skip
+the write" comparison could not recognise an idle comment and re-edited it on every
+such poll.
 
 `status`, `dry-run` and `open` stay **read-only**: they display the comment row but
 never create or edit a comment, and never start a runtime.

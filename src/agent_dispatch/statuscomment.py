@@ -396,6 +396,17 @@ def task_view(
     resolved_state = state or derived_state
     clock = now or utcnow_iso()
     started = run_started_at or (task.last_run_at if resolved_state in LIVE_STATES else None)
+    # The "Status updated" stamp is taken from the TASK ROW, not from the render
+    # clock, whenever the state is not live. This has to be stable: rendering the
+    # current time made the body differ on any poll that crossed a minute boundary,
+    # so the "body unchanged, skip the write" comparison could not recognise an
+    # unchanged status and the dispatcher re-edited an idle comment on every poll —
+    # breaking the guarantee that a poll with nothing running costs no GitHub write.
+    # The row's own `updated_at` is the moment the state being described was last
+    # written, which is both stable and the more accurate thing to show.
+    stamp = (
+        clock if resolved_state in LIVE_STATES | {STATE_PUBLISHING} else task.updated_at or clock
+    )
     return StatusView(
         repo=task.repo,
         issue_number=task.issue_number,
@@ -411,7 +422,7 @@ def task_view(
             if resolved_state in LIVE_STATES | {STATE_PUBLISHING}
             else None
         ),
-        updated_at=clock,
+        updated_at=stamp,
         process_alive=process_alive,
         last_event_at=last_event_at,
         events_observed=events_observed,
@@ -950,15 +961,33 @@ class RunHeartbeat:
     # -------------------------------------------------------------------- loop
 
     def _loop(self) -> None:
-        while not self._stop.wait(self._poll):
-            if not self._spawned.is_set():
-                # No process yet: `Starting` is the truthful state, and no heartbeat
-                # interval has started to run.
-                continue
+        # Wait for the SPAWN signal before doing anything else, rather than sleeping a
+        # whole poll interval and *then* checking. Sleeping first delayed the first
+        # `Running` tick by up to `_poll`, and if the run ended inside that window the
+        # stop was seen before any tick: the comment went straight from `Starting` to
+        # the terminal state without ever reporting `Running`.
+        while not self._stop.is_set() and not self._spawned.is_set():
+            self._spawned.wait(self._poll)
+        if self._stop.is_set():
+            return
+        while not self._stop.is_set():
             now = self._clock()
             if not self.running_published or now >= self._deadline:
                 self._tick()
-                self._deadline = now + self._interval
+                # Measured AFTER the tick, so the next one is due a full interval
+                # after this one *finished*. Scheduling from the pre-tick time would
+                # fire immediately again whenever a write took longer than the
+                # interval, turning a slow GitHub call into back-to-back writes.
+                self._deadline = self._clock() + self._interval
+            # Sleep until the next tick is due (or until stopped), never longer than
+            # `_poll` so the stop flag is still noticed promptly. Waiting the full
+            # interval in one go is avoided because `stop_and_join` must be able to
+            # interrupt it; waiting on an already-set event is avoided because it
+            # would spin.
+            remaining = self._deadline - self._clock()
+            delay = self._poll if remaining <= 0.0 else min(self._poll, remaining)
+            if self._stop.wait(delay):
+                return
 
     def _tick(self) -> None:
         if self._stop.is_set():
