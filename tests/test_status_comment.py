@@ -500,6 +500,44 @@ class SingleCommentLifecycleTests(StatusCommentCase):
             with self.subTest(state=expected):
                 self.assertIn(expected, states, f"states published were {states}")
 
+    def test_publishing_never_claims_the_runtime_has_not_started(self) -> None:
+        # `Publishing` means the runtime finished cleanly and publication is in
+        # flight. Rendering the process block there said "not started yet", the
+        # opposite of the truth, so the liveness fields are scoped to Starting/Running.
+        self.set_issues(issue(1, "Publishing render", labels=[TRIGGER]))
+        from agent_dispatch.config import load_config
+        from agent_dispatch.statuscomment import (
+            STATE_PUBLISHING,
+        )
+        from agent_dispatch.statuscomment import (
+            task_view as build_view,
+        )
+
+        store = self.store_rows(load_config(self.world.config_path))
+        task = store.get_task(self.slug, 1)
+        self.assertIsNone(task, "no task row exists before a poll")
+
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        task = store.get_task(self.slug, 1)
+        self.assertIsNotNone(task)
+
+        # The exact view the orchestrator builds for the publication window.
+        view = build_view(
+            task,
+            state=STATE_PUBLISHING,
+            process_alive=False,
+            run_started_at="2026-09-25T00:00:00+00:00",
+        )
+        body = render_comment(view)
+        self.assertIn(STATE_PUBLISHING, body)
+        self.assertNotIn(
+            "not started yet",
+            body,
+            "Publishing must not claim the runtime never started",
+        )
+        self.assertNotIn("Command Code process", body, "no process line while publishing")
+        self.assertNotIn("Last observed runtime event", body)
+
     def test_publishing_is_not_claimed_as_awaiting_review(self) -> None:
         # Ordering matters: Publishing must precede Awaiting review, and the run must
         # never jump straight to the terminal state (which would hide a failed publish).
@@ -1070,9 +1108,11 @@ class MarkerRecoveryTests(StatusCommentCase):
         self.assertIsNotNone(task.pr_number)
         self.assertIsNone(store.status_comment(self.slug, 1).comment_id)
 
-    def test_two_marked_comments_are_reported_and_the_oldest_is_reused(self) -> None:
-        # Ambiguity must not become a stream of duplicates. The deterministic choice is
-        # the oldest marked comment, and it is logged at warning level.
+    def test_two_marked_comments_fail_closed_rather_than_picking_one(self) -> None:
+        # Two exact markers means ownership is genuinely ambiguous, and the Issue text
+        # requires ambiguity to be *reported* rather than resolved by guessing. Picking
+        # one arbitrarily could edit a comment that is not ours, so nothing is edited
+        # and nothing is created until an operator leaves exactly one.
         self.set_issues(issue(1, "Ambiguous", labels=[TRIGGER]))
         marker = marker_for(self.slug, 1)
         world = self.world.read_world()
@@ -1112,12 +1152,71 @@ class MarkerRecoveryTests(StatusCommentCase):
         )
         task = store.get_task(self.slug, 1)
         self.assertIsNotNone(task, "the worker poll must have queued the task")
+        self.assertFalse(
+            publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00"),
+            "an ambiguous scan must publish nothing",
+        )
+        self.assertIsNone(publisher.comment_id, "no comment may be adopted on a guess")
+        self.assertEqual(len(self.status_comments()), 2, "no third comment is created")
+        self.assertIn("status_comment_ambiguous", stream.getvalue())
+
+        # Nothing was edited either: both comments are untouched.
+        bodies = [
+            entry["body"] for entry in self.world.read_world()["repos"][self.slug]["comments"]
+        ]
+        self.assertEqual(sorted(bodies), sorted([f"{marker}\nfirst", f"{marker}\nsecond"]))
+
+    def test_ambiguity_resolved_by_an_operator_is_adopted_again(self) -> None:
+        # The recovery path for the fail-closed case: once exactly one marked comment
+        # remains, normal ownership resumes without creating anything.
+        self.set_issues(issue(1, "Ambiguous then fixed", labels=[TRIGGER]))
+        marker = marker_for(self.slug, 1)
+        world = self.world.read_world()
+        world["repos"][self.slug]["comments"] = [
+            {
+                "id": 700,
+                "body": f"{marker}\nfirst",
+                "html_url": "https://github.com/example/repo/issues/1#c700",
+                "issue_number": 1,
+            },
+            {
+                "id": 701,
+                "body": f"{marker}\nsecond",
+                "html_url": "https://github.com/example/repo/issues/1#c701",
+                "issue_number": 1,
+            },
+        ]
+        self.world.world = world
+        self.world.write_world()
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+
+        # An operator deletes one of the two duplicates.
+        world = self.world.read_world()
+        world["repos"][self.slug]["comments"] = [
+            entry for entry in world["repos"][self.slug]["comments"] if entry["id"] == 700
+        ]
+        self.world.world = world
+        self.world.write_world()
+
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.statuscomment import StatusPublisher
+
+        config = load_config(self.world.config_path)
+        store = self.store_rows(config)
+        publisher = StatusPublisher(
+            client=GitHubClient(config.github.command),
+            store=store,
+            log=Logger(fmt="text", stream=__import__("io").StringIO()),
+            repo=self.slug,
+            issue_number=1,
+        )
+        task = store.get_task(self.slug, 1)
         self.assertTrue(
             publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
         )
-        self.assertEqual(publisher.comment_id, 700, "the oldest marked comment is reused")
-        self.assertEqual(len(self.status_comments()), 2, "no third comment is created")
-        self.assertIn("status_comment_ambiguous", stream.getvalue())
+        self.assertEqual(publisher.comment_id, 700, "the surviving comment is adopted")
 
 
 # ==============================================================================
@@ -1127,8 +1226,8 @@ class MarkerRecoveryTests(StatusCommentCase):
 
 class NonFatalDeliveryTests(StatusCommentCase):
     def test_a_denied_comment_edit_does_not_change_the_task_result_or_duplicate(self) -> None:
-        self.set_issues(issue(1, "Denied", labels=[TRIGGER]))
         # The first edit is denied; the run itself must be unaffected.
+        self.set_issues(issue(1, "Denied", labels=[TRIGGER]))
         self.inject_failure(
             f"{self.slug}:comment_edit",
             stderr="gh: Resource not accessible by personal access token (HTTP 403)",
@@ -1199,6 +1298,77 @@ class NonFatalDeliveryTests(StatusCommentCase):
         # A status update still waiting when the run ends is worthless, and this bound is
         # what keeps an in-flight edit from delaying a terminal update indefinitely.
         self.assertLess(STATUS_TIMEOUT_SECONDS, 60.0)
+
+    def test_a_transient_edit_failure_never_creates_a_second_comment(self) -> None:
+        # The duplicate bug the review found. A PATCH can fail transiently (rate limit,
+        # timeout, network) while the marker listing still SUCCEEDS and returns the very
+        # comment we own. Because `found.id == self._comment_id`, the old code returned
+        # nothing and then fell through to `_create()`, POSTing a second marked comment.
+        #
+        # A terminal/per-poll `sync_from_task()` passes `allow_create=True`, so it is
+        # exactly this path that was vulnerable — the heartbeat uses
+        # `allow_create=False`, which is why the existing denial tests missed it.
+        self.set_issues(issue(1, "Transient edit", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        created = self.assert_one_comment()
+        self.assertIn(STATE_AWAITING_REVIEW, self.status_comment_body())
+
+        # An operator transition changes the durable state, so the next sync genuinely
+        # has a different body to write — and that write is made to fail. (A poll on
+        # unchanged state would be skipped by the body comparison and never reach the
+        # edit at all, which is why the failure has to be paired with a real change.)
+        #
+        # `inject_failure` persists the in-memory world, so it must be refreshed from
+        # disk first: otherwise it writes back a snapshot taken before the run created
+        # the comment and silently deletes it.
+        self.world.world = self.world.read_world()
+        self.inject_failure(
+            f"{self.slug}:comment_edit",
+            stderr="gh: API rate limit exceeded (HTTP 403)",
+            once=True,
+        )
+        result = self.run_cli("pause", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 0, "a status failure must not fail the command")
+        self.assertIn("status_comment_edit_failed", result.stderr)
+
+        # The failure must not have produced a second comment.
+        after = self.status_comments()
+        self.assertEqual(len(after), 1, "a failed edit must never create a duplicate")
+        self.assertEqual(after[0]["id"], created["id"], "the owned comment is unchanged")
+
+        # The next pass edits that same id — the retry is a later edit, never a create.
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        self.assertEqual(len(self.status_comments()), 1, "still exactly one comment")
+        self.assertTrue(
+            all(entry["comment_id"] == created["id"] for entry in self.status_edits()),
+            "every write must target the single owned comment",
+        )
+        self.assertIn(STATE_PAUSED, self.status_comment_body(), "the retry applied the change")
+
+    def test_a_failed_edit_on_a_truncated_rescan_still_never_creates(self) -> None:
+        # The same bug reached through the other guard: the edit fails AND the rescan
+        # cannot prove what exists. Creation must stay refused, because "I could not
+        # read the list" is not evidence that no comment exists.
+        self.set_issues(issue(1, "Truncated retry", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        created = self.assert_one_comment()
+
+        # `inject_failure` persists the in-memory world, so it must be refreshed from
+        # disk first — otherwise it would write back a snapshot taken before the run
+        # created the comment and silently delete it.
+        self.world.world = self.world.read_world()
+        self.inject_failure(
+            f"{self.slug}:comment_edit",
+            stderr="gh: API rate limit exceeded (HTTP 403)",
+            once=True,
+        )
+        # Pad only the COMMENT listing so the rescan hits the page cap.
+        self.world.env_overrides["FAKE_GH_PAD_COMMENTS"] = "60"
+        self.addCleanup(self.world.env_overrides.pop, "FAKE_GH_PAD_COMMENTS", None)
+
+        self.run_cli("pause", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(len(self.status_comments()), 1, "no duplicate on an unprovable scan")
+        self.assertEqual(self.status_comments()[0]["id"], created["id"])
 
     def test_a_deleted_comment_is_re_resolved_by_marker_rather_than_duplicated(self) -> None:
         self.set_issues(issue(1, "Deleted", labels=[TRIGGER]))
@@ -1441,6 +1611,179 @@ class HeartbeatThreadTests(unittest.TestCase):
         # enormous — the point is only that it was computed from two real timestamps.
         self.assertIsNotNone(view.elapsed_seconds)
         self.assertGreaterEqual(view.elapsed_seconds or -1, 0)
+
+
+class StaleIdentityTests(StatusCommentCase):
+    def _repos_block(self, model: str, effort: str) -> str:
+        return f"""
+[repos."{self.slug}"]
+path = "{self.world.repo_path}"
+base_branch = "main"
+agents_file = "AGENTS.md"
+
+[repos."{self.slug}".runtime]
+driver = "commandcode"
+model = "{model}"
+effort = "{effort}"
+permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = 40
+"""
+
+    def test_the_comment_shows_the_model_actually_invoked_after_a_config_change(self) -> None:
+        # The review's finding 3. `task` is loaded during discovery; the claim then
+        # pins the CURRENT runtime identity into SQLite and the driver invokes it. If
+        # the status were rendered from the pre-claim snapshot, a config change between
+        # discovery and dispatch would make the comment name a model that never ran —
+        # exactly what the pinned identity exists to prevent.
+        #
+        # Asserting only the FINAL body would not catch this: the terminal sync
+        # re-reads the durable row and is correct either way. The vulnerable renders
+        # are the LIVE ones (`Starting`, `Running`) written during the run, so the
+        # whole write history is checked.
+        self.set_issues(issue(1, "Identity change", labels=[TRIGGER]))
+
+        # Discovery happens at the OLD identity...
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(),
+            repos_block=self._repos_block("model-at-discovery", "low"),
+        )
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+
+        # ...then the config changes before the task is dispatched. The run is kept
+        # alive so a live `Running` render really happens.
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(),
+            repos_block=self._repos_block("model-at-dispatch", "high"),
+        )
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "success",
+                    "stream_seconds": 1.5,
+                    "stream_tick": 0.2,
+                    "edits": {"impl.txt": "done\n"},
+                }
+            ]
+        )
+        self.assertEqual(self.run_cli("run").returncode, 0)
+
+        writes = self.status_writes()
+        self.assertTrue(writes, "expected status writes")
+        for entry in writes:
+            with self.subTest(kind=entry["kind"]):
+                self.assertNotIn(
+                    "model-at-discovery",
+                    entry["body"],
+                    "no write may name a model that never ran this task",
+                )
+                self.assertIn("model-at-dispatch", entry["body"])
+
+        body = self.status_comment_body()
+        self.assertIn("model-at-dispatch", body, "the comment must name the invoked model")
+        self.assertIn("high", body)
+
+        # The durable row agrees with the comment, so a later sync cannot flip it.
+        from agent_dispatch.config import load_config
+
+        store = self.store_rows(load_config(self.world.config_path))
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-at-dispatch")
+        self.assertEqual(task.runtime_effort, "high")
+
+    def test_a_spawn_failure_reports_failure_not_the_pre_claim_state(self) -> None:
+        # The review's finding 4a. When the runtime preflight passes but the spawn then
+        # fails, `_run_once` records the task as `failed` — but the caller used to sync
+        # the status from the object it held BEFORE that transition, so the comment
+        # could describe the task's old `queued` state while the database already knew
+        # it had failed. The sync must re-read the row.
+        self.set_issues(issue(1, "Spawn fails", labels=[TRIGGER]))
+        # A runtime path that cannot be executed: preflight passes (the config is
+        # valid) and the spawn itself is what fails.
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(
+                commandcode_path=str(self.tmp / "no-such-runtime")
+            )
+        )
+
+        result = self.run_cli("run")
+        self.assertNotEqual(result.returncode, 0, "a spawn failure is not a success")
+
+        from agent_dispatch.config import load_config
+
+        store = self.store_rows(load_config(self.world.config_path))
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "failed", "the durable row records the failure")
+
+        # The comment must agree with the durable row rather than describe `queued`.
+        self.assertIn(STATE_FAILED, self.status_comment_body())
+        self.assertNotIn(STATE_QUEUED, self.status_comment_body())
+        self.assert_one_comment(why="a failed spawn still owns exactly one comment")
+
+
+class PreStatusSchemaTests(StatusCommentCase):
+    def _drop_status_table(self) -> None:
+        """Model a database written by the merged #16 build (no status_comments)."""
+        from agent_dispatch.config import load_config
+
+        config = load_config(self.world.config_path)
+        store = self.store_rows(config)
+        store._conn.execute("DROP TABLE IF EXISTS status_comments")
+        store.close()
+
+    def test_read_only_commands_work_against_a_pre_17_database(self) -> None:
+        # Read-only stores deliberately do not migrate, so an upgraded database has no
+        # `status_comments` table until a write path opens it. `status`, `open` and
+        # `dry-run` must still work — and must not create it, because that would make a
+        # read command a writer.
+        self.set_issues(issue(1, "Upgrade path", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        self._drop_status_table()
+
+        for argv in (
+            ("status",),
+            ("open", "--repo", self.slug, "--issue", "1"),
+            ("dry-run",),
+        ):
+            with self.subTest(command=argv[0]):
+                result = self.run_cli(*argv)
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"`{argv[0]}` must survive a pre-#17 database:\n{result.stderr}",
+                )
+                self.assertNotIn("no such table", result.stderr)
+
+        # Still absent: reading must not have added it.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.store import Store
+
+        config = load_config(self.world.config_path)
+        store = Store.open_read_only(config.worker.state_db)
+        try:
+            self.assertFalse(
+                store._table_present("status_comments"),
+                "a read-only command must not create the table",
+            )
+            self.assertIsNone(store.status_comment(self.slug, 1))
+        finally:
+            store.close()
+
+    def test_a_write_path_adds_the_table_afterwards(self) -> None:
+        self.set_issues(issue(1, "Recreate", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+        self._drop_status_table()
+
+        self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
+
+        from agent_dispatch.config import load_config
+
+        store = self.store_rows(load_config(self.world.config_path))
+        self.assertTrue(
+            store._table_present("status_comments"),
+            "the next write-path open must create the table normally",
+        )
 
 
 class PublisherGuardTests(StatusCommentCase):

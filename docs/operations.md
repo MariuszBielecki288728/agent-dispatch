@@ -946,9 +946,22 @@ Three things keep the comment from being duplicated or hijacked:
    owning comment is reused.
 
 Marker matching is exact, so a comment that merely *looks* like a status comment is
-never adopted, and another person's comment is never edited or deleted. If the
-comment listing comes back **truncated**, "no marker found" is unprovable — so
-nothing is created and a warning is logged, rather than risking a duplicate.
+never adopted, and another person's comment is never edited or deleted. Two further
+rules keep that honest:
+
+* **Ambiguity fails closed.** If *more than one* exact marker exists, ownership is
+  genuinely ambiguous, so nothing is edited and nothing is created — the dispatcher
+  logs `status_comment_ambiguous` and waits for an operator to delete the extra
+  comment. Picking one arbitrarily could edit a comment that is not ours, and would
+  compound the duplicate problem this design exists to prevent.
+* **An unprovable scan never creates.** If the comment listing comes back
+  **truncated**, "no marker found" cannot be proven, so nothing is created and a
+  warning is logged rather than risking a duplicate.
+* **A failed edit never creates either.** A rate limit, timeout or network error
+  fails identically to a deleted comment, so a failed edit triggers a re-scan; if
+  that scan finds a marked comment, it is adopted and retried and creation stays
+  refused. Creating is only safe once a **complete** scan proves no marked comment
+  exists.
 
 ### Configuration
 
@@ -970,6 +983,12 @@ such poll.
 
 `status`, `dry-run` and `open` stay **read-only**: they display the comment row but
 never create or edit a comment, and never start a runtime.
+
+Read-only stores deliberately do not migrate, so an **upgraded database has no
+`status_comments` table until a write path opens it**. Reads treat an absent table
+as "this build has published no status comments yet" rather than failing, so
+`status` / `dry-run` / `open` work immediately after an upgrade and the first
+worker or `enqueue` run creates the table normally. A read command never adds it.
 
 ---
 

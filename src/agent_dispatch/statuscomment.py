@@ -361,8 +361,19 @@ class StatusView:
 
     @property
     def live(self) -> bool:
-        """Whether volatile liveness fields belong in this render."""
+        """Whether volatile status timestamps belong in this render."""
         return self.state in {STATE_STARTING, STATE_RUNNING, STATE_PUBLISHING}
+
+    @property
+    def runtime_live(self) -> bool:
+        """Whether *runtime liveness* fields may be rendered.
+
+        Narrower than :attr:`live` on purpose. ``Publishing`` means the runtime has
+        already stopped cleanly and publication is what is in flight, so the process
+        block must not appear at all: rendering it there said "not started yet",
+        which is the opposite of what actually happened.
+        """
+        return self.state in {STATE_STARTING, STATE_RUNNING}
 
 
 def task_view(
@@ -459,6 +470,12 @@ def render_comment(view: StatusView) -> str:
         elapsed = format_elapsed(view.elapsed_seconds)
         if elapsed:
             lines.append(f"- **Elapsed:** {elapsed}")
+
+    if view.runtime_live:
+        # Runtime liveness is only meaningful while a runtime is meant to be alive.
+        # `Publishing` is deliberately excluded: its runtime already exited cleanly,
+        # so any process line there would be describing the wrong thing (it used to
+        # say "not started yet").
         if view.process_alive is True:
             lines.append(
                 "- **Command Code process:** alive — task still running. "
@@ -475,7 +492,7 @@ def render_comment(view: StatusView) -> str:
                 else ""
             )
             lines.append(f"- **Last observed runtime event:** {event_at} UTC{events}")
-    elif view.updated_at:
+    elif not view.live and view.updated_at:
         # Non-live states still carry the one timestamp that is definitely true: when
         # this text was generated. Labelled differently on purpose, so it can never be
         # mistaken for evidence that something is running now.
@@ -687,15 +704,22 @@ class StatusPublisher:
         if self._comment_id is not None:
             if self._edit(self._comment_id, body):
                 return True
-            # The recorded comment could not be edited. It may simply be gone (a
-            # maintainer deleted it), so re-resolve once from GitHub before
-            # concluding anything — and only adopt a *different* marker comment,
-            # never conclude "there is none" from one failed edit.
+            # The edit failed. That is NOT evidence the comment is gone: a rate limit,
+            # a timeout or a transient network error fails identically to a deletion.
+            # Re-resolve from GitHub before concluding anything, and treat ANY marked
+            # comment found as proof that one still exists locally.
             found = self._scan()
-            if found is not None and found.id != self._comment_id:
-                self._adopt(found)
-                if self._edit(found.id, body):
-                    return True
+            if found is not None:
+                if found.id != self._comment_id:
+                    self._adopt(found)
+                    if self._edit(found.id, body):
+                        return True
+                # A marked comment exists and could not be edited. Creating a second
+                # one is never the answer, so stop here and let a later pass retry
+                # this same id. Falling through to `_create` here was a real bug: a
+                # transient PATCH failure on the terminal/per-poll path (which passes
+                # `allow_create=True`) would POST a duplicate status comment.
+                return False
         if not allow_create:
             return False
         if self._scan_unprovable:
@@ -709,6 +733,8 @@ class StatusPublisher:
                 ),
             )
             return False
+        # No marked comment was found and the scan was provably complete, so there is
+        # genuinely nothing to edit: creating the first one is safe.
         return self._create(body)
 
     def _resolve_locked(self) -> None:
@@ -749,15 +775,24 @@ class StatusPublisher:
         if not matches:
             return None
         if len(matches) > 1:
-            # Ambiguity is reported and resolved deterministically (the oldest id)
-            # rather than by creating yet another comment. A stream of duplicates is
-            # the failure mode this whole design exists to prevent.
+            # More than one exact marker means ownership is genuinely ambiguous, and
+            # the Issue text is explicit that ambiguity must be reported rather than
+            # resolved by guessing. Editing one of them would be a coin flip: it could
+            # be a human's comment that happens to carry our marker, and a wrong pick
+            # also compounds the duplicate problem this design exists to prevent.
+            # Fail closed: report, treat ownership as unprovable, and create nothing.
+            # An operator resolves it by deleting the extra comment.
+            self._scan_unprovable = True
             self._warn(
                 "status_comment_ambiguous",
                 count=len(matches),
-                adopting=matches[0].id,
-                detail="more than one marked status comment exists; reusing the oldest",
+                ids=",".join(str(item.id) for item in matches),
+                detail=(
+                    "more than one marked status comment exists, so ownership is ambiguous; "
+                    "not editing or creating any comment until an operator leaves exactly one"
+                ),
             )
+            return None
         return matches[0]
 
     def _adopt(self, comment: IssueComment) -> None:

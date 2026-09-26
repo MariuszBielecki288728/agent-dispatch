@@ -469,6 +469,11 @@ class Store:
         """
         clone = Store.in_memory()
         for table in ("tasks", "observed_state", "runs", "operations", "status_comments"):
+            if not self._table_present(table):
+                # An optional table an older build never created. Skipping it keeps a
+                # read-only `dry-run` working against a pre-#17 database instead of
+                # raising `no such table` mid-copy.
+                continue
             for row in self._conn.execute(f"SELECT * FROM {table}"):
                 columns = list(row.keys())
                 placeholders = ", ".join("?" for _ in columns)
@@ -540,6 +545,22 @@ class Store:
             # CREATE TABLE already ran, so this is a genuine "needs adding".
             return False
         return column in existing
+
+    def _table_present(self, table: str) -> bool:
+        """Whether ``table`` exists in this database.
+
+        Read-only stores deliberately do not migrate (that is what makes them
+        read-only), so a database written by an older build can legitimately lack a
+        table this build knows about. Reads have to tolerate that instead of raising
+        ``no such table``, otherwise the first command after an upgrade — e.g.
+        ``status``, which opens the database read-only — would fail before any write
+        path had a chance to add the table.
+        """
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
 
     def _log_migration_race(self, table: str, column: str, exc: sqlite3.OperationalError) -> None:
         """Record a benign migration race once, without a logger dependency.
@@ -1185,7 +1206,13 @@ class Store:
         Scoped to the exact pair rather than to the task id: the row is the record of
         *which comment this dispatcher owns*, and that ownership must never be
         inferred for a different repository or Issue.
+
+        A pre-#17 database has no ``status_comments`` table at all, and read-only
+        stores never migrate, so an absent table means "this build has published no
+        status comments yet" rather than an error.
         """
+        if not self._table_present("status_comments"):
+            return None
         row = self._conn.execute(
             "SELECT * FROM status_comments WHERE repo = ? AND issue_number = ?",
             (repo, issue_number),

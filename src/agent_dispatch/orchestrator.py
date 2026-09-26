@@ -571,6 +571,14 @@ class Orchestrator:
             permission_mode=repo.runtime.permission_mode,
         )
 
+        # Re-read the row so the run and its status comment are driven by the identity
+        # just PINNED, not by the snapshot taken before the claim. `task` was loaded
+        # during discovery, so a config change in between would otherwise let the
+        # driver invoke the new model while the comment rendered the old one — the
+        # comment claiming a model that never ran this task, which is exactly what the
+        # pinned identity exists to prevent.
+        pinned = self.store.get_task(task.repo, task.issue_number) or task
+
         instruction = build_instruction(
             repo_slug=repo.slug,
             issue=issue,
@@ -579,13 +587,13 @@ class Orchestrator:
             worktree_path=provision.state.path,
             agents_file=repo.agents_file,
             is_retry=provision.state.dirty or provision.state.has_commits,
-            previous_error=task.last_error,
+            previous_error=pinned.last_error,
         )
         for note in instruction.notes:
             self.log.info("instruction_note", repo=repo.slug, issue=task.issue_number, note=note)
 
         result, run_row, early = self._run_once(
-            task=task,
+            task=pinned,
             repo=repo,
             worktree=provision.state.path,
             instruction=instruction.text,
@@ -598,17 +606,21 @@ class Orchestrator:
             # status comment must still be brought up to date: `Starting` was already
             # published, and leaving it there would describe a process that does not
             # exist — the same stale-running lie this feature exists to prevent.
-            self.sync_task_status(task)
+            #
+            # Re-read first: `_run_once` records the failure, so syncing from the
+            # pre-failure object would render the OLD state (e.g. `queued`) for a task
+            # the database already knows is `failed`.
+            self.sync_task_status(self.store.get_task(task.repo, task.issue_number) or pinned)
             return early
         return self._finish(
-            task,
+            pinned,
             repo,
             manager,
             provision.state,
             result,
             run_row=run_row,
             issue=issue,
-            publisher=self._publisher(task),
+            publisher=self._publisher(pinned),
             run_started_at=self._run_started_at,
         )
 
