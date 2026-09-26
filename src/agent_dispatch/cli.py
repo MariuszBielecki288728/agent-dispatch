@@ -39,7 +39,7 @@ from .lockfile import LockBusyError, WorkerLock
 from .logging_setup import Logger, make_logger
 from .orchestrator import OUTCOME_BLOCKED, OUTCOME_REVIEW_DONE, Orchestrator
 from .runlogs import prune
-from .store import Store, phase_summary
+from .store import STATES_NEEDING_ATTENTION, Store, phase_summary
 from .worker import PollOutcome, Worker
 
 EXIT_OK = 0
@@ -185,6 +185,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "report which handoffs are pending and what each round would carry, without "
             "claiming a round, clearing a label or starting an agent"
+        ),
+    )
+    review.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "give up on a parked (failed/interrupted) review round so the task returns to "
+            "awaiting_review and the next explicit handoff can be claimed. The feedback is "
+            "NOT acknowledged, so it is carried again. Requires --repo and --issue"
+        ),
+    )
+    review.add_argument(
+        "--retry-round",
+        action="store_true",
+        help=(
+            "re-open a parked review round for ONE more attempt with its claimed snapshot "
+            "preserved. Requires --repo and --issue. Never invokes the implementation path"
         ),
     )
 
@@ -915,6 +932,8 @@ def _cmd_review(args: argparse.Namespace, config: Config, log: Logger) -> int:
     """
     if args.repo is not None:
         config.repo(args.repo)  # allowlist check before anything else
+    if args.release or args.retry_round:
+        return _cmd_review_parked(args, config, log)
     if args.dry_run:
         return _review_dry_run(args, config, log)
 
@@ -940,6 +959,22 @@ def _cmd_review(args: argparse.Namespace, config: Config, log: Logger) -> int:
             client.check_available()
         except GitHubError as exc:
             log.error("review_failed", kind=exc.kind, error=str(exc))
+            return EXIT_FAILURE
+
+        # Refresh discovery BEFORE deciding anything, exactly as `run` does.
+        #
+        # This is not a nicety. Without it the command acted on a local snapshot that
+        # could be arbitrarily old, so a maintainer who re-added `take-it` and then asked
+        # for a review round would be told there was nothing to do — because the row
+        # still recorded the label-withdrawn pause from before. `execute=False` on
+        # purpose: this command decides which single round to start *after* the refresh,
+        # and letting the poll dispatch first would make that choice implicit.
+        refresh = Worker(config, store, log, execute=False).poll_once()
+        if not refresh.ok:
+            log.error(
+                "review_poll_failed",
+                detail=refresh.error or "one or more repositories were inaccessible",
+            )
             return EXIT_FAILURE
 
         orchestrator = Orchestrator(config, store, client, log)
@@ -991,6 +1026,158 @@ def _cmd_review(args: argparse.Namespace, config: Config, log: Logger) -> int:
         store.close()
         lock.release()
         log.info("lock_released", path=str(config.worker.lock_file))
+
+
+def _cmd_review_parked(args: argparse.Namespace, config: Config, log: Logger) -> int:
+    """Release or re-open a parked review round. Never runs the implementation path.
+
+    This is the one explicit maintainer action for the state a failed or interrupted
+    round leaves behind, and it exists because there was previously *none*: a parked
+    round is deliberately not touched by any poll (a turn may already have been paid
+    for, and its commits may be half-written), `ReviewLoop.evaluate` needs
+    `awaiting_review`, and implementation `retry` would start an implementation run —
+    which is not what a maintainer asking about a review round wants.
+
+    Two options, and the difference is the whole point:
+
+    * ``--release`` gives the round up. The task returns to ``awaiting_review`` and a
+      future explicit handoff can be claimed. The feedback is deliberately **not**
+      acknowledged, so it is carried again by that next round.
+    * ``--retry-round`` re-opens *this* round for one more attempt with its claimed
+      snapshot preserved, so the same feedback is retried rather than re-collected.
+
+    Both take the lock and run the review pass afterwards, so the command's effect is
+    reported from durable state rather than assumed.
+    """
+    if args.repo is None or args.issue is None:
+        print("--release and --retry-round require --repo and --issue", file=sys.stderr)
+        return EXIT_USAGE
+
+    store = Store(config.worker.state_db)
+    try:
+        task = store.get_task(args.repo, args.issue)
+        if task is None:
+            print(f"{args.repo}#{args.issue}: no task row recorded", file=sys.stderr)
+            return EXIT_FAILURE
+        round_row = store.open_round(task.id)
+        if round_row is None or round_row.state not in STATES_NEEDING_ATTENTION:
+            state = round_row.state if round_row is not None else "none"
+            print(
+                f"{task.ref}: no parked review round to act on "
+                f"(review round state: {state}). Nothing was changed.",
+                file=sys.stderr,
+            )
+            return EXIT_FAILURE
+
+        action = "release" if args.release else "retry-round"
+        note = f"review round {round_row.round} {action}d by the maintainer"
+        # Remember WHICH round was acted on. A successful retry closes it, so the
+        # result must be reported from this row rather than from "whatever is open
+        # now" — asking the latter would read success as failure.
+        round_id = round_row.id
+        try:
+            if args.release:
+                store.release_round(task.id, round_row.id, note=note)
+            else:
+                store.reopen_round(task.id, round_row.id, note=note)
+        except Exception as exc:  # noqa: BLE001 - reported, never silently swallowed
+            log.error("review_parked_action_failed", action=action, error=f"{exc}")
+            return EXIT_FAILURE
+        log.info(
+            "review_parked_action",
+            action=action,
+            repo=task.repo,
+            issue=task.issue_number,
+            round=round_row.round,
+        )
+    finally:
+        store.close()
+
+    lock = WorkerLock(
+        config.worker.lock_file,
+        command=f"agent-dispatch review --{action.replace('_', '-')} --config {config.source_path}",
+    )
+    try:
+        lock.acquire()
+    except LockBusyError as exc:
+        # A live worker finishes (or reports) the round on its next poll, which is
+        # enough here: the row has already been changed to a state the passes act on.
+        print(f"a worker holds the lock ({exc.holder}); it will act on the change on its next poll")
+        return EXIT_OK
+    try:
+        store = Store(config.worker.state_db)
+        try:
+            client = GitHubClient(config.github.command)
+            try:
+                client.check_available()
+            except GitHubError as exc:
+                log.error("review_failed", kind=exc.kind, error=str(exc))
+                return _review_parked_result(args, store, log, round_id)
+            orchestrator = Orchestrator(config, store, client, log)
+            for note in orchestrator.reconcile_review_rounds():
+                print(f"review reconcile: {note}")
+            for outcome in orchestrator.dispatch_review_rounds(only_repo=args.repo):
+                print(f"result: {outcome.summary()}")
+                for item in outcome.notes:
+                    print(f"  note: {item}")
+            return _review_parked_result(args, store, log, round_id)
+        finally:
+            store.close()
+    finally:
+        lock.release()
+        log.info("lock_released", path=str(config.worker.lock_file))
+
+
+def _review_parked_result(
+    args: argparse.Namespace, store: Store, log: Logger, round_id: int
+) -> int:
+    """Report the outcome of a release or retry from durable state, not from intent.
+
+    Reads the **specific round the command acted on**, by id, rather than "whatever is
+    open now". A successful ``--retry-round`` closes its round — that is the whole point
+    — so asking whether a round is still open would read success as failure. That is the
+    same trap ``resume-publish`` had to avoid: a command's exit status describes the
+    outcome, and the outcome here is the state of the round it acted on.
+
+    A release always succeeds: its effect is to *leave* the unresolved state, and there
+    is nothing that can still be pending afterwards.
+    """
+    task = store.get_task(args.repo, args.issue)
+    if task is None:  # pragma: no cover - the caller already checked
+        return EXIT_FAILURE
+    round_row = store.review_round(task.id, _round_number_for(store, task.id, round_id)) or (
+        store.open_round(task.id)
+    )
+    if args.release:
+        print(
+            f"{task.ref}: review round released; {task.phase}"
+            + (" — the next explicit handoff carries the same feedback again")
+        )
+        return EXIT_OK
+
+    if round_row is not None and round_row.state not in STATES_NEEDING_ATTENTION:
+        print(
+            f"{task.ref}: review round {round_row.round} is now {round_row.state}; {task.phase}"
+            + (f" — {round_row.error}" if round_row.error else "")
+        )
+        return EXIT_OK
+
+    state = round_row.state if round_row is not None else "unknown"
+    print(
+        f"{task.ref}: the review round is still {state}; it was not finished. "
+        "The round and its feedback are unchanged, so it can be released or retried "
+        "again once the cause is fixed.",
+        file=sys.stderr,
+    )
+    return EXIT_FAILURE
+
+
+def _round_number_for(store: Store, task_id: int, round_id: int) -> int:
+    """The round number of the row whose id is ``round_id``, or 0 when unknown."""
+    for row in store.rounds_for(task_id):
+        if row.id == round_id:
+            return row.round
+    return 0
 
 
 def _review_dry_run(args: argparse.Namespace, config: Config, log: Logger) -> int:

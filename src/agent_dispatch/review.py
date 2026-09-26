@@ -146,6 +146,12 @@ class Reason:
     NO_SESSION = "session_not_resumable"
     WORKTREE_UNOWNED = "worktree_not_owned"
     TRIGGER_GONE = "trigger_label_missing"
+    #: The task is paused explicitly by the maintainer, as opposed to a pause this
+    #: service applied because the trigger label was withdrawn.
+    TASK_PAUSED = "task_paused"
+    #: The live Issue carries no trigger label, seen at evaluation time rather than
+    #: inferred from a possibly-stale local observation.
+    TRIGGER_MISSING_LIVE = "trigger_label_missing_live"
     LABEL_NOT_CLEARED = "handoff_label_not_cleared"
     DIFF_UNAVAILABLE = "diff_unavailable"
 
@@ -470,6 +476,9 @@ class HandoffDecision:
     session_id: str | None = None
     branch: str | None = None
     worktree_path: str | None = None
+    #: Set when the evaluation **observed** the handoff label absent. Reported rather
+    #: than persisted so `evaluate` stays pure; the write path re-arms the handoff.
+    observed_label_absent: bool = False
 
     @property
     def claimed_round(self) -> bool:
@@ -514,7 +523,15 @@ class ReviewLoop:
     # ------------------------------------------------------------------ gates
 
     def evaluate(self, task: Task, repo: RepoConfig) -> HandoffDecision:
-        """Decide whether ``task`` may start a round now. Never has a side effect."""
+        """Decide whether ``task`` may start a round now.
+
+        **Pure**: it reads state and returns a decision, and never writes — not even to
+        record that the label was absent. That is what makes it safe for
+        ``review --dry-run``, which opens the database read-only and would otherwise
+        raise on a write (or, worse, silently mutate the file it promised not to touch).
+        Anything that must be persisted is reported on the decision and performed by
+        :meth:`Orchestrator.record_handoff_outcome` on the write path.
+        """
         ref = task.ref
         handoff = self.config.github.review_handoff_label
 
@@ -533,6 +550,42 @@ class ReviewLoop:
                 "publication of the previous round is still pending; it will be finished "
                 "before any new round starts",
                 task_ref=ref,
+            )
+        if task.phase == "paused":
+            # An explicit maintainer `pause`, or a pause this service applied because
+            # `take-it` was removed. Both mean "stop doing things to this task", and a
+            # review round is a thing.
+            #
+            # This gate exists because `reconcile_review_rounds` walks unresolved rounds
+            # regardless of phase: without it, a claimed round could still be re-driven
+            # after a crash, and a publish-pending round could still be committed and
+            # pushed — after a `pause`, and after `take-it` was withdrawn. That is the
+            # #16/#18 invariant (a paused publish-pending task is not automatically
+            # published) applied to review.
+            #
+            # Reported as a **deferral**, not a refusal, because both pauses are
+            # reversible and neither is a judgement about the round itself: `unpause`
+            # resumes an explicit pause, and re-adding `take-it` releases the other. A
+            # refusal would consume the handoff, so a maintainer who paused a task
+            # briefly would come back to find their review request quietly dropped.
+            reason = (
+                Reason.TRIGGER_GONE
+                if task.pause_reason == "label_withdrawn"
+                else Reason.TASK_PAUSED
+            )
+            detail = (
+                "the trigger label was removed, so dispatch intent is withdrawn"
+                if task.pause_reason == "label_withdrawn"
+                else "the task is paused by the maintainer"
+            )
+            return HandoffDecision(
+                HandoffAction.DEFER,
+                reason,
+                f"no review round starts while {detail}. Re-add "
+                f"'{self.config.github.trigger_label}' and unpause to continue; this handoff "
+                "is kept and will be picked up then.",
+                task_ref=ref,
+                pr_number=task.pr_number,
             )
         if task.phase == "running":
             # One writer per task, always. The label stays where it is, so the
@@ -638,14 +691,17 @@ class ReviewLoop:
 
         if not pull.has_label(handoff):
             # Nothing to do, and the common case: a poll of a PR with no handoff must
-            # be free, silent and side-effect free.
-            self.store.observe_handoff_absent(task.id)
+            # be free and silent. The absence is *reported*, not persisted here:
+            # `evaluate` is a pure decision, and a decision that writes is how
+            # `review --dry-run` came to mutate the database it had opened read-only.
+            # The caller re-arms the handoff after its own writes.
             return HandoffDecision(
                 HandoffAction.SKIP,
                 Reason.LABEL_ABSENT,
                 f"PR #{pull.number} does not carry '{handoff}'",
                 task_ref=ref,
                 pr_number=pull.number,
+                observed_label_absent=True,
             )
 
         if not task.handoff_claimable:
@@ -786,15 +842,20 @@ class ReviewLoop:
         return None
 
 
-def _pr_is_ours(pull: PullRequest, repo: str, task: Task) -> bool:
+def _pr_is_ours(pull: PullRequest, repo: str, task: Task, *, expected: int | None = None) -> bool:
     """Whether this PR is provably the one this task owns.
 
     Three independent checks, all required, matching the ownership rule from #4/#16:
     the number is the recorded one, the head branch is in this repository and not a
     fork with a colliding name, and the PR text references the Issue. A branch name
     is a hint; only this combination is evidence.
+
+    ``expected`` names the PR number the caller is *already committed to* — a review
+    round's claimed PR. When given it replaces the recorded ``task.pr_number``, so a
+    round can assert "this exact PR, still mine" rather than only "some PR I own".
     """
-    if task.pr_number is None or pull.number != task.pr_number:
+    wanted = expected if expected is not None else task.pr_number
+    if wanted is None or pull.number != wanted:
         return False
     if task.branch and pull.head_ref and pull.head_ref != task.branch:
         return False

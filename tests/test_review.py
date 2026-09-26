@@ -39,6 +39,7 @@ credits. Its absence is reported in the PR rather than papered over.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import sys
@@ -67,6 +68,7 @@ from agent_dispatch.store import (  # noqa: E402
     ROUND_INTERRUPTED,
     ROUND_PUBLISH_PENDING,
     ROUND_PUBLISHED,
+    ROUND_RELEASED,
     ROUND_STAGE_PR,
     ROUND_STAGE_PUSH,
     Store,
@@ -272,6 +274,132 @@ class ReviewCase(ExecutionCase):
     def runtime_calls(self) -> int:
         return len(self.recorded_argv())
 
+    def claimed_cursor(self) -> str:
+        """The feedback cursor a fresh claim would record for this task's PR.
+
+        Crash fixtures must claim with a cursor that a restart can actually reproduce,
+        because a claimed round's snapshot has to be re-read from GitHub and re-checked
+        before it may run again. A hand-written cursor would be a snapshot no live read
+        can match, and the round would (correctly) refuse to re-drive — so a test built
+        on one would prove nothing about the restart path.
+        """
+        import os
+
+        from agent_dispatch.github import GitHubClient
+        from test_offline import FAKE_WRAPPER
+
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        feedback = collect_feedback(
+            GitHubClient(str(FAKE_WRAPPER)),
+            repo=self.slug,
+            pr_number=PR_NUMBER,
+            issue_number=1,
+        )
+        self.assertTrue(feedback.complete, feedback.problems)
+        return serialise_cursor(feedback.cursor())
+
+    def parked_publish_pending_round(self, *, stage: str = ROUND_STAGE_PR):
+        """A round whose model turn already completed and whose publication failed.
+
+        Built directly, because the alternative is a fixture that lies. Injecting a
+        one-shot failure and running the whole `review` command does **not** reach the
+        publication code: `ReviewLoop.evaluate` reads the PR itself, so it consumes the
+        injected failure first and defers — and the test would then pass or fail for
+        reasons that have nothing to do with publication.
+
+        The state modelled is exactly what `_publish_review_round` leaves behind: the
+        round is `publish_pending` with a review-specific stage, and the task is parked
+        with the same stage so the recovery pass picks it up.
+        """
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        store.start_review_round(claimed.id, session_id=task.session_id)
+        store.finish_run(
+            store.start_run(
+                task.id,
+                run_id="20260401T000000000000-review-parked1",
+                kind="review",
+                resumed_from=task.session_id,
+                log_path=str(self.tmp / "parked.ndjson"),
+                consumes_attempt=False,
+            ),
+            outcome="succeeded",
+            session_id=task.session_id,
+            exit_code=0,
+            subtype="success",
+            tool_hook_blocked=False,
+            timed_out=False,
+            produced_work=True,
+            detail=None,
+        )
+        store.mark_round_publish_pending(claimed.id, head_sha="a" * 40, stage=stage)
+        store.park_for_recovery(task.id, stage=stage, note="review publication failed")
+        return store, task, claimed
+
+    def _repo_config(self):
+        from agent_dispatch.config import load_config
+
+        return load_config(self.world.config_path).repo(self.slug)
+
+    def _orchestrator(self, store, repository, task):
+        """An Orchestrator plus the worktree manager and state it would publish from."""
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        stream = open(os.devnull, "w")  # noqa: SIM115
+        self.addCleanup(stream.close)
+        orchestrator = Orchestrator(
+            config, store, GitHubClient(config.github.command), Logger(fmt="text", stream=stream)
+        )
+        manager = orchestrator._manager(repository)
+        state = manager.inspect(task.worktree_path, task.branch)
+        self.assertTrue(state.branch_matches, state.describe())
+        return orchestrator, manager, state
+
+    def _confirm_publish(self, orchestrator, store, claimed, task, repository, manager, state):
+        """Drive the exact-PR confirmation directly, with the round's real handover.
+
+        Called directly rather than through `review` on purpose: `ReviewLoop.evaluate`
+        reads the PR itself, so a whole-command test would consume any injected failure
+        before publication was reached — and would then assert about the wrong step.
+        """
+        return orchestrator._confirm_exact_pull_request(
+            task,
+            repository,
+            state,
+            require_pr=PR_NUMBER,
+            result=None,
+            notes=[],
+            on_confirmed=lambda number, url: store.finalise_review_round(
+                claimed.id,
+                task.id,
+                cursor_json=claimed.cursor or "{}",
+                pr_number=number,
+                pr_url=url,
+            ),
+            recovery_stage=ROUND_STAGE_PR,
+        )
+
+    def _label_names(self) -> list[str]:
+        return [
+            str(item["name"]) if isinstance(item, dict) else str(item)
+            for item in self.pr().get("labels", [])
+        ]
+
     def review_scenario(self, **overrides: object) -> None:
         """Script a second run: the resumed review round."""
         run: dict[str, object] = {
@@ -393,12 +521,6 @@ class OneRoundPerHandoffTests(ReviewCase):
         self.review_scenario()
         self.assertEqual(self.run_cli("review").returncode, 0)
         self.assertEqual([r.round for r in self.rounds()], [1, 2])
-
-    def _label_names(self) -> list[str]:
-        return [
-            str(item["name"]) if isinstance(item, dict) else str(item)
-            for item in self.pr().get("labels", [])
-        ]
 
     def test_removing_and_readding_the_label_queues_exactly_one_further_round(self) -> None:
         """The documented way to ask again: remove it, let the round finish, add it again."""
@@ -867,10 +989,14 @@ class FailingClosedTests(ReviewCase):
         self.review_scenario()
         self.set_issues(issue(1, "Feature work", labels=[]))
 
-        self.assertEqual(self.run_cli("review").returncode, 1)
-        self.assertEqual(self.runtime_calls(), 1)
-        self.assertEqual(self.rounds(), [])
-        self.assertIn("dispatch intent is withdrawn", self.task_row().last_error or "")
+        result = self.run_cli("review")
+        self.assertEqual(result.returncode, 0, "a reversible pause is not a failure")
+        self.assertEqual(self.runtime_calls(), 1, "no model call without dispatch intent")
+        self.assertEqual(self.rounds(), [], "no round may be claimed")
+        task = self.task_row()
+        self.assertEqual(task.phase, "paused")
+        self.assertEqual(task.pause_reason, "label_withdrawn")
+        self.assertTrue(task.handoff_claimable, "the handoff is kept, not consumed")
 
     def test_an_unreadable_pr_defers_rather_than_failing_the_handoff(self) -> None:
         self.first_run()
@@ -894,47 +1020,53 @@ class FailingClosedTests(ReviewCase):
 
 class ReviewPublicationTests(ReviewCase):
     def test_a_failed_pr_lookup_is_finished_publish_only_on_a_later_pass(self) -> None:
-        """The #5 publish-only regression: same PR, zero further runtime calls."""
+        """The #5 publish-only regression: same PR, zero further runtime calls.
+
+        The failure is injected on the **exact-PR** read, which is what the review
+        publication path uses now that it may not create or adopt a pull request.
+        Injecting it on the PR *listing* would no longer reach this code at all, so the
+        test would pass without exercising anything.
+        """
         self.first_run()
         session = self.task_row().session_id
-        self.hand_off()
-        self.add_comment("Please adjust the wording.")
-        self.review_scenario()
+        repository = self._repo_config()
+        store, task, claimed = self.parked_publish_pending_round()
+        calls_before = self.runtime_calls()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
 
-        # The resumed turn completes and its commit lands, but publication fails.
-        self.inject_failure(f"{self.slug}:pulls", stderr="gh: rate limit exceeded\n")
-        self.assertEqual(self.run_cli("review").returncode, 1)
+        # First attempt: the exact-PR read fails, so the round must park with its stage
+        # intact and its feedback still unacknowledged.
+        self.inject_failure(f"{self.slug}:pull:{PR_NUMBER}", stderr="gh: rate limit exceeded\n")
+        outcome = self._confirm_publish(
+            orchestrator, store, claimed, task, repository, manager, state
+        )
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "review_pr_unreadable")
 
         rounds = self.rounds()
-        self.assertEqual(len(rounds), 1)
         self.assertEqual(rounds[0].state, ROUND_PUBLISH_PENDING)
         self.assertEqual(rounds[0].recovery_stage, ROUND_STAGE_PR)
-        self.assertEqual(
+        self.assertIsNone(
             self.task_row().feedback_cursor,
-            None,
             "feedback must stay unacknowledged until its publication is durable",
         )
-        calls_after_failure = self.runtime_calls()
-        self.assertEqual(calls_after_failure, 2)
+        self.assertEqual(self.runtime_calls(), calls_before)
 
-        # The failure is one-shot, so the next pass recovers. It must publish without
-        # touching the model again.
+        # The failure was one-shot, so recovery now publishes — with no model call.
         self.assertEqual(self.run_cli("review").returncode, 0)
-        self.assertEqual(
-            self.runtime_calls(), calls_after_failure, "recovery must invoke no runtime"
-        )
+        self.assertEqual(self.runtime_calls(), calls_before, "recovery must invoke no runtime")
 
         rounds = self.rounds()
         self.assertEqual(len(rounds), 1, "no second round may be minted by recovery")
         self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
         self.assertIsNone(rounds[0].recovery_stage)
 
-        task = self.task_row()
-        self.assertEqual(task.phase, "awaiting_review")
-        self.assertEqual(task.pr_number, PR_NUMBER, "the SAME PR is retained")
-        self.assertEqual(task.session_id, session)
+        after = self.task_row()
+        self.assertEqual(after.phase, "awaiting_review")
+        self.assertEqual(after.pr_number, PR_NUMBER, "the SAME PR is retained")
+        self.assertEqual(after.session_id, session)
         self.assertEqual(
-            parse_cursor(task.feedback_cursor),
+            parse_cursor(after.feedback_cursor),
             parse_cursor(rounds[0].cursor),
             "the cursor advances once publication is durable",
         )
@@ -943,22 +1075,28 @@ class ReviewPublicationTests(ReviewCase):
 
     def test_a_failed_push_of_a_round_is_recovered_without_a_model_call(self) -> None:
         self.first_run()
-        self.hand_off()
-        self.add_comment("Push this for me.")
-        self.review_scenario()
-
-        # `ls-remote` is what the tip comparison uses; failing it makes the round's
-        # publication fail closed with the round left publish-pending.
-        self.inject_failure(f"{self.slug}:pulls", stderr="gh: rate limit exceeded\n")
-        self.assertEqual(self.run_cli("review").returncode, 1)
+        repository = self._repo_config()
+        store, task, claimed = self.parked_publish_pending_round(stage=ROUND_STAGE_PUSH)
         calls = self.runtime_calls()
-        self.assertEqual(self.open_round().state, ROUND_PUBLISH_PENDING)
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
 
-        self.assertEqual(self.run_cli("review").returncode, 0)
-        self.assertEqual(self.runtime_calls(), calls)
-        self.assertEqual(self.open_round(), None)
-        self.assertEqual(self.task_row().phase, "awaiting_review")
-        self.assertEqual(self.rounds()[-1].state, ROUND_PUBLISHED)
+        outcome = self._confirm_publish(
+            orchestrator, store, claimed, task, repository, manager, state
+        )
+        self.assertEqual(outcome.action, "awaiting_review")
+        self.assertEqual(self.runtime_calls(), calls, "publication must not call the model")
+
+        rounds = self.rounds()
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+        after = self.task_row()
+        self.assertEqual(after.phase, "awaiting_review")
+        self.assertEqual(after.pr_number, PR_NUMBER, "the SAME PR is retained")
+        self.assertEqual(
+            parse_cursor(after.feedback_cursor),
+            parse_cursor(rounds[0].cursor),
+            "the cursor advances only with the publication",
+        )
+        self.assertEqual(len(self.current_world()["repos"][self.slug]["pulls"]), 1)
 
     def test_a_round_that_changes_nothing_is_accepted_and_published(self) -> None:
         """A reasoned no-op round is a valid outcome, not a failure (#5 acceptance)."""
@@ -1037,7 +1175,7 @@ class ReviewHandoffCrashTests(ReviewCase):
         self.add_comment("A request.")
         store = self.store()
         task = self.task_row()
-        cursor = serialise_cursor({"conversation:1": "2026-02-01T10:00:00Z"})
+        cursor = self.claimed_cursor()
         claimed = store.claim_review_round(
             task.id,
             pr_number=PR_NUMBER,
@@ -1064,7 +1202,7 @@ class ReviewHandoffCrashTests(ReviewCase):
         self.add_comment("A request.")
         store = self.store()
         task = self.task_row()
-        cursor = serialise_cursor({"conversation:1": "2026-02-01T10:00:00Z"})
+        cursor = self.claimed_cursor()
         claimed = store.claim_review_round(
             task.id,
             pr_number=PR_NUMBER,
@@ -1130,12 +1268,6 @@ class ReviewHandoffCrashTests(ReviewCase):
         self.assertEqual(after.pr_number, PR_NUMBER)
         self.assertEqual(after.session_id, session)
         self.assertIsNone(after.recovery_stage)
-
-    def _label_names(self) -> list[str]:
-        return [
-            str(item["name"]) if isinstance(item, dict) else str(item)
-            for item in self.pr().get("labels", [])
-        ]
 
 
 class FinalisationAtomicityTests(ReviewCase):
@@ -1361,7 +1493,7 @@ class ReviewReadOnlyTests(ReviewCase):
         self.add_comment("A request.")
         store = self.store()
         task = self.task_row()
-        cursor = serialise_cursor({"conversation:1": "2026-02-01T10:00:00Z"})
+        cursor = self.claimed_cursor()
         claimed = store.claim_review_round(
             task.id,
             pr_number=PR_NUMBER,
@@ -1426,7 +1558,7 @@ class ReviewReadOnlyTests(ReviewCase):
         self.add_comment("A request.")
         store = self.store()
         task = self.task_row()
-        cursor = serialise_cursor({"conversation:1": "2026-02-01T10:00:00Z"})
+        cursor = self.claimed_cursor()
         claimed = store.claim_review_round(
             task.id,
             pr_number=PR_NUMBER,
@@ -1480,6 +1612,47 @@ class ReviewReadOnlyTests(ReviewCase):
             "a read-only command must not create the state database",
         )
 
+    def test_review_dry_run_writes_nothing_when_the_label_is_absent(self) -> None:
+        """The absent-label branch is the one that used to write.
+
+        `ReviewLoop.evaluate` re-armed the handoff itself when it found no label, so a
+        dry run against a task with `handoff_armed = 0` and no label mutated the database
+        it had just opened read-only — contradicting both that method's own docstring and
+        the CLI's promise. Asserting "no state file was created" does not cover this,
+        because here the database already exists; the check has to be on its contents.
+        """
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        self.review_scenario()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        # Disarm the handoff directly: a crash between the claim and the label removal
+        # leaves exactly this pair (label gone from the PR, handoff still consumed), and
+        # that pair is what made `evaluate` re-arm as a side effect of deciding.
+        task = self.task_row()
+        self.store().disarm_handoff(task.id, note="simulated interrupted claim")
+        self.assertFalse(self.task_row().handoff_claimable, "precondition: consumed")
+
+        from agent_dispatch.config import load_config
+
+        config = load_config(self.world.config_path)
+        before = hashlib.sha256(config.worker.state_db.read_bytes()).hexdigest()
+
+        # No label on the PR, and the handoff is disarmed: the exact branch that used to
+        # re-arm as a side effect of *evaluating*.
+        self.set_pr_labels()
+        result = self.run_cli("review", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        after = hashlib.sha256(config.worker.state_db.read_bytes()).hexdigest()
+        self.assertEqual(
+            after, before, "review --dry-run must not modify the state database at all"
+        )
+        self.assertFalse(
+            self.task_row().handoff_claimable, "evaluating must not re-arm the handoff"
+        )
+
     def test_status_and_dry_run_never_start_a_round(self) -> None:
         self.first_run()
         self.hand_off()
@@ -1500,6 +1673,585 @@ class ReviewReadOnlyTests(ReviewCase):
         self.assertEqual(self.run_cli("worker", "--once", "--no-execute").returncode, 0)
         self.assertEqual(self.runtime_calls(), 1, "--no-execute must not spend a model call")
         self.assertEqual(self.rounds(), [])
+
+
+class ExactPullRequestTests(ReviewCase):
+    """A review round may only ever publish to the PR it was claimed against (#5).
+
+    The create-or-adopt implementation path is correct for a first implementation and
+    forbidden for a round: a round that pushed to a replacement PR, or adopted a
+    different open PR on the same branch, would silently replace review work on a pull
+    request a human was reading.
+    """
+
+    def _publish_parked_round(self, store, claimed, task, repository, mutate_world=None):
+        if mutate_world is not None:
+            mutate_world()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
+        return self._confirm_publish(orchestrator, store, claimed, task, repository, manager, state)
+
+    def test_a_closed_pr_parks_the_round_and_posts_no_replacement(self) -> None:
+        self.first_run()
+        repository = self._repo_config()
+        store, task, claimed = self.parked_publish_pending_round()
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+
+        def close_it() -> None:
+            self.mutate(
+                pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}]
+            )
+
+        outcome = self._publish_parked_round(
+            store, claimed, task, repository, mutate_world=close_it
+        )
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "review_pr_not_open")
+
+        # The harm to assert is "no PR was created", not a proxy.
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "a review round must never create a replacement pull request",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+        self.assertEqual(self.task_row().phase, "needs_attention")
+
+    def test_another_open_pr_on_the_branch_is_never_adopted(self) -> None:
+        """Even a plausible-looking candidate must not replace the claimed PR."""
+        self.first_run()
+        repository = self._repo_config()
+        store, task, claimed = self.parked_publish_pending_round()
+        # A second open PR that also references the Issue. The old create-or-adopt path
+        # could have adopted this; the round must not.
+        self.mutate(
+            pulls=[
+                self.pr(),
+                {
+                    **self.pr(),
+                    "number": 99,
+                    "html_url": f"https://github.com/{self.slug}/pull/99",
+                    "body": f"Fixes https://github.com/{self.slug}/issues/1",
+                },
+            ]
+        )
+
+        outcome = self._publish_parked_round(store, claimed, task, repository)
+        self.assertEqual(outcome.action, "awaiting_review")
+        self.assertEqual(
+            outcome.pr_number,
+            PR_NUMBER,
+            "the round must publish to its own PR, not to another open one",
+        )
+        self.assertEqual(self.task_row().pr_number, PR_NUMBER)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+
+    def test_a_pr_that_stopped_being_ours_parks_the_round(self) -> None:
+        """Ownership is re-verified at publish time, not trusted from the claim."""
+        self.first_run()
+        repository = self._repo_config()
+        store, task, claimed = self.parked_publish_pending_round()
+
+        def fork_it() -> None:
+            self.mutate(
+                pulls=[
+                    {
+                        **self.pr(),
+                        "head": {
+                            "ref": task.branch,
+                            "sha": "0" * 40,
+                            "repo": {"full_name": "someone-else/agent-dispatch"},
+                            "user": {"login": "someone-else"},
+                        },
+                    }
+                ]
+            )
+
+        outcome = self._publish_parked_round(store, claimed, task, repository, mutate_world=fork_it)
+        self.assertEqual(outcome.action, "needs_attention")
+        self.assertEqual(outcome.reason, "review_pr_unowned")
+        # The round stays publish-pending with its feedback unacknowledged, so a later
+        # pass (or a maintainer) can still resolve it rather than losing the work.
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(self.task_row().feedback_cursor)
+        self.assertEqual(self.task_row().phase, "needs_attention")
+
+    def test_publish_only_recovery_is_also_restricted_to_the_exact_pr(self) -> None:
+        """Recovery is the same decision, so it needs the same restriction.
+
+        Recovering a round is exactly when a replacement is most tempting — the push
+        already happened — and exactly when it would be most damaging.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round(stage=ROUND_STAGE_PUSH)
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+        self.mutate(pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}])
+
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        stream = open(os.devnull, "w")  # noqa: SIM115
+        self.addCleanup(stream.close)
+        orchestrator = Orchestrator(
+            config, store, GitHubClient(config.github.command), Logger(fmt="text", stream=stream)
+        )
+        calls = self.runtime_calls()
+        orchestrator.reconcile_review_rounds()
+
+        self.assertEqual(self.runtime_calls(), calls, "recovery must not call the model")
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "recovery must not create a replacement pull request either",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+
+
+class SnapshotReproductionTests(ReviewCase):
+    """A restarted round may only run when its claimed snapshot is reproducible (#5).
+
+    Only ids and versions are persisted — bodies stay on GitHub by design — so a
+    re-drive has to re-read them and check they still match. All three failures below
+    must park without a model call, because the alternative is acting on feedback the
+    round was not claimed for.
+    """
+
+    def _claim_and_restart(self, mutate_world=None):
+        """A claimed-but-unstarted round, optionally with the world changed since."""
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        if mutate_world is not None:
+            mutate_world()
+        self.review_scenario()
+        return store, task, claimed
+
+    def _redrive(self) -> None:
+        """Run one `review` pass, expecting the round to park WITHOUT a model call.
+
+        The exit code is deliberately not asserted here: a snapshot refusal is reported
+        as `needs_attention`, and what this class is about is the *absence of a model
+        call plus the parked state*. Asserting an exit code as well would make the test
+        about CLI plumbing, and an earlier version of it did exactly that — it asserted
+        `1` for a case that correctly returns `0`, so it failed for a reason unrelated to
+        the guard it was meant to pin.
+        """
+        result = self.run_cli("review")
+        self.assertIn(
+            "review_snapshot_unreproducible",
+            result.stdout + result.stderr,
+            "the refusal must be the snapshot decision, not a side effect",
+        )
+
+    def test_a_truncated_read_after_the_claim_starts_nothing(self) -> None:
+        self._claim_and_restart()
+        before = self.runtime_calls()
+        previous = os.environ.get("FAKE_GH_PAD_REVIEWS")
+        os.environ["FAKE_GH_PAD_REVIEWS"] = "60"
+        self.addCleanup(
+            lambda: (
+                os.environ.pop("FAKE_GH_PAD_REVIEWS", None)
+                if previous is None
+                else os.environ.__setitem__("FAKE_GH_PAD_REVIEWS", previous)
+            )
+        )
+
+        self._redrive()
+        self.assertEqual(self.runtime_calls(), before, "no model call on an unproven snapshot")
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+
+    def test_a_claimed_item_deleted_after_the_claim_starts_nothing(self) -> None:
+
+        def delete_it() -> None:
+            world = self.current_world()
+            repo = world["repos"][self.slug]
+            repo["comments"] = [item for item in repo.get("comments", []) if item["id"] == 1001]
+            self.world.world = world
+            self.world.write_world()
+
+        self._claim_and_restart(mutate_world=delete_it)
+        before = self.runtime_calls()
+        self._redrive()
+        self.assertEqual(self.runtime_calls(), before, "no model call when a claimed item is gone")
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+
+    def test_an_item_edited_after_the_claim_starts_nothing(self) -> None:
+        """Post-claim text belongs to a LATER handoff, never to the round that claimed it."""
+
+        def edit_it() -> None:
+            world = self.current_world()
+            for record in world["repos"][self.slug]["comments"]:
+                record["body"] = "edited after the claim"
+                record["updated_at"] = "2026-05-01T00:00:00Z"
+            self.world.world = world
+            self.world.write_world()
+
+        self._claim_and_restart(mutate_world=edit_it)
+        before = self.runtime_calls()
+        self._redrive()
+        self.assertEqual(self.runtime_calls(), before, "no model call for edited feedback")
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+    def test_an_unchanged_snapshot_still_re_drives(self) -> None:
+        """The positive case, so failing closed is not accidentally refusing everything."""
+        before = self.runtime_calls()
+        self._claim_and_restart()
+        before = self.runtime_calls()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), before + 1, "an unchanged snapshot still runs")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+
+
+class PausedTaskReviewTests(ReviewCase):
+    """Pause and withdrawn `take-it` stop review work, exactly as they stop dispatch (#5)."""
+
+    def _claimed_round(self, *, started: bool):
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        if started:
+            store.start_review_round(claimed.id, session_id=task.session_id)
+            store.set_phase(task.id, "running", "review round in flight")
+        return store, task, claimed
+
+    def test_a_paused_task_is_never_re_driven_after_a_crash(self) -> None:
+        store, task, claimed = self._claimed_round(started=False)
+        store.pause(task.repo, task.issue_number)
+        self.review_scenario()
+        calls = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), calls, "a paused task must not be re-driven")
+        self.assertEqual(self.rounds()[0].state, ROUND_CLAIMED)
+        self.assertEqual(self.task_row().phase, "paused")
+
+    def test_a_paused_publish_pending_round_is_not_pushed(self) -> None:
+        """The #16/#18 invariant, for review: pause stops publication too."""
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round(stage=ROUND_STAGE_PUSH)
+        store.pause(task.repo, task.issue_number)
+
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.logging_setup import Logger
+        from agent_dispatch.orchestrator import Orchestrator
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        stream = open(os.devnull, "w")  # noqa: SIM115
+        self.addCleanup(stream.close)
+        orchestrator = Orchestrator(
+            config, store, GitHubClient(config.github.command), Logger(fmt="text", stream=stream)
+        )
+        tips_before = self._remote_tip(task.branch)
+        orchestrator.reconcile_review_rounds()
+        orchestrator.reconcile_publish_pending()
+
+        self.assertEqual(self._remote_tip(task.branch), tips_before, "nothing may be pushed")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertEqual(self.task_row().phase, "paused")
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+    def test_a_withdrawn_trigger_label_stops_a_crash_re_drive(self) -> None:
+        store, task, claimed = self._claimed_round(started=False)
+        self.set_issues(issue(1, "Feature work", labels=[]))
+        self.review_scenario()
+        calls = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), calls, "no model call without dispatch intent")
+        self.assertEqual(self.rounds()[0].state, ROUND_CLAIMED)
+        self.assertEqual(self.task_row().pause_reason, "label_withdrawn")
+
+    def test_restoring_intent_resumes_the_review_path_not_an_implementation(self) -> None:
+        store, task, claimed = self._claimed_round(started=False)
+        self.set_issues(issue(1, "Feature work", labels=[]))
+        self.review_scenario()
+        self.run_cli("review")
+        calls = self.runtime_calls()
+        self.assertEqual(calls, 1)
+
+        # Re-add the label: the task is released from the pause and the round, still
+        # unresolved and unchanged, is re-driven. It must not become an implementation
+        # run. The handoff needs no re-arming because it was never claimed-and-consumed
+        # here — the round is still in its original `claimed` state.
+        self.set_issues(issue(1, "Feature work", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), calls + 1)
+        argv = self.recorded_argv()[-1]
+        self.assertIn("--session", argv, "the resumed call must be a review round")
+        task_row = self.task_row()
+        self.assertEqual(task_row.phase, "awaiting_review")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+        self.assertNotIn("queued", task_row.phase)
+
+    def _remote_tip(self, branch: str) -> str | None:
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        line = (proc.stdout or "").strip()
+        return line.split()[0] if line else None
+
+
+class ParkedRoundRecoveryTests(ReviewCase):
+    """`review --release` / `--retry-round`: the one explicit way out of a parked round.
+
+    Without these, a failed or interrupted round was unrecoverable without editing
+    SQLite by hand — the review pass deliberately leaves both alone, `evaluate` needs
+    `awaiting_review`, and implementation `retry` would start an implementation run.
+    """
+
+    def _park(self, *, state: str = ROUND_FAILED):
+        self.first_run()
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        store.park_round(claimed.id, state=state, stage=None, note="the round broke")
+        store.set_phase(task.id, "needs_attention", "the round broke")
+        return store, task, claimed
+
+    def test_a_parked_round_is_not_pickable_by_a_plain_review_run(self) -> None:
+        """The problem the commands solve: re-adding the label did nothing."""
+        store, task, claimed = self._park()
+        self.hand_off()
+        self.add_comment("A request.")
+        self.review_scenario()
+        calls = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), calls, "a parked round must not be re-driven")
+        self.assertEqual(self.rounds()[0].state, ROUND_FAILED)
+        self.assertEqual(self.task_row().phase, "needs_attention")
+
+    def test_release_returns_the_task_and_lets_a_fresh_handoff_be_claimed(self) -> None:
+        store, task, claimed = self._park()
+        self.assertEqual(
+            self.run_cli("review", "--release", "--repo", self.slug, "--issue", "1").returncode,
+            0,
+        )
+        after = self.task_row()
+        self.assertEqual(after.phase, "awaiting_review")
+        self.assertIsNone(after.recovery_stage)
+        self.assertEqual(self.rounds()[0].state, ROUND_RELEASED)
+        self.assertIsNone(after.feedback_cursor, "releasing must not acknowledge feedback")
+
+        # The feedback is still unacknowledged, so a fresh handoff carries it again.
+        # The label must be OBSERVED ABSENT first, because a label sitting on the PR is
+        # not automatically a new request — and note that `_park` never added one, so
+        # this genuinely is an absence rather than a re-add of something already there.
+        # (Getting this wrong made an earlier version of the test pass for the wrong
+        # reason: the "absence" was a no-op, so the re-arm under test never happened.)
+        self.assertNotIn(HANDOFF, self._label_names(), "precondition: no handoff label")
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertTrue(self.task_row().handoff_claimable)
+        self.hand_off()
+        self.add_comment("A follow-up request.", created_at="2026-08-01T00:00:00Z")
+        self.review_scenario()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        rounds = self.rounds()
+        self.assertEqual([item.round for item in rounds], [1, 2])
+        self.assertEqual(rounds[1].state, ROUND_PUBLISHED)
+        self.assertEqual(
+            parse_cursor(self.task_row().feedback_cursor),
+            parse_cursor(rounds[1].cursor),
+            "the new round acknowledges the same feedback",
+        )
+
+    def test_release_works_for_an_interrupted_round_too(self) -> None:
+        store, task, claimed = self._park(state=ROUND_INTERRUPTED)
+        self.assertEqual(
+            self.run_cli("review", "--release", "--repo", self.slug, "--issue", "1").returncode,
+            0,
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_RELEASED)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+
+    def test_retry_round_re_drives_the_same_feedback(self) -> None:
+        store, task, claimed = self._park()
+        self.review_scenario()
+        calls = self.runtime_calls()
+
+        self.assertEqual(
+            self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1").returncode,
+            0,
+        )
+        rounds = self.rounds()
+        self.assertEqual(len(rounds), 1, "the SAME round is retried, not a new one")
+        self.assertEqual(rounds[0].id, claimed.id)
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+        self.assertEqual(self.runtime_calls(), calls + 1, "exactly one model call for the retry")
+        self.assertEqual(
+            parse_cursor(self.task_row().feedback_cursor),
+            parse_cursor(rounds[0].cursor),
+        )
+
+    def test_release_is_refused_when_nothing_is_parked(self) -> None:
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        self.review_scenario()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        result = self.run_cli("review", "--release", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no parked review round", result.stderr)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+
+    def test_release_requires_a_repo_and_issue(self) -> None:
+        self.first_run()
+        self.assertEqual(self.run_cli("review", "--release").returncode, 2)
+
+
+class PinnedSessionTests(ReviewCase):
+    """A mismatched resume must not overwrite the task's pinned session (#5)."""
+
+    def test_a_resume_returning_another_session_keeps_the_pinned_one(self) -> None:
+        """The run may report any id it likes; the *task's* pin is the pinned one.
+
+        The driver validates `result.session_id == expected_session` and fails the run
+        when they differ — but the `on_session` callback fires as soon as the stream
+        reports an id, which is **before** validation. Adopting that id into
+        `tasks.session_id` would leave the task advertising a session that was
+        explicitly rejected, and every later resume would then be attempted against the
+        wrong conversation.
+        """
+        self.first_run()
+        session = self.task_row().session_id
+        self.hand_off()
+        self.add_comment("A request.")
+        # The resumed run reports a DIFFERENT session id.
+        self.review_scenario(session_id="sess-different", result_session_id="sess-different")
+
+        result = self.run_cli("review")
+        self.assertEqual(result.returncode, 1, "a mismatched resume must fail the round")
+
+        task = self.task_row()
+        self.assertEqual(
+            task.session_id,
+            session,
+            "the pinned session must survive a rejected resume",
+        )
+        rounds = self.rounds()
+        self.assertEqual(rounds[0].state, ROUND_FAILED, "the round is parked, not published")
+        self.assertEqual(
+            rounds[0].session_id,
+            session,
+            "the round must still record the session it was claimed against",
+        )
+        self.assertIsNone(task.feedback_cursor, "a failed round acknowledges nothing")
+
+        # The attempted id is not lost: it belongs on the run record.
+        run = self.store().run_history(task.id)[-1]
+        self.assertEqual(run.kind, "review")
+        self.assertEqual(
+            run.session_id,
+            "sess-different",
+            "the run records which session was actually attempted",
+        )
+
+    def test_a_first_run_still_pins_the_session_it_started(self) -> None:
+        """The positive case: `record_session` must still work for a NEW session."""
+        self.set_issues(issue(1, "Feature work", labels=[TRIGGER]))
+        self.write_scenario(runs=[{"session_id": "sess-first", "edits": {"impl.txt": "x\n"}}])
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        self.assertEqual(self.task_row().session_id, "sess-first")
+
+
+class AttemptBudgetTests(ReviewCase):
+    """A review round must not consume the implementation attempt budget (#5)."""
+
+    def test_a_review_round_does_not_inflate_the_attempt_counter(self) -> None:
+        """The budget bounds *implementation* tries; a round has its own.
+
+        Sharing the counter made the status comment render nonsense — a task with one
+        implementation and several rounds read "Attempt 4 of 3" — and, worse, a task near
+        its budget could be pushed into `failed` by review rounds rather than by failed
+        implementations.
+        """
+        self.first_run()
+        self.assertEqual(self.task_row().attempts, 1, "the implementation run consumed one")
+
+        for round_number in (1, 2):
+            self.hand_off()
+            self.add_comment(
+                f"Round {round_number} request.", created_at=f"2026-0{round_number}-01T00:00:00Z"
+            )
+            self.review_scenario()
+            self.assertEqual(self.run_cli("review").returncode, 0, f"round {round_number}")
+            self.assertEqual(
+                self.task_row().attempts,
+                1,
+                f"round {round_number} must not consume an implementation attempt",
+            )
+            self.assertEqual(self.task_row().review_round, round_number)
+            if round_number == 1:
+                self.set_pr_labels()
+                self.run_cli("review")
+
+        self.assertEqual(
+            self.store().review_round_attempts(self.task_row().id),
+            2,
+            "the review budget is tracked on the rounds themselves",
+        )
+        body = self.status_body()
+        self.assertNotIn(
+            "Attempt 3",
+            body,
+            "the rendered attempt count must describe implementation attempts only",
+        )
 
 
 class ReviewLoopGuardTests(unittest.TestCase):

@@ -1224,6 +1224,7 @@ poll. Nothing is lost and you do not have to re-add a label you already added:
 | A round is already open | Deferred; the open round owns the handoff. |
 | The previous round's publication is incomplete | Deferred until it is finished. |
 | **No new feedback** since the last round | Deferred. Add your comments and the same still-present label starts the round on the next poll. |
+| The task is **paused**, or `take-it` was removed | Deferred. Both are reversible: `unpause`, or re-add `take-it`, and the kept handoff resumes on the next poll. |
 | The feedback listing was incomplete, or the PR could not be read | Deferred and retried. Claiming from a partial read would acknowledge feedback the model never saw. |
 
 ### When a handoff is refused
@@ -1234,10 +1235,39 @@ consumed rather than re-reported on every poll. `status`/`open` show the reason:
 | Situation | Why it will not start by waiting |
 |---|---|
 | The PR is merged or closed | There is nothing to push a round to. |
-| `take-it` was removed from the Issue | Dispatch intent for the whole task is withdrawn. Re-add it, then re-add `agent:fix`. |
 | No cleanly completed session | An interrupted Command Code run has **no transcript**, so it cannot be resumed. The dispatcher refuses instead of quietly starting a different conversation and calling it a review round. A *first* run interrupted mid-flight is retried fresh by #4's own path; that is a new session, and not a review round. |
 | No recorded worktree, or it is not on the task's branch | A round must resume in the directory the conversation was about. |
 | The PR is not provably this task's | Ownership is re-verified at claim time. Acting on someone else's PR is the one mistake a later poll cannot undo. |
+
+### A round publishes to its own PR, or not at all
+
+The implementation path creates a PR when none exists and adopts one when it does. A
+review round must never do either: it pushes to the **exact PR it was claimed
+against**. Between the claim and the push you can merge or close that PR, and a
+create-or-adopt path would then open a *replacement* PR for the same branch, or
+adopt an unrelated open PR that references the Issue — silently moving review work
+off the pull request you were reading.
+
+So the round's PR number is carried into publication and re-verified there (still
+open, still this repository's head, still linking this Issue, still the same number).
+Any failure parks the round as `Needs attention` with the feedback still
+unacknowledged. A **replacement PR is never created**, and that is asserted by the
+tests rather than merely intended.
+
+### A restarted round must reproduce its claimed feedback, or it does not run
+
+Only feedback *ids and versions* are persisted — comment bodies stay on GitHub by
+design. So a round that has to be re-driven after a crash (claimed but never started)
+re-reads the feedback and checks it still matches what was claimed. It parks instead
+of running when:
+
+* the read is **incomplete** (a truncated listing, a rate limit);
+* a claimed item is **missing** (deleted, or unreadable);
+* a claimed item was **edited after the claim** — its new text belongs to a *later*
+  handoff, not to the round that claimed it.
+
+All three park with no model call, and the feedback stays unacknowledged either way.
+The message names the reason and the action (`--release`).
 
 ### What the agent is asked to do
 
@@ -1271,10 +1301,11 @@ one.
 
 | Failure | What the service does |
 |---|---|
-| The process dies before the round reaches the model | Re-drives the **same** claimed round with the same snapshot and session. No feedback is lost and no second round is minted. |
+| The process dies before the round reaches the model | Re-drives the **same** claimed round with the same snapshot and session — but only if the live Issue still carries `take-it` and the feedback still reads back exactly as claimed. If not, it parks instead. No feedback is lost and no second round is minted. |
 | The process dies while the round's turn is running | Parks the round as interrupted and starts **nothing**. A turn may already have been paid for and its commits may be half-written, so a human decides. |
 | The turn completes but the commit/push/PR step fails | Parking reason is preserved and the **next pass finishes the publication with zero further model calls**. The remote tip is checked against the completed local tip first; the round is only marked published once that matches. |
 | The label could not be removed after the claim | The round still runs; the still-present label cannot start a second round, and the warning says to remove it by hand. |
+| Publication finds its PR closed, merged or no longer ours | Parks as `Needs attention` and creates **no replacement**. The commits are on the branch; the feedback stays unacknowledged. |
 
 **Feedback is acknowledged exactly once, and only after its round is durably
 published.** Closing the round, advancing the acknowledged-feedback cursor, clearing
@@ -1293,12 +1324,35 @@ agent-dispatch review --repo owner/name --issue 12
 
 `review` is optional — the polling worker starts rounds on its own — but it is the
 way to act immediately and the way to see *why* a visible label is not starting
-anything without consuming the handoff. `--dry-run` opens the state database
-read-only, so it cannot create, migrate or write it.
+anything without consuming the handoff. It refreshes discovery first, exactly as `run`
+does, so a `take-it` you re-added a moment ago is already reflected. `--dry-run` opens
+the state database read-only and **writes nothing at all** — not even the
+"label was absent, re-arm the handoff" bookkeeping, which is now a write-path job.
 
 Both `review` and the worker take the single-instance lock: one agent at a time
 remains global, and a review round is an agent run like any other. If the worker
 holds the lock, `review` exits `3` (`busy`) rather than starting a second one.
+
+### Recovering a parked round
+
+A `failed` or `interrupted` round is deliberately left alone by every automatic pass:
+a turn may already have been paid for, and its commits may be half-written. Re-adding
+the label does **not** re-drive it. There is exactly one explicit action, and it makes
+you choose what you mean:
+
+```bash
+agent-dispatch open --repo owner/name --issue 12                     # read the reason first
+agent-dispatch review --release     --repo owner/name --issue 12     # give the round up
+agent-dispatch review --retry-round --repo owner/name --issue 12     # retry the SAME feedback
+```
+
+| Command | Effect |
+|---|---|
+| `--release` | Drops the round and returns the task to `awaiting_review`, so a fresh explicit handoff can be claimed. The feedback is **not** acknowledged, so the next round carries it again. Use this when the round is beyond saving, or when you want to reword your feedback first. |
+| `--retry-round` | Re-opens **that same** round for one more attempt with its claimed snapshot preserved, so it retries exactly the feedback it was claimed with. Use this after fixing whatever broke. |
+
+Neither routes through implementation `retry`: that would start an *implementation*
+run, which is not what you are asking for here.
 
 Manual recovery, in order of what you are likely to want:
 
@@ -1306,13 +1360,14 @@ Manual recovery, in order of what you are likely to want:
 agent-dispatch open --repo owner/name --issue 12   # branch, worktree, session, PR, runs
 agent-dispatch review --dry-run                    # is a handoff claimable, and why not?
 agent-dispatch review                              # finish a round whose publication failed
+agent-dispatch review --release    --repo ... --issue 12   # a parked round is in your way
+agent-dispatch review --retry-round --repo ... --issue 12  # retry the same feedback
 agent-dispatch run                                 # finish a failed IMPLEMENTATION publication
 ```
 
 For a round parked as interrupted or failed, read the recorded reason first
-(`open` prints it). The worktree keeps whatever the round produced, and the feedback
-stays unacknowledged, so fixing the cause and re-adding the label re-runs the round
-with the same feedback rather than losing it.
+(`open` prints it), then choose `--release` or `--retry-round`. The worktree keeps
+whatever the round produced, and the feedback stays unacknowledged either way.
 
 ### What is not verified for this feature
 
