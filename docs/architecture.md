@@ -544,11 +544,37 @@ The exact-PR check itself runs **twice** around the push — once before, once a
 - *After*: the same predicate re-applied, to catch the PR changing state while our own
   push was in flight. It is the same rule, not a second one.
 
-The pre-spawn re-check uses the same predicate with unreadable-PR treated as blocking,
-because there the alternative is spending a model call on an unproven assumption. At
-publication an unreadable PR is *not* blocking: the read failure is transient and the
-recorded stage already retries it. That one deliberate difference is an explicit
-parameter rather than a duplicated code path.
+### One boundary, one read (#5)
+
+Every PR check reads the pull request exactly once and judges **that** object. The rule
+is a correctness property rather than tidiness: validating response A and then handing
+response B to the model validates nothing, because the PR can change between the two
+reads and the unjudged object is the one quoted to the agent. The pre-spawn gate is
+where it matters most, sitting immediately before the model starts.
+
+The predicate is therefore split in two so a caller cannot accidentally re-read:
+
+- `fetch_round_pull()` performs the read and returns the object **together with** any
+  read failure;
+- `judge_round_pull()` judges an object it is *given*, and never fetches.
+
+Returning the object alongside the problem is what makes the single-read property
+structural instead of a comment. The two publication checks are two deliberate race
+boundaries and so two reads — that is the intent. The fake wrapper counts reads per PR
+number, so the property is asserted rather than described.
+
+An unreadable PR is treated differently at each boundary, and the difference is
+deliberate rather than inconsistent:
+
+| Boundary | Unreadable PR | Why |
+|---|---|---|
+| Pre-spawn (re-drive, `--retry-round`, fresh claim) | **Blocks**; zero model calls, round parked | A model call may only be spent on a PR we could actually read and verify |
+| Pre-push (publication) | **Blocks the push**, but the round stays `publish_pending` | "Transient and retryable" does not require mutating the remote branch while the target is unproven — and an outage can coincide with the PR having been closed |
+| Post-push (publication) | Keeps the round retryable; a later pass re-reads | The push already happened, so the read failure is the only thing left to retry |
+
+Making those an explicit named parameter rather than duplicated code paths is what keeps
+`review_pr_unreadable` out of `STRUCTURAL_PR_REASONS`: the round is never parked for a
+read failure, so a temporary GitHub outage needs no maintainer action.
 
 ### Releasing a pause: one restore rule (#5)
 
@@ -570,10 +596,12 @@ finished task there permanently.
 
 Two invariants keep the repair itself safe: a paused task is left alone by every
 automatic pass (so a pause is never silently undone by publishing work the operator
-stopped), and "park the round and retire the stale stage it left on its task" is one
-method, because clearing a stage and setting a phase as separate writes leaves a row
-that is neither publishable nor visibly parked if the process dies between them — the
-window #16's structural test still forbids.
+stopped), and "park the round and retire the stale stage it left on its task" runs in
+**one SQLite transaction** — the connection is in autocommit mode, so two statements in
+one method are still two commits and a crash between them leaves the round already
+`interrupted` (nothing retries its publication) while the task row still looks
+publish-pending. That is the half-applied state this write exists to prevent, and it is
+the same window #16's structural test forbids elsewhere.
 
 Which of those two writes actually enforces what is worth being precise about, since the
 obvious reading is wrong:

@@ -512,6 +512,22 @@ def main(argv: list[str]) -> int:
         spec = consume_failure(world, f"{slug}:pull:{number}")
         if spec:
             fail_with(spec)
+        # Count reads of this exact PR. A caller that validates one response and then
+        # uses a *second* one is a TOCTOU hole that is invisible from the outside — the
+        # only way a test can catch it is by knowing how many times the endpoint was
+        # asked. Recorded per PR number so a test asserts the count for its own boundary
+        # rather than a global total that other code paths also move.
+        reads = world.setdefault("pr_reads", {})
+        key = f"{slug}#{number}"
+        reads[key] = int(reads.get(key, 0)) + 1
+        save_world(world)
+        # An optional per-read override lets a test model "the PR changed between two
+        # reads": `pr_read_overrides` maps a 1-based read index to a full PR record.
+        overrides = (world.get("pr_read_overrides") or {}).get(key) or {}
+        override = overrides.get(str(reads[key]))
+        if override is not None:
+            emit(override, jq)
+            return 0
         for pr in repo.get("pulls", []):
             if int(pr["number"]) == number:
                 emit(pr, jq)

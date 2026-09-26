@@ -1737,20 +1737,28 @@ class Store:
         A round stage is cleared, but an **implementation** stage is deliberately left
         alone: it is evidence for a different repair, and a round has no business
         discarding it.
+
+        **One transaction, not two autocommitted statements.** The connection runs with
+        ``isolation_level=None``, so statements commit individually unless they are
+        wrapped; a crash between them would leave the round already ``interrupted``
+        (so no automatic publication retry) while the task row still carried the old
+        publication phase and stage — the half-applied state this method exists to
+        prevent. Living in one method is not atomicity; sharing one transaction is.
         """
-        self._conn.execute(
-            "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = ?, "
-            "finished_at = ? WHERE id = ?",
-            (ROUND_INTERRUPTED, note, utcnow_iso(), round_id),
-        )
-        # `CASE` rather than `= NULL`: only this round's own stage is stale. An
-        # implementation stage is another repair's evidence and survives untouched.
-        self._conn.execute(
-            f"UPDATE tasks SET phase = 'needs_attention', recovery_stage = CASE "
-            f"WHEN recovery_stage IN {ROUND_STAGE_SQL} THEN NULL ELSE recovery_stage END, "
-            "last_error = ?, updated_at = ? WHERE id = ?",
-            (note, utcnow_iso(), task_id),
-        )
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = ?, "
+                "finished_at = ? WHERE id = ?",
+                (ROUND_INTERRUPTED, note, utcnow_iso(), round_id),
+            )
+            # `CASE` rather than `= NULL`: only this round's own stage is stale. An
+            # implementation stage is another repair's evidence and survives untouched.
+            conn.execute(
+                f"UPDATE tasks SET phase = 'needs_attention', recovery_stage = CASE "
+                f"WHEN recovery_stage IN {ROUND_STAGE_SQL} THEN NULL ELSE recovery_stage END, "
+                "last_error = ?, updated_at = ? WHERE id = ?",
+                (note, utcnow_iso(), task_id),
+            )
 
     def finalise_review_round(
         self,

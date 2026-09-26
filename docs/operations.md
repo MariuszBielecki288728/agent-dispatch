@@ -1287,6 +1287,14 @@ what happens next:
 | PR closed, merged, or no longer provably ours | structural | **Parks** the round as `Needs attention`. No retry can help — a closed PR does not reopen — so an auto-retry would push to the branch on every poll, forever. |
 | Push failed, remote tip unverifiable, PR lookup errored | transient | Leaves the round `publish_pending` and finishes it on a later pass with **zero** further model calls. |
 
+An unreadable PR at the **pre-push** boundary is transient but *also* blocks the push,
+which is a deliberate refinement rather than a contradiction. "Transient and retryable"
+does not require mutating the remote branch while the exact PR is unproven: an API
+outage can coincide with the PR having been closed or merged, and pushing then is
+precisely what the pre-push gate exists to prevent. So the branch is left alone, the
+round keeps its publication stage, and the next pass re-reads the PR and finishes the
+step — no human decision, no model call, and no push on an unproven target.
+
 Either way the feedback stays unacknowledged, so nothing is lost, and a **replacement
 PR is never created**. Both are asserted by the tests rather than merely intended —
 including the assertion that the remote tip is unchanged, which is verified by pushing
@@ -1297,6 +1305,24 @@ A structurally parked round is *not* retried automatically. Reopening the PR doe
 bring it back on its own; choose `review --retry-round` after restoring the pull
 request, or `review --release` to drop the round and let the next handoff carry the
 same feedback.
+
+### One boundary, one read
+
+Each PR check reads the pull request exactly once and judges **that** object. This is a
+correctness rule, not tidiness: a gate that validates response A and then hands response
+B to the model has validated nothing, because the PR can change between the two reads and
+the unjudged object is the one quoted to the agent. The pre-spawn gate is where this
+mattered most — it sits immediately before the model is started, which is exactly where
+the window is worth closing.
+
+The two *publication* checks (before and after the push) are two deliberate race
+boundaries and therefore two reads; that is the intent, not an oversight. The fake
+wrapper counts reads per PR so the single-read property is asserted rather than left to
+a comment.
+
+One more consequence worth knowing: because the gate never parks a round on an
+unreadable PR, the round stays recoverable by the ordinary poll. Nothing about a
+temporary GitHub outage requires maintainer action for a review round.
 
 ### A restarted round must reproduce its claimed feedback, or it does not run
 

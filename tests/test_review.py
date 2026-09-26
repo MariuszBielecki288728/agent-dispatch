@@ -2303,6 +2303,269 @@ class RedrivePrRevalidationTests(ReviewCase):
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
 
 
+class StructuralParkAtomicityTests(ReviewCase):
+    """Parking a structurally-unusable round is one transaction, not two writes.
+
+    `park_round_outside_publication` is the authority for every structural exact-PR
+    park, so a crash inside it must leave the row exactly as it was. The connection runs
+    with `isolation_level=None`, which means statements autocommit individually unless
+    they share a transaction — "both statements live in one method" is not atomicity.
+
+    The failure is injected with SQLite's own `RAISE` in a trigger on the *second* table
+    the method touches, so it fails after the first statement has already run and the
+    rollback is what the test observes. That mirrors the `finalise_review_round` tests
+    above rather than inventing a second technique.
+    """
+
+    def _parked_round(self):
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        before = self.task_row()
+        assert before is not None
+        return store, task, claimed, before
+
+    def test_the_park_writes_both_facts_in_one_transaction(self) -> None:
+        store, task, claimed, _ = self._parked_round()
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        begins = [s for s in statements if s.strip().upper().startswith("BEGIN")]
+        commits = [s for s in statements if s.strip().upper().startswith("COMMIT")]
+        self.assertEqual(len(begins), 1, f"one transaction expected: {statements}")
+        self.assertEqual(len(commits), 1, f"one commit expected: {statements}")
+
+        after = self.task_row()
+        assert after is not None
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(after.phase, "needs_attention")
+
+    def test_a_failure_inside_the_park_rolls_the_round_back_too(self) -> None:
+        """The half-applied state this method exists to prevent must be unreachable.
+
+        Without one transaction the round would already be `interrupted` (so nothing
+        retries its publication) while the task row still looked publish-pending — the
+        worst of both, and invisible from the outside.
+        """
+        store, task, claimed, before = self._parked_round()
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+
+        store._conn.executescript(
+            "CREATE TRIGGER fail_park BEFORE UPDATE ON tasks "
+            "WHEN NEW.phase = 'needs_attention' "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure mid-park'); END;"
+        )
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+        finally:
+            store._conn.executescript("DROP TRIGGER fail_park")
+
+        after = self.task_row()
+        assert after is not None
+        self.assertEqual(
+            self.rounds()[0].state,
+            ROUND_PUBLISH_PENDING,
+            "a rolled-back park must not leave the round interrupted",
+        )
+        self.assertEqual(after.phase, before.phase, "phase must not move")
+        self.assertEqual(after.recovery_stage, before.recovery_stage, "stage must not move")
+
+        # The retry then succeeds and moves both facts together.
+        store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+        final = self.task_row()
+        assert final is not None
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(final.phase, "needs_attention")
+        self.assertNotIn(final.recovery_stage, ROUND_STAGES)
+
+
+class PreSpawnSingleReadTests(ReviewCase):
+    """The pre-spawn gate validates the object it hands to the model (#5).
+
+    Validating response A and then using response B validates nothing: the PR can change
+    between the two reads, and the second object would be quoted to the model without
+    ever being checked. The fake wrapper counts reads per PR number so the single-read
+    property is observable rather than asserted in a comment.
+    """
+
+    def _claimed_unstarted_round(self):
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        return store, task, claimed
+
+    def _pr_reads(self) -> int:
+        reads = self.current_world().get("pr_reads") or {}
+        return int(reads.get(f"{self.slug}#{PR_NUMBER}", 0))
+
+    def test_the_gate_reads_the_pr_exactly_once(self) -> None:
+        """One boundary, one read — counted around the gate itself.
+
+        Deliberately not counted around a whole `review` invocation: several legitimate
+        code paths read this PR (evaluation, snapshot reproduction, discovery), so a
+        command-level total would be measuring all of them and could not tell a double
+        read inside the gate from normal traffic. Counting around the one call that
+        owns this boundary is what makes the assertion specific to the bug.
+        """
+        store, task, claimed = self._claimed_unstarted_round()
+        orchestrator = self.live_orchestrator(store)
+        before = self._pr_reads()
+
+        pull, problem = orchestrator._require_live_round_pull(self._repo_config(), task, PR_NUMBER)
+
+        self.assertIsNone(problem)
+        self.assertIsNotNone(pull, "the validated object must be the one returned")
+        self.assertEqual(
+            self._pr_reads() - before,
+            1,
+            "the gate must validate the very object it hands on, not refetch a second",
+        )
+
+    def test_a_pr_that_closes_on_its_single_read_is_refused(self) -> None:
+        """The TOCTOU case, modelled on the read the gate actually performs.
+
+        With a validate-then-refetch gate, the object that reaches
+        `build_review_instruction` is a *second*, unvalidated read — so the PR can be
+        closed on that read and the model spawns anyway. Here the override makes the
+        gate's one read closed, so the refusal proves the object it judged is the object
+        it would have used.
+        """
+        store, task, claimed = self._claimed_unstarted_round()
+        world = self.current_world()
+        world["pr_read_overrides"] = {
+            f"{self.slug}#{PR_NUMBER}": {
+                "1": {**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}
+            }
+        }
+        self.world.world = world
+        self.world.write_world()
+        orchestrator = self.live_orchestrator(store)
+        before = self._pr_reads()
+
+        pull, problem = orchestrator._require_live_round_pull(self._repo_config(), task, PR_NUMBER)
+
+        self.assertIsNone(pull, "a PR that is not usable must never be returned")
+        self.assertIsNotNone(problem)
+        self.assertEqual(problem.reason, "review_pr_not_open")
+        self.assertEqual(self._pr_reads() - before, 1, "and it took exactly one read")
+
+    def test_the_gate_still_refuses_a_closed_pr_on_its_single_read(self) -> None:
+        """The positive control: the single read is still a real check.
+
+        Without this, a gate that read once and validated nothing would satisfy the two
+        tests above.
+        """
+        store, task, claimed = self._claimed_unstarted_round()
+        self.mutate(pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}])
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        self.assertEqual(self.runtime_calls(), calls_before, "no model call for a closed PR")
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self._pr_reads(), 1, "and it read the PR exactly once to decide")
+
+
+class UnreadablePrBeforePushTests(ReviewCase):
+    """An unreadable PR at the pre-push boundary must not push, and must stay retryable.
+
+    The classification is right that a failed read is transient, but "transient and
+    retryable" does not require mutating the remote branch while the exact PR is
+    unproven: an API outage can coincide with the PR having been closed or merged. So the
+    round stays publishable and the branch is left alone until the target is readable.
+    """
+
+    def _publish_full(self, store, task, mutate_world=None):
+        worktree = Path(task.worktree_path)
+        (worktree / "round-work.txt").write_text("round work\n", encoding="utf-8")
+        if mutate_world is not None:
+            mutate_world()
+        repository = self._repo_config()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
+        committed, note = manager.commit_all(worktree, task.branch, "review round: apply feedback")
+        self.assertTrue(committed, note)
+        state = manager.inspect(worktree, task.branch)
+        self.assertNotEqual(
+            state.head_sha,
+            self._remote_tip(task.branch),
+            "there must be a commit that is not on the remote yet",
+        )
+        return orchestrator, orchestrator._publish_review_round(
+            task, repository, manager, state, self.rounds()[0], result=None
+        )
+
+    def test_an_unreadable_pr_is_not_pushed_and_stays_retryable(self) -> None:
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        tip_before = self._remote_tip(task.branch)
+        calls_before = self.runtime_calls()
+
+        def fail_the_read() -> None:
+            self.inject_failure(f"{self.slug}:pull:{PR_NUMBER}", exit_code=1, stderr="boom")
+
+        _, outcome = self._publish_full(store, task, mutate_world=fail_the_read)
+
+        self.assertEqual(outcome.reason, "review_pr_unreadable")
+        self.assertEqual(
+            self._remote_tip(task.branch),
+            tip_before,
+            "an unproven exact PR must not be pushed to",
+        )
+        # Still publishable, NOT parked: a read failure that clears by itself must not
+        # need a human. That is the whole point of keeping this transient.
+        self.assertEqual(
+            self.rounds()[0].state,
+            ROUND_PUBLISH_PENDING,
+            "an unreadable PR is transient, so the round must stay retryable",
+        )
+        self.assertEqual(self.runtime_calls(), calls_before, "no model call")
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+    def test_the_next_pass_publishes_once_the_pr_is_readable_again(self) -> None:
+        """The retryability promise, kept: the next pass finishes it with no model call."""
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        tip_before = self._remote_tip(task.branch)
+
+        def fail_the_read() -> None:
+            self.inject_failure(f"{self.slug}:pull:{PR_NUMBER}", exit_code=1, stderr="boom")
+
+        self._publish_full(store, task, mutate_world=fail_the_read)
+        self.assertEqual(self._remote_tip(task.branch), tip_before)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+
+        # The next pass: the read works again, so publication completes.
+        calls_before = self.runtime_calls()
+        self.run_all_reconcile_passes(store)
+
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+        self.assertEqual(
+            self.runtime_calls(), calls_before, "completing publication needs no model call"
+        )
+        self.assertNotEqual(
+            self._remote_tip(task.branch), tip_before, "the retry did push the round"
+        )
+
+
 class SnapshotReproductionTests(ReviewCase):
     """A restarted round may only run when its claimed snapshot is reproducible (#5).
 

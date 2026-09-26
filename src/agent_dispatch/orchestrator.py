@@ -1264,10 +1264,16 @@ class Orchestrator:
         # retry to build on. The second check runs after the push and catches the
         # narrower race where the PR changes state *during* our own publication.
         #
-        # Only the *structural* verdicts stop here — an unreadable PR is deliberately
-        # NOT one of them, because a lookup failure is transient and blocking on it
-        # would strand a perfectly good publication. That distinction is what keeps
-        # "retry this step" and "a human must decide" from being the same outcome.
+        # An UNREADABLE PR stops here too, and that is a deliberate departure from how
+        # publication classifies read failures elsewhere. "Transient and retryable" does
+        # not require pushing while the exact PR is unproven: a temporary API outage can
+        # coincide with the PR actually having been closed or merged, and pushing then is
+        # precisely what this gate exists to prevent. So the safe retryable behaviour is
+        # to leave the remote alone, keep the round publish-pending with its stage, and
+        # re-read on the next pass. That stays inside the transient classification — the
+        # round is never parked — while refusing to mutate the branch on an unproven
+        # target. `_round_pull_problem` below still treats a read failure as non-blocking
+        # for the *verdict*; the push decision is stricter than the verdict.
         if require_pr is not None:
             # `require_pr` and `round_id` travel together: only `_publish_review_round`
             # sets `require_pr`, and it always knows its round. Asserted rather than
@@ -1275,7 +1281,11 @@ class Orchestrator:
             # retried — see `_park_unusable_round`.
             if round_id is None:  # pragma: no cover - defensive
                 raise ValueError("require_pr implies a review round, so round_id is required")
-            structural = self._round_pull_problem(repo, task, require_pr, allow_unreadable=True)
+            pull, problem = self.fetch_round_pull(repo, require_pr)
+            if problem is not None:
+                return self._defer_unproven_pr(task, require_pr, problem, notes, result)
+            assert pull is not None  # fetch_round_pull returns one or the other
+            structural = self.judge_round_pull(repo, task, pull, expected=require_pr)
             if structural is not None:
                 return self._park_unusable_round(
                     task, require_pr, round_id, structural, notes, result
@@ -1369,6 +1379,43 @@ class Orchestrator:
             recovery_stage=stage_pr,
         )
 
+    def _defer_unproven_pr(
+        self,
+        task: Task,
+        pr_number: int,
+        problem: PrProblem,
+        notes: list[str],
+        result: RunResult | None,
+    ) -> DispatchOutcome:
+        """Refuse to push while the exact PR is unreadable, without parking the round.
+
+        The middle path between "push anyway" and "a human must decide": the round keeps
+        its publication stage, so the next pass re-reads the PR and finishes the step with
+        **zero** model calls, while the remote branch is left untouched until the target is
+        proven usable. Parking would be wrong (nothing is structurally broken, and a
+        read failure usually clears by itself), and pushing would be wrong for the reason
+        the pre-push gate exists at all.
+        """
+        detail = (
+            f"review round's PR #{pr_number} could not be read ({problem.detail}), so the "
+            "branch was NOT pushed: the exact pull request is unproven"
+        )
+        self.store.park_for_recovery(task.id, stage=ROUND_STAGE_PUSH, note=detail)
+        return DispatchOutcome(
+            action=OUTCOME_NEEDS_ATTENTION,
+            task_ref=task.ref,
+            reason=problem.reason,
+            pr_number=pr_number,
+            session_id=result.session_id if result else task.session_id,
+            run=result,
+            notes=notes
+            + [
+                detail,
+                "the round stays publishable and the next pass retries the read; no model "
+                "call is repeated and the feedback stays unacknowledged",
+            ],
+        )
+
     def _park_unusable_round(
         self,
         task: Task,
@@ -1453,23 +1500,54 @@ class Orchestrator:
             return PrProblem(
                 "review_pr_unreadable", f"PR #{pr_number} could not be read ({exc.kind})"
             )
+        return self.judge_round_pull(repo, task, pull, expected=pr_number)
+
+    def judge_round_pull(
+        self, repo: RepoConfig, task: Task, pull, *, expected: int
+    ) -> PrProblem | None:
+        """Why an ALREADY-FETCHED PullRequest is unusable, or ``None`` when it is good.
+
+        Split out so a caller that must validate and then *use* the same object performs
+        exactly one read. The pre-spawn gate is that caller, and the distinction is a
+        correctness one rather than tidiness: validating one response and then handing a
+        **second, unvalidated** response to the model is a TOCTOU hole inside the gate
+        itself. It would pass validation on an open PR, the PR could change, and the
+        fresh object would then be quoted to the model without being checked at all.
+        """
         if pull.state != "open" or pull.merged:
-            return PrProblem("review_pr_not_open", f"PR #{pr_number} is {_pr_state(pull)}")
-        if not _pr_is_ours(pull, repo.slug, task, expected=pr_number):
+            return PrProblem("review_pr_not_open", f"PR #{expected} is {_pr_state(pull)}")
+        if not _pr_is_ours(pull, repo.slug, task, expected=expected):
             return PrProblem(
                 "review_pr_unowned",
-                f"PR #{pr_number} is no longer provably this task's (head {pull.head_label!r})",
+                f"PR #{expected} is no longer provably this task's (head {pull.head_label!r})",
             )
         return None
+
+    def fetch_round_pull(
+        self, repo: RepoConfig, pr_number: int
+    ) -> tuple[object | None, PrProblem | None]:
+        """Read the round's PR ONCE, returning it with any read failure.
+
+        The one boundary that must not read twice: a caller validating response A and
+        using response B is validating nothing. Returning the object alongside the
+        problem is what makes the single-read property structural rather than a comment.
+        """
+        try:
+            return self.client.get_pull(repo.slug, pr_number), None
+        except GitHubError as exc:
+            return None, PrProblem(
+                "review_pr_unreadable", f"PR #{pr_number} could not be read ({exc.kind})"
+            )
 
     def _require_live_round_pull(
         self, repo: RepoConfig, task: Task, pr_number: int | None
     ) -> tuple[object | None, PrProblem | None]:
-        """Fetch the round's PR and refuse the round when it is not usable.
+        """Fetch the round's PR once and refuse the round when that object is unusable.
 
         Used immediately before a model spawn, where an unreadable PR blocks (see
-        :meth:`_round_pull_problem`). On success returns the pulled request so the caller
-        can describe it to the model rather than reading it twice.
+        :meth:`_round_pull_problem`). On success returns the *validated* pulled request so
+        the caller can describe it to the model without reading again — see
+        :meth:`judge_round_pull` for why a second read here would be a real hole.
         """
         if pr_number is None:
             return None, PrProblem(
@@ -1477,17 +1555,16 @@ class Orchestrator:
                 "the round has no recorded pull request, so there is no PR it may act on "
                 "and no PR it may publish to",
             )
-        # `allow_unreadable=False`: a model call may only be spent on a PR we could
-        # actually read and verify, so here "cannot tell" blocks rather than proceeds.
-        problem = self._round_pull_problem(repo, task, pr_number, allow_unreadable=False)
+        pull, problem = self.fetch_round_pull(repo, pr_number)
+        if problem is not None:
+            # `allow_unreadable=False` here: a model call may only be spent on a PR we
+            # could actually read, so "cannot tell" blocks rather than proceeds.
+            return None, problem
+        assert pull is not None  # fetch_round_pull returns one or the other
+        problem = self.judge_round_pull(repo, task, pull, expected=pr_number)
         if problem is not None:
             return None, problem
-        try:
-            return self.client.get_pull(repo.slug, pr_number), None
-        except GitHubError as exc:  # pragma: no cover - the check above already read it
-            return None, PrProblem(
-                "review_pr_unreadable", f"PR #{pr_number} could not be read ({exc.kind})"
-            )
+        return pull, None
 
     def _confirm_exact_pull_request(
         self,
@@ -1522,6 +1599,12 @@ class Orchestrator:
         * the PR is unreadable (a lookup failure is not evidence of anything);
         * the PR is closed or merged;
         * the PR is not provably this task's (number, head branch, head repo, Issue link).
+
+        This is a **second, deliberate** read: the pre-push gate checked the PR, then the
+        push happened, and a PR can be closed or replaced *during* that push. Two reads
+        for two boundaries is the intent; what must never happen is two reads for *one*
+        boundary, which is why :meth:`judge_round_pull` validates the object it is given
+        rather than fetching its own.
         """
         try:
             pull = self.client.get_pull(repo.slug, require_pr)
@@ -1542,32 +1625,16 @@ class Orchestrator:
                 notes=notes + [detail],
             )
 
-        if pull.state != "open" or pull.merged:
-            # A structural failure: retrying cannot make a closed PR open again, so the
-            # round is parked for an explicit decision rather than left retryable.
+        # The SAME verdict rule as the pre-push gate, from the same method — the only
+        # difference is the wording, since discovering it now means the push already
+        # happened and the round therefore fails with different consequences.
+        structural = self.judge_round_pull(repo, task, pull, expected=require_pr)
+        if structural is not None:
             return self._park_unusable_round(
                 task,
                 require_pr,
                 round_id,
-                PrProblem(
-                    "review_pr_not_open",
-                    f"it is {_pr_state(pull)} after the push",
-                ),
-                notes,
-                result,
-                pushed=True,
-            )
-
-        if not _pr_is_ours(pull, repo.slug, task, expected=require_pr):
-            return self._park_unusable_round(
-                task,
-                require_pr,
-                round_id,
-                PrProblem(
-                    "review_pr_unowned",
-                    f"it is no longer provably this task's (head {pull.head_label!r}) "
-                    "after the push",
-                ),
+                PrProblem(structural.reason, f"{structural.detail} after the push"),
                 notes,
                 result,
                 pushed=True,
