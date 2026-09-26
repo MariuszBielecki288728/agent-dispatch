@@ -37,6 +37,10 @@ review PR, add `agent:fix` to the PR
      -> claim one round + snapshot its feedback -> clear the label
      -> resume the SAME session in the SAME worktree -> validate -> push to the SAME PR
      -> acknowledge that feedback -> awaiting_review
+
+something went wrong mid-round?
+     -> review --retry-round  (retry the SAME feedback, snapshot preserved)
+     -> review --release      (drop the round; the next handoff carries it again)
 ```
 
 What it will **not** do, on purpose:

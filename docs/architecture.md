@@ -520,6 +520,77 @@ A publication failure never overwrites a more specific reason: the recorded stag
 the evidence that finished work exists, and downgrading it would make the round
 permanently unpublishable after one transient outage (§9's rule, applied to review).
 
+### Structural vs. transient publication failures (#5)
+
+`publish_pending` is a promise that a later pass can finish the job. That promise only
+holds for failures that *can* be finished, so the two kinds are classified explicitly
+rather than both being left retryable:
+
+| Failure | Kind | Outcome |
+|---|---|---|
+| PR closed, merged, or no longer provably ours | structural | Parked `interrupted` for an explicit `--release` / `--retry-round`. No retry can help: a closed PR does not reopen on the next poll, so an auto-retrying round would push to the branch on **every** pass, forever, while reporting a reason that never changes. |
+| Push failed, remote tip unverifiable, PR lookup errored | transient | Stays `publish_pending` with its stage; the next pass finishes it with zero model calls. |
+
+The classification is the `STRUCTURAL_PR_REASONS` set, and the reason code travels with
+the human-readable detail in one small value type so no call site has to compare prose
+to decide which kind it is holding.
+
+The exact-PR check itself runs **twice** around the push — once before, once after:
+
+- *Before*: a round whose PR is already unusable is rejected without touching the
+  remote branch. This is what makes "nothing was pushed" a fact rather than a
+  best-effort, and it is asserted against the real publication path (with a real
+  unpushed commit present, so the assertion can fail).
+- *After*: the same predicate re-applied, to catch the PR changing state while our own
+  push was in flight. It is the same rule, not a second one.
+
+The pre-spawn re-check uses the same predicate with unreadable-PR treated as blocking,
+because there the alternative is spending a model call on an unproven assumption. At
+publication an unreadable PR is *not* blocking: the read failure is transient and the
+recorded stage already retries it. That one deliberate difference is an explicit
+parameter rather than a duplicated code path.
+
+### Releasing a pause: one restore rule (#5)
+
+`unpause` and re-adding `take-it` both have to answer "where does this task belong
+now?", so they call the same helper (`_restored_phase_sql` in `store.py`) instead of
+each carrying a copy of the rule. The most specific reason wins:
+
+| Condition | Restored phase |
+|---|---|
+| Has a publishable stage (commits not on the remote yet) | `needs_attention` — the work is genuinely incomplete, and it needs *publication*, not another model run. Checked first, because a task can own a PR and still have an unfinished push. |
+| Owns a PR, nothing left to publish | `awaiting_review` — the work is published, so it belongs where the review loop looks. |
+| Neither | `queued`. |
+
+Omitting the middle row is a silent dead end rather than a visible error: implementation
+dispatch refuses a task that owns a PR, and the review loop only inspects
+`awaiting_review`, so `queued + owned PR` is reachable by neither. Removing and
+re-adding `take-it` — the documented way to suspend and resume — was enough to strand a
+finished task there permanently.
+
+Two invariants keep the repair itself safe: a paused task is left alone by every
+automatic pass (so a pause is never silently undone by publishing work the operator
+stopped), and "park the round and retire the stale stage it left on its task" is one
+method, because clearing a stage and setting a phase as separate writes leaves a row
+that is neither publishable nor visibly parked if the process dies between them — the
+window #16's structural test still forbids.
+
+Which of those two writes actually enforces what is worth being precise about, since the
+obvious reading is wrong:
+
+- **Parking the round** is the gate. The re-drive is driven by the *round's* state, so
+  leaving it `publish_pending` would push to the branch on every pass forever, against a
+  pull request that can never accept it.
+- **Clearing the task's stage** is hygiene. `Task.has_publishable_stage` recognises only
+  *implementation* stages, so a surviving round stage does not by itself make the task
+  dispatchable or publishable. What it does do is linger as stale evidence, because
+  `_task_round_stage` mirrors the task row's stage back onto a later publication attempt.
+
+The clear is therefore scoped with a `CASE` over *round* stages only. An implementation
+stage is evidence for a different repair — it is what authorises finishing that work
+without a model call — and a round discarding it would silently destroy the other
+feature's recoverability.
+
 ### Concurrency and limits
 
 - **One active task total** for the MVP (`worker.max_concurrent_tasks = 1`).

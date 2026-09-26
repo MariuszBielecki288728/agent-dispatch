@@ -177,6 +177,12 @@ _PUBLISHABLE_STAGE_SQL = (
     + ")"
 )
 
+#: The same trick for the *round* stages alone. Kept separate from the combined list
+#: above because "which stages may be published" and "which stages does a round own" are
+#: different questions: clearing a round's stale stage must not also clear an
+#: implementation stage, which is evidence for a different repair.
+ROUND_STAGE_SQL = "(" + ", ".join(f"'{stage}'" for stage in sorted(ROUND_STAGES)) + ")"
+
 #: SQL predicate: true when this task has finished work awaiting publication, so a
 #: model run must not be started for it. Used by every mutation that could otherwise
 #: turn such a task back into an implementation queue entry.
@@ -348,6 +354,43 @@ CREATE TABLE IF NOT EXISTS review_rounds (
 #: An interrupted run has no transcript (runtime §2.3.1), so it must never be
 #: offered as a resume target — which is why resumability is a query, not a flag.
 RESUMABLE_RUN_OUTCOMES = frozenset({"succeeded"})
+
+
+#: SQL choosing the phase a restored task belongs in, built from its own row.
+#:
+#: Named once, as a function, so the several restore paths cannot drift: a duplicated
+#: copy of this rule is exactly how the dead end described below stayed reachable after
+#: the first copy was fixed.
+#:
+#: Three cases, and the order is the point — the *most specific* reason wins:
+#:
+#: 1. **Finished work awaiting publication** — a publishable stage means the model's
+#:    commits are not on the remote yet, so the task belongs in ``needs_attention``
+#:    for the publish pass to finish. This is checked first because it is the only
+#:    case where the work is genuinely incomplete: such a task may well already own a
+#:    PR, and choosing ``awaiting_review`` for it would tell the review loop there is
+#:    something to review while the push that carries the round is still pending.
+#:    Skipping this also breaks #16/#18: ``recovery_stage`` deliberately survives a
+#:    pause *so that* releasing the pause can restore publication.
+#: 2. **It owns a PR.** The work is published, so the task belongs in
+#:    ``awaiting_review``. This is the case that used to fall through: re-adding
+#:    `take-it` after a withdrawal put such a task back in ``queued``, where
+#:    implementation dispatch refuses it ("this worker already owns PR #N") and the
+#:    review loop ignores it (`phase != awaiting_review`). A dead end reachable from
+#:    the documented trigger protocol.
+#: 3. **Anything else** — back to the implementation queue.
+#:
+#: ``column`` is interpolated rather than bound because it is the one thing SQL cannot
+#: parameterise here; every caller passes a constant from this module, never caller
+#: input.
+def _restored_phase_sql(column: str) -> str:
+    return (
+        "CASE "
+        f"WHEN {column}.recovery_stage IN {_PUBLISHABLE_STAGE_SQL} THEN "
+        f"'{PUBLISH_PENDING_PHASE}' "
+        f"WHEN {column}.pr_number IS NOT NULL THEN 'awaiting_review' "
+        "ELSE 'queued' END"
+    )
 
 
 @dataclass(frozen=True)
@@ -935,18 +978,25 @@ class Store:
     def unpause(self, repo: str, issue_number: int) -> Task:
         """Release a maintainer pause.
 
-        A task with finished work awaiting publication returns to
-        ``needs_attention`` rather than the implementation queue: unpausing a
-        publish-pending task means "carry on with the publication", and putting it in
-        ``queued`` would let the next poll start a second model run on work that is
-        already done.
+        The destination is decided by :func:`_restored_phase_sql`, shared with the
+        label-withdrawal release, because the question is identical: this task was
+        suspended and is now wanted again, so where does it belong?
+
+        For a task that **owns a PR** the answer is ``awaiting_review``. Sending it to
+        ``queued`` was the same dead end the label path had: implementation dispatch
+        refuses an owned PR, and the review loop only looks at ``awaiting_review``, so
+        an `unpause` of a finished task parked it permanently with no automatic way
+        forward.
         """
         task = self._require(repo, issue_number)
         if task.phase != "paused":
             raise ValueError(f"{task.ref} is {task.phase}, not paused")
-        return self._release_to(
-            task, PUBLISH_PENDING_PHASE if task.is_publish_pending else "queued"
+        self._conn.execute(
+            f"UPDATE tasks SET phase = {_restored_phase_sql('tasks')}, pause_reason = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task.id),
         )
+        return self._require(repo, issue_number)
 
     def _release_to(self, task: Task, phase: str) -> Task:
         """Move a task out of a paused/parked state to ``phase``, clearing the pause."""
@@ -969,21 +1019,23 @@ class Store:
         )
 
     def release_label_withdrawn_pause(self, task_id: int) -> bool:
-        """Return a label-withdrawn task to the queue. Returns True if released.
+        """Return a label-withdrawn task to where it actually belongs. True if released.
 
         A maintainer pause is left untouched: only a pause that *this* rule
         created is reversed when the trigger label comes back.
 
-        Publish-pending work is released to ``needs_attention`` instead of ``queued``,
-        for the same reason as :meth:`unpause`: re-adding `take-it` restores
-        *dispatch intent*, but a task whose model run already completed does not need
-        another implementation run — it needs its push/PR finished.
+        The destination comes from :func:`_restored_phase_sql`, so this and :meth:`unpause`
+        cannot disagree. Both used to send everything except publish-pending work to
+        ``queued``, which for a task that **owns a PR** is a dead end: implementation
+        dispatch refuses it and the review loop ignores it. So removing and re-adding
+        `take-it` — the documented way to suspend and resume a task — could permanently
+        strand a finished one.
         """
         cursor = self._conn.execute(
-            f"UPDATE tasks SET phase = CASE WHEN {_IS_PUBLISH_PENDING} THEN ? ELSE 'queued' END, "
-            "pause_reason = NULL, updated_at = ? "
+            f"UPDATE tasks SET phase = {_restored_phase_sql('tasks')}, pause_reason = NULL, "
+            "updated_at = ? "
             "WHERE id = ? AND phase = 'paused' AND pause_reason = ?",
-            (PUBLISH_PENDING_PHASE, utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
+            (utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
         )
         return cursor.rowcount > 0
 
@@ -1658,6 +1710,46 @@ class Store:
             "UPDATE review_rounds SET state = ?, recovery_stage = COALESCE(?, recovery_stage), "
             "error = ?, finished_at = ? WHERE id = ?",
             (state, stage, note, utcnow_iso(), round_id),
+        )
+
+    def park_round_outside_publication(self, round_id: int, task_id: int, note: str) -> None:
+        """Park a round as unfinished and retire the stale stage it left on its task.
+
+        Two writes that belong together, so they are issued together rather than as a
+        sequence a caller could half-apply or a crash could split. #16's review removed
+        exactly that "clear the stage, then set the phase" window from
+        `finalise_publication`, and its structural test still forbids the adjacency.
+
+        What each write actually does — stated precisely, because the honest division of
+        labour here is not the obvious one:
+
+        * **Parking the round** is what stops the round being retried. The re-drive is
+          driven by the *round's* state (`_reconcile_one_round` re-drives
+          ``publish_pending``), so leaving it ``publish_pending`` would push to the branch
+          on every pass forever, against a pull request that can never accept it.
+        * **Clearing the task's stage** is hygiene, not the gate. `Task.has_publishable_stage`
+          recognises only *implementation* stages, so a surviving round stage does not by
+          itself make the task publishable or dispatchable. What it does do is linger as
+          stale evidence: `_task_round_stage` reads the task row back to mirror the stage
+          onto the round, so a later publication attempt would re-attach a reason
+          belonging to the parked round.
+
+        A round stage is cleared, but an **implementation** stage is deliberately left
+        alone: it is evidence for a different repair, and a round has no business
+        discarding it.
+        """
+        self._conn.execute(
+            "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = ?, "
+            "finished_at = ? WHERE id = ?",
+            (ROUND_INTERRUPTED, note, utcnow_iso(), round_id),
+        )
+        # `CASE` rather than `= NULL`: only this round's own stage is stale. An
+        # implementation stage is another repair's evidence and survives untouched.
+        self._conn.execute(
+            f"UPDATE tasks SET phase = 'needs_attention', recovery_stage = CASE "
+            f"WHEN recovery_stage IN {ROUND_STAGE_SQL} THEN NULL ELSE recovery_stage END, "
+            "last_error = ?, updated_at = ? WHERE id = ?",
+            (note, utcnow_iso(), task_id),
         )
 
     def finalise_review_round(

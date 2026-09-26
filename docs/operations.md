@@ -756,6 +756,26 @@ could modify work that is already finished. Every path that could do that is clo
 | `resume-publish` | Finishes publication for a paused publish-pending task — the counterpart of `retry`, and it actually publishes. When a live worker holds the lock it re-arms the task and hands off, because that worker finishes publication on its next poll |
 | Any row left `queued` by an older build | The dispatcher **escalates** it and starts no runtime, and the atomic claim additionally refuses it in SQL |
 
+### Releasing a pause: one rule, two ways in
+
+Releasing a pause (`unpause`, or re-adding `take-it`) has to answer "where does this
+task belong now?", and there are three possible answers. Both entry points ask
+`_restored_phase_sql` in `store.py`, so they cannot drift apart — a second copy of the
+rule is how the bug below stayed reachable after the first one was fixed.
+
+The order is the important part: the **most specific** reason wins.
+
+| Condition | Restored phase | Why |
+|---|---|---|
+| Has a publishable `recovery_stage` | `needs_attention` | The model's commits are not on the remote yet, so the work is genuinely incomplete and the publish pass must finish it. Checked first, because a task can own a PR *and* still have an unfinished push — sending that to `awaiting_review` would tell the review loop there is something to review while the push carrying it is still pending |
+| Owns a PR (no publishable stage) | `awaiting_review` | The work is published, so the task belongs where the review loop looks. This is the case that used to fall through to `queued`, where implementation dispatch refuses it (`this worker already owns PR #N`) and the review loop ignores it (`phase != awaiting_review`) — a dead end reachable simply by removing and re-adding `take-it` |
+| Neither | `queued` | Ordinary unfinished work, back to the implementation queue |
+
+A task in a paused state is left alone by every automatic pass, and a paused
+publish-pending task is never published — `recovery_stage` survives a pause *so that*
+releasing it can restore publication, so `is_publish_pending` alone must not be enough
+to act on it.
+
 The normal retry behaviour for a genuinely interrupted or failed runtime (no
 publishable stage) is unchanged, and passing `resume-publish` a task with nothing
 pending is refused rather than silently doing nothing.
@@ -1250,9 +1270,33 @@ off the pull request you were reading.
 
 So the round's PR number is carried into publication and re-verified there (still
 open, still this repository's head, still linking this Issue, still the same number).
-Any failure parks the round as `Needs attention` with the feedback still
-unacknowledged. A **replacement PR is never created**, and that is asserted by the
-tests rather than merely intended.
+The check runs **twice**: once *before* the branch is pushed, and again after it, for
+the narrower race where the PR changes state while our own push is in flight.
+
+The order matters and is the reason there are two. A round whose PR is closed is
+rejected **before any push**, so the remote branch is left exactly as it was found —
+a round that pushed first and then discovered its PR was gone would leave commits on
+a branch nobody will merge while reporting that it had done nothing. The post-push
+check is the same predicate applied a second time, not a different rule.
+
+The two phases also classify failure differently, and this is the part that decides
+what happens next:
+
+| Failure | Kind | What the dispatcher does |
+|---|---|---|
+| PR closed, merged, or no longer provably ours | structural | **Parks** the round as `Needs attention`. No retry can help — a closed PR does not reopen — so an auto-retry would push to the branch on every poll, forever. |
+| Push failed, remote tip unverifiable, PR lookup errored | transient | Leaves the round `publish_pending` and finishes it on a later pass with **zero** further model calls. |
+
+Either way the feedback stays unacknowledged, so nothing is lost, and a **replacement
+PR is never created**. Both are asserted by the tests rather than merely intended —
+including the assertion that the remote tip is unchanged, which is verified by pushing
+a real commit through the publication path so that "the tip did not move" cannot be
+satisfied by a test that simply never pushed.
+
+A structurally parked round is *not* retried automatically. Reopening the PR does not
+bring it back on its own; choose `review --retry-round` after restoring the pull
+request, or `review --release` to drop the round and let the next handoff carry the
+same feedback.
 
 ### A restarted round must reproduce its claimed feedback, or it does not run
 
@@ -1268,6 +1312,17 @@ of running when:
 
 All three park with no model call, and the feedback stays unacknowledged either way.
 The message names the reason and the action (`--release`).
+
+A re-driven round re-checks its **pull request** as well, immediately before the model
+is spawned. A round can be re-driven hours after it was claimed — a crash restart, or
+an explicit `--retry-round` — and in that window the PR can be merged, closed, or stop
+being provably this task's. The claim is not evidence that the PR is still valid now,
+and an externally closed or merged PR receives no new round. The same applies to
+`--retry-round`: it is the command you reach for *precisely* when something went wrong,
+so it is the one most likely to be aimed at a PR that has since become unusable.
+Failure means **zero runtime calls**, an unacknowledged cursor, and a parked round — the
+`review --retry-round` command then exits non-zero, which is the honest report: you
+asked for the round to be retried and it was not.
 
 ### What the agent is asked to do
 

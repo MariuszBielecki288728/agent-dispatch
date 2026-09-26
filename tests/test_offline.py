@@ -326,11 +326,24 @@ class BaseCase(unittest.TestCase):
         return task
 
     def set_issues(self, *issues: dict) -> None:
-        self.world.world["repos"][self.slug]["issues"] = list(issues)  # type: ignore[index]
+        # Read-modify-write, not write-from-memory. The fake wrapper rewrites the world
+        # file as it serves requests (it records created PRs, added comments and so on),
+        # so the in-memory copy taken at construction time goes stale the moment anything
+        # runs. Writing that stale copy back silently discards everything the run did —
+        # which for a test that replaces the Issue after a `run` meant the PR vanished,
+        # making the test assert against a world that no longer matched reality.
+        world = self.world.read_world()
+        world["repos"][self.slug]["issues"] = list(issues)  # type: ignore[index]
+        self.world.world = world
         self.world.write_world()
 
     def set_pulls(self, *pulls: dict) -> None:
-        self.world.world["repos"][self.slug]["pulls"] = list(pulls)  # type: ignore[index]
+        # Same read-modify-write as `set_issues`, and for the same reason: the world
+        # file is rewritten by the fake wrapper as it serves requests, so the in-memory
+        # copy is stale and would silently discard everything a run has recorded.
+        world = self.world.read_world()
+        world["repos"][self.slug]["pulls"] = list(pulls)  # type: ignore[index]
+        self.world.world = world
         self.world.write_world()
 
     def inject_failure(

@@ -63,6 +63,7 @@ from agent_dispatch.statuscomment import (  # noqa: E402
     STATE_RUNNING,
 )
 from agent_dispatch.store import (  # noqa: E402
+    RECOVERY_PUSH_FAILED,
     ROUND_CLAIMED,
     ROUND_FAILED,
     ROUND_INTERRUPTED,
@@ -71,6 +72,7 @@ from agent_dispatch.store import (  # noqa: E402
     ROUND_RELEASED,
     ROUND_STAGE_PR,
     ROUND_STAGE_PUSH,
+    ROUND_STAGES,
     Store,
 )
 from test_execution import ExecutionCase  # noqa: E402
@@ -382,6 +384,7 @@ class ReviewCase(ExecutionCase):
             repository,
             state,
             require_pr=PR_NUMBER,
+            round_id=claimed.id,
             result=None,
             notes=[],
             on_confirmed=lambda number, url: store.finalise_review_round(
@@ -1767,6 +1770,36 @@ class ExactPullRequestTests(ReviewCase):
         orchestrator, manager, state = self._orchestrator(store, repository, task)
         return self._confirm_publish(orchestrator, store, claimed, task, repository, manager, state)
 
+    def _publish_full(self, store, task, mutate_world=None):
+        """Drive the WHOLE publication path, push included.
+
+        `_publish_parked_round` above calls only the final confirmation step, so it can
+        never push and therefore cannot tell "the push was skipped because the PR is
+        unusable" apart from "the test never got as far as pushing". Both look like an
+        unchanged tip. These tests are about the branch being left alone, so they must go
+        through the real entry point that *would* have pushed — and the worktree must hold
+        a commit that is genuinely not on the remote yet, or a skipped push and a completed
+        push leave the same remote tip and the assertion proves nothing.
+        """
+        worktree = Path(task.worktree_path)
+        (worktree / "round-work.txt").write_text("round work\n", encoding="utf-8")
+        if mutate_world is not None:
+            mutate_world()
+        repository = self._repo_config()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
+        committed, note = manager.commit_all(worktree, task.branch, "review round: apply feedback")
+        self.assertTrue(committed, note)
+        state = manager.inspect(worktree, task.branch)
+        self.assertNotEqual(
+            state.head_sha,
+            self._remote_tip(task.branch),
+            "there must be a commit that is not on the remote yet, or the push assertions "
+            "cannot tell 'skipped' from 'produced no new commits'",
+        )
+        return orchestrator, orchestrator._publish_review_round(
+            task, repository, manager, state, self.rounds()[0], result=None
+        )
+
     def test_a_closed_pr_parks_the_round_and_posts_no_replacement(self) -> None:
         self.first_run()
         repository = self._repo_config()
@@ -1790,9 +1823,79 @@ class ExactPullRequestTests(ReviewCase):
             pulls_before,
             "a review round must never create a replacement pull request",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        # A structural failure must NOT be left auto-retryable: a publish-pending round is
+        # retried every pass, and no retry can reopen a closed PR. Left that way the
+        # dispatcher would push to the branch on every poll forever.
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertNotEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
         self.assertEqual(self.task_row().phase, "needs_attention")
+
+    def test_a_closed_pr_is_not_pushed_to_by_the_full_publication_path(self) -> None:
+        """The pre-push gate, driven through the code that actually pushes.
+
+        This is the specific harm: the branch is the one piece of shared state a round
+        touches, and a round that pushed before discovering its PR was closed would leave
+        commits on a branch nobody will merge — while reporting that it had done nothing.
+        Asserted against the real `_publish_review_round`, so "the tip is unchanged"
+        means the push was genuinely skipped rather than never attempted.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        tip_before = self._remote_tip(task.branch)
+        calls_before = self.runtime_calls()
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+
+        _, outcome = self._publish_full(
+            store,
+            task,
+            mutate_world=lambda: self.mutate(
+                pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}]
+            ),
+        )
+
+        self.assertEqual(outcome.reason, "review_pr_not_open")
+        self.assertEqual(
+            self._remote_tip(task.branch),
+            tip_before,
+            "a closed PR must not be pushed to: the gate runs before the push",
+        )
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "no replacement PR either",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.runtime_calls(), calls_before)
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+    def test_a_structurally_parked_round_is_not_repushed_or_rerun(self) -> None:
+        """The round must not be retried by a later pass — no push and no model call."""
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        tip_before = self._remote_tip(task.branch)
+        calls_before = self.runtime_calls()
+
+        self._publish_full(
+            store,
+            task,
+            mutate_world=lambda: self.mutate(
+                pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}]
+            ),
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+
+        # Every pass that could pick the round up again, run in the worker's order.
+        self.run_all_reconcile_passes(store)
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(
+            self._remote_tip(task.branch), tip_before, "a later pass must not push either"
+        )
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "a parked round must not spend another model call",
+        )
 
     def test_another_open_pr_on_the_branch_is_never_adopted(self) -> None:
         """Even a plausible-looking candidate must not replace the claimed PR."""
@@ -1823,6 +1926,140 @@ class ExactPullRequestTests(ReviewCase):
         self.assertEqual(self.task_row().pr_number, PR_NUMBER)
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
 
+    def test_a_foreign_pr_is_rejected_before_the_branch_is_pushed(self) -> None:
+        """The ADOPT variant of the pre-push gate.
+
+        A closed claimed PR and a *replaced* claimed PR fail differently: the first makes
+        the create path tempting, the second makes the adopt path tempting — and the
+        pre-push gate has to stop both. The closed case is covered above; this is the one
+        where an unrelated open PR that also references the Issue sits on the same head
+        branch, so a gate that only handled "closed" would push and then adopt it.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        tip_before = self._remote_tip(task.branch)
+
+        _, outcome = self._publish_full(
+            store,
+            task,
+            mutate_world=lambda: self.mutate(
+                pulls=[
+                    {
+                        **self.pr(),
+                        "head": {
+                            "ref": task.branch,
+                            "sha": "0" * 40,
+                            "repo": {"full_name": "someone-else/agent-dispatch"},
+                            "user": {"login": "someone-else"},
+                        },
+                    }
+                ]
+            ),
+        )
+
+        self.assertEqual(outcome.reason, "review_pr_unowned")
+        self.assertEqual(
+            self._remote_tip(task.branch),
+            tip_before,
+            "a PR that is not provably ours must not be pushed to either",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(
+            self.task_row().pr_number,
+            PR_NUMBER,
+            "the task must keep its own PR number",
+        )
+
+    def test_a_round_without_recorded_pr_is_never_published_or_republished(self) -> None:
+        """The `require_pr is None` branch, which had the same stale-stage gap.
+
+        A round with no recorded PR number cannot publish anywhere, and the honest
+        answer is to park it. What must NOT happen is the task being left looking
+        publish-pending: the implementation publish pass reads that signature as "retry
+        this publication" and would pick the task up as though a round's unfinished work
+        were an ordinary implementation publication.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        # The round loses its PR number; the worktree and diff are untouched.
+        store._conn.execute("UPDATE review_rounds SET pr_number = NULL WHERE id = ?", (claimed.id,))
+        round_row = store.review_round(task.id, 1)
+        self.assertIsNotNone(round_row)
+        self.assertIsNone(round_row.pr_number)
+
+        repository = self._repo_config()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
+        tip_before = self._remote_tip(task.branch)
+        pulls_before = len(self.current_world()["repos"][self.slug]["pulls"])
+        calls_before = self.runtime_calls()
+
+        outcome = orchestrator._publish_review_round(
+            task, repository, manager, state, round_row, result=None
+        )
+
+        self.assertEqual(outcome.reason, "review_pr_unknown")
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(
+            len(self.current_world()["repos"][self.slug]["pulls"]),
+            pulls_before,
+            "a round with no known PR must not create one",
+        )
+        self.assertEqual(self._remote_tip(task.branch), tip_before, "and must not push either")
+        self.assertEqual(self.runtime_calls(), calls_before)
+
+        # Asserted immediately, before a later pass could tidy it up: the task's own
+        # round stage must be retired along with the round, so no later attempt mirrors
+        # a reason belonging to a parked round onto itself. `_task_round_stage` reads the
+        # task row back, so a surviving stage is stale evidence rather than a gate.
+        parked = self.task_row()
+        self.assertEqual(parked.phase, "needs_attention")
+        self.assertNotIn(
+            parked.recovery_stage,
+            ROUND_STAGES,
+            "a parked round must not leave its publication stage on the task row",
+        )
+
+        # And no later pass spends a model call or pushes on its behalf. Parking the
+        # ROUND is what enforces this: the re-drive is driven by the round's state, so
+        # leaving it `publish_pending` would push to the branch on every pass forever.
+        self.run_all_reconcile_passes(store)
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.runtime_calls(), calls_before)
+        self.assertEqual(self._remote_tip(task.branch), tip_before)
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+    def test_parking_a_round_preserves_an_implementation_stage(self) -> None:
+        """The clearing is scoped to round stages, because the two kinds mean different things.
+
+        An implementation `recovery_stage` is evidence for the implementation publish
+        pass — it is what authorises finishing *that* work without a model call. A round
+        has no business discarding it, so the clear is a `CASE` over round stages only.
+        """
+        self.first_run()
+        store = self.store()
+        task = self.task_row()
+        store.park_for_recovery(task.id, stage=RECOVERY_PUSH_FAILED, note="implementation push")
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+
+        store.park_round_outside_publication(claimed.id, task.id, "the round was parked")
+
+        after = self.task_row()
+        self.assertEqual(
+            after.recovery_stage,
+            RECOVERY_PUSH_FAILED,
+            "a round must not clear an implementation stage: it is another repair's evidence",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+
     def test_a_pr_that_stopped_being_ours_parks_the_round(self) -> None:
         """Ownership is re-verified at publish time, not trusted from the claim."""
         self.first_run()
@@ -1847,9 +2084,10 @@ class ExactPullRequestTests(ReviewCase):
         outcome = self._publish_parked_round(store, claimed, task, repository, mutate_world=fork_it)
         self.assertEqual(outcome.action, "needs_attention")
         self.assertEqual(outcome.reason, "review_pr_unowned")
-        # The round stays publish-pending with its feedback unacknowledged, so a later
-        # pass (or a maintainer) can still resolve it rather than losing the work.
-        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        # Structural, so parked for an explicit decision: a PR that stopped being ours
+        # does not become ours again on the next poll, and leaving the round
+        # publish-pending would push to the branch every pass forever.
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
         self.assertIsNone(self.task_row().feedback_cursor)
         self.assertEqual(self.task_row().phase, "needs_attention")
 
@@ -1885,7 +2123,7 @@ class ExactPullRequestTests(ReviewCase):
             pulls_before,
             "recovery must not create a replacement pull request either",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
 
     def test_recovery_never_adopts_another_open_pr_on_the_branch(self) -> None:
@@ -1927,8 +2165,142 @@ class ExactPullRequestTests(ReviewCase):
             PR_NUMBER,
             "the task must keep its own PR number, not the replacement's",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+
+
+class RedrivePrRevalidationTests(ReviewCase):
+    """A re-driven round re-checks its PR before spending a model call (#5).
+
+    A round can be re-driven long after it was claimed — a crash restart, or an explicit
+    `review --retry-round` — and in that window the pull request can be merged, closed or
+    stop being provably this task's. The claim is not evidence that the PR is still valid
+    now, and #5 is explicit that an externally closed or merged PR receives no new round.
+
+    Every case must end with ZERO runtime calls and an unacknowledged cursor: the
+    feedback has to survive so a later, valid round can still apply it.
+    """
+
+    def _claimed_unstarted_round(self, *, advance_attempts: int = 0):
+        """A claimed round whose model turn never started — the re-drivable state."""
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        return store, task, claimed
+
+    def _assert_parked_without_a_call(self, store, calls_before: int) -> None:
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "a round whose PR is unusable must not spend another model call",
+        )
+        rounds = self.rounds()
+        self.assertEqual(rounds[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.task_row().phase, "needs_attention")
+        self.assertIsNone(self.task_row().feedback_cursor, "the feedback must stay unacknowledged")
+        # And it is not silently revived by a later pass either.
+        self.run_all_reconcile_passes(store)
+        self.assertEqual(self.runtime_calls(), calls_before)
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+
+    def test_a_pr_closed_after_the_claim_is_never_re_driven(self) -> None:
+        store, task, claimed = self._claimed_unstarted_round()
+        self.mutate(pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}])
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self._assert_parked_without_a_call(store, calls_before)
+
+    def test_a_pr_merged_after_the_claim_is_never_re_driven(self) -> None:
+        """Merged is a separate verdict from closed, and reaches a different `state`."""
+        store, task, claimed = self._claimed_unstarted_round()
+        self.mutate(pulls=[{**self.pr(), "merged_at": "2026-04-01T00:00:00Z"}])
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self._assert_parked_without_a_call(store, calls_before)
+
+    def test_a_pr_that_stopped_being_ours_is_never_re_driven(self) -> None:
+        store, task, claimed = self._claimed_unstarted_round()
+        self.mutate(
+            pulls=[
+                {
+                    **self.pr(),
+                    "head": {
+                        "ref": task.branch,
+                        "sha": "0" * 40,
+                        "repo": {"full_name": "someone-else/agent-dispatch"},
+                        "user": {"login": "someone-else"},
+                    },
+                }
+            ]
+        )
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self._assert_parked_without_a_call(store, calls_before)
+
+    def test_retry_round_after_the_pr_closed_does_not_run_the_model(self) -> None:
+        """`--retry-round` re-opens a parked round, so it must meet the same gate.
+
+        This is the path a maintainer reaches for *precisely* when something went wrong,
+        so it is the one most likely to be aimed at a PR that has since become unusable.
+        A gate that only covered the crash re-drive would leave this open.
+
+        The command exits non-zero, and that is the honest report rather than a bug: the
+        maintainer asked for the round to be retried and it was **not** retried, because
+        the exact PR can no longer be published to. Saying "released" would imply the
+        round is resolved when nothing has happened to it.
+        """
+        store, task, claimed = self._claimed_unstarted_round()
+        store.park_round(claimed.id, state=ROUND_FAILED, stage=None, note="the round broke")
+        self.mutate(pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}])
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+        tip_before = self._remote_tip(task.branch)
+
+        result = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(
+            result.returncode,
+            1,
+            "an unsuccessful retry must say so rather than reporting success",
+        )
+        self.assertIn("still interrupted", result.stderr)
+        self._assert_parked_without_a_call(store, calls_before)
+        self.assertEqual(
+            self._remote_tip(task.branch), tip_before, "the branch must not be pushed either"
+        )
+
+    def test_a_still_open_pr_still_re_drives(self) -> None:
+        """The positive case, so the gate is not refusing every re-drive.
+
+        Without this, a gate that always blocked would satisfy every test above and
+        silently disable the crash re-drive the rest of the feature depends on.
+        """
+        store, task, claimed = self._claimed_unstarted_round()
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(
+            self.runtime_calls(), calls_before + 1, "a usable PR must still be re-driven"
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
 
 
 class SnapshotReproductionTests(ReviewCase):
@@ -2190,6 +2562,114 @@ class PausedTaskReviewTests(ReviewCase):
         self.assertEqual(task_row.phase, "awaiting_review")
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
         self.assertNotIn("queued", task_row.phase)
+
+    def test_restoring_intent_with_no_open_round_lands_in_awaiting_review(self) -> None:
+        """The ordinary case: a finished task with a PR, suspended and resumed.
+
+        Deliberately has NO unresolved round. The sibling test above does, and that
+        masked a real dead end: an unresolved round makes the review loop act on the
+        task regardless of its phase, so the task recovered even when the *phase* the
+        restore chose was wrong.
+
+        The case modelled here is the plain one a maintainer actually hits. A first
+        implementation publishes, so the task owns a PR and is ``awaiting_review``.
+        Removing `take-it` must pause it; re-adding it must put it back in
+        ``awaiting_review``. It must NOT go to ``queued``, where implementation dispatch
+        refuses it ("this worker already owns PR #1") and the review loop ignores it
+        (`phase != awaiting_review`) — a task stranded in no reachable state at all.
+        """
+        self.first_run()
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+        self.assertEqual(self.rounds(), [], "a finished implementation run is not a round")
+
+        # Withdraw dispatch intent through the real poll, then observe it.
+        self.set_issues(issue(1, "Feature work", labels=[]))
+        self.run_all_reconcile_passes(self.store())
+        paused = self.task_row()
+        self.assertEqual(paused.phase, "paused")
+        self.assertEqual(paused.pause_reason, "label_withdrawn")
+
+        # Re-add it: the task must return to the phase where the review loop can see it.
+        calls_before = self.runtime_calls()
+        self.set_issues(issue(1, "Feature work", labels=[TRIGGER]))
+        self.run_all_reconcile_passes(self.store())
+        restored = self.task_row()
+        self.assertEqual(
+            restored.phase,
+            "awaiting_review",
+            "a task with a PR belongs in awaiting_review, not in a queue dispatch refuses",
+        )
+        self.assertIsNone(restored.pause_reason)
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "restoring intent must not start an implementation run",
+        )
+
+        # And the review path is genuinely reachable from there, which is the point: a
+        # normal handoff claims and publishes a round.
+        self.hand_off()
+        self.add_comment("Please rework the helper.")
+        self.review_scenario()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(len(self.rounds()), 1)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+
+    def test_unpause_of_a_task_with_a_pr_also_returns_to_awaiting_review(self) -> None:
+        """The same boundary through the maintainer command, which had the same bug.
+
+        `unpause` chose its destination with its own copy of the rule, so fixing only the
+        label path would have left the dead end reachable a second way.
+        """
+        self.first_run()
+        self.assertEqual(self.run_cli("pause", "--repo", self.slug, "--issue", "1").returncode, 0)
+        self.assertEqual(self.task_row().phase, "paused")
+
+        calls_before = self.runtime_calls()
+        self.assertEqual(self.run_cli("unpause", "--repo", self.slug, "--issue", "1").returncode, 0)
+        restored = self.task_row()
+        self.assertEqual(
+            restored.phase,
+            "awaiting_review",
+            "unpause must reach the same destination as the label path",
+        )
+        self.assertEqual(self.runtime_calls(), calls_before)
+
+    def test_a_publish_pending_task_still_restores_to_publication(self) -> None:
+        """The other half of the rule, still honoured: unfinished work resumes publishing.
+
+        The regression above must not be fixed by always choosing ``awaiting_review`` —
+        a task whose push/PR never completed has no published work to review and must go
+        back to ``needs_attention`` so the publish pass finishes it without a second
+        model run.
+
+        Asserted at the release boundary itself rather than through a poll. A poll would
+        not test the *decision*: the publish pass afterwards legitimately completes the
+        publication and moves the task on to ``awaiting_review``, so a poll-level
+        assertion would read the same whichever phase the release had chosen — and would
+        have passed even with the ordering bug this pins.
+        """
+        self.first_run()
+        store = self.store()
+        task = self.task_row()
+        store.park_for_recovery(task.id, stage=RECOVERY_PUSH_FAILED, note="the push never landed")
+        store.pause_for_withdrawn_label(task.id, "take-it went away")
+        self.assertEqual(self.task_row().recovery_stage, RECOVERY_PUSH_FAILED)
+
+        self.assertTrue(store.release_label_withdrawn_pause(task.id))
+        restored = self.task_row()
+        # The task owns a PR *and* has an unfinished publication. Publication is the
+        # decision that wins, because it is the work that is genuinely incomplete:
+        # sending the task to `awaiting_review` would tell the review loop there is
+        # something to review while the push carrying it is still pending.
+        self.assertEqual(
+            restored.phase,
+            "needs_attention",
+            "unfinished publication must resume publication, not review",
+        )
+        self.assertEqual(restored.recovery_stage, RECOVERY_PUSH_FAILED)
+        self.assertIsNone(restored.pause_reason)
 
 
 class ParkedRoundRecoveryTests(ReviewCase):

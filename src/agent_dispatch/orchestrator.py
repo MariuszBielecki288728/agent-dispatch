@@ -143,6 +143,33 @@ PUBLISH_NOT_APPLICABLE = "not_applicable"
 PublishConfirmed = Callable[[int | None, str | None], None]
 
 
+@dataclass(frozen=True)
+class PrProblem:
+    """Why a review round's exact PR cannot be acted on. ``reason`` is the API code.
+
+    The reason and the human-readable detail travel together because every caller needs
+    both: ``reason`` is what `review`/`status` report and what decides whether a round is
+    parked or left retryable, and ``detail`` is what the operator reads. Returning only a
+    string forced call sites to compare prose, which is how the structural/transient
+    distinction would silently rot.
+    """
+
+    reason: str
+    detail: str
+
+
+#: The subset of PR problems that no amount of retrying can fix. A closed, merged or
+#: no-longer-ours PR stays that way until a human acts, so a round that hits one is
+#: parked for an explicit `review --release` / `review --retry-round` rather than left
+#: ``publish_pending``. Leaving it retryable means the dispatcher pushes to the branch on
+#: every poll, forever, against a pull request it can never publish to — the round would
+#: report the same failure indefinitely while quietly keeping the remote branch moving.
+#:
+#: `review_pr_unreadable` is deliberately absent: a failed read is transient, and
+#: treating it as structural would strand a publication that the next poll can finish.
+STRUCTURAL_PR_REASONS = frozenset({"review_pr_not_open", "review_pr_unowned", "review_pr_unknown"})
+
+
 @dataclass
 class RecoveryResult:
     """What publish-only recovery found and did for one task."""
@@ -1190,6 +1217,7 @@ class Orchestrator:
         on_confirmed: PublishConfirmed | None = None,
         recovery_stages: tuple[str, str] | None = None,
         require_pr: int | None = None,
+        round_id: int | None = None,
     ) -> DispatchOutcome:
         """Push the owned branch and create or adopt exactly one PR.
 
@@ -1201,10 +1229,10 @@ class Orchestrator:
 
         ``on_confirmed`` replaces the default `finalise_publication` write with the
         caller's own completion step, ``recovery_stages`` names the caller's park
-        reasons, and ``require_pr`` forbids creating or adopting any other PR.
-
-        All three exist for the review loop (#5). A review round must push to the
-        **exact** PR it was claimed against: the issue is explicit that a round may
+        reasons, ``require_pr`` forbids creating or adopting any other PR, and
+        ``round_id`` names the review round to park when that PR turns out to be
+        unusable. All four exist for the review loop (#5). A review round must push to
+        the **exact** PR it was claimed against: the issue is explicit that a round may
         never create a replacement PR or act on someone else's. With ``require_pr``
         set, a missing/closed/replaced PR parks the round instead — see
         :meth:`_confirm_exact_pull_request`, which is a strictly narrower operation
@@ -1226,6 +1254,32 @@ class Orchestrator:
 
         stage_push, stage_pr = recovery_stages or (RECOVERY_PUSH_FAILED, RECOVERY_PR_FAILED)
         notes: list[str] = []
+
+        # --- exact-PR gate (BEFORE any push) ---
+        #
+        # Checked twice on purpose, and the order is the point. This first check runs
+        # before the branch is touched, so a round whose PR was closed, merged or
+        # replaced since the claim leaves the remote exactly as it found it: no push,
+        # and therefore no misleading "the branch is up to date" evidence for a later
+        # retry to build on. The second check runs after the push and catches the
+        # narrower race where the PR changes state *during* our own publication.
+        #
+        # Only the *structural* verdicts stop here — an unreadable PR is deliberately
+        # NOT one of them, because a lookup failure is transient and blocking on it
+        # would strand a perfectly good publication. That distinction is what keeps
+        # "retry this step" and "a human must decide" from being the same outcome.
+        if require_pr is not None:
+            # `require_pr` and `round_id` travel together: only `_publish_review_round`
+            # sets `require_pr`, and it always knows its round. Asserted rather than
+            # assumed, because parking the round (not the task) is what stops it being
+            # retried — see `_park_unusable_round`.
+            if round_id is None:  # pragma: no cover - defensive
+                raise ValueError("require_pr implies a review round, so round_id is required")
+            structural = self._round_pull_problem(repo, task, require_pr, allow_unreadable=True)
+            if structural is not None:
+                return self._park_unusable_round(
+                    task, require_pr, round_id, structural, notes, result
+                )
 
         # --- push (intent-before-action) ---
         push_op = self.store.intend_operation(
@@ -1290,11 +1344,16 @@ class Orchestrator:
         # `_confirm_exact_pull_request` for why the review loop needs it and why it is a
         # separate method rather than a flag inside `_ensure_pull_request`.
         if require_pr is not None:
+            # The post-push half of the exact-PR check lives in
+            # `_confirm_exact_pull_request`, which now splits its verdicts: a structural
+            # failure parks the round for an explicit decision, a transient one keeps it
+            # retryable.
             return self._confirm_exact_pull_request(
                 task,
                 repo,
                 state,
                 require_pr=require_pr,
+                round_id=round_id,
                 result=result,
                 notes=notes,
                 on_confirmed=on_confirmed,
@@ -1310,6 +1369,126 @@ class Orchestrator:
             recovery_stage=stage_pr,
         )
 
+    def _park_unusable_round(
+        self,
+        task: Task,
+        pr_number: int,
+        round_id: int,
+        problem: PrProblem,
+        notes: list[str],
+        result: RunResult | None,
+        *,
+        pushed: bool = False,
+    ) -> DispatchOutcome:
+        """Park a round whose exact PR is structurally unusable. Returns the outcome.
+
+        Structural means the answer will not change by trying again: the PR is closed,
+        merged, or no longer provably this task's. That is why the round is parked in
+        ``interrupted`` rather than left ``publish_pending`` — a publish-pending round is
+        retried on every pass, and an auto-retried push against a closed PR can never
+        succeed, so it would push to the branch forever while reporting nothing useful.
+
+        The feedback is deliberately left unacknowledged: no model output reached the
+        PR, so re-applying the same feedback later is correct and losing it would not be.
+        """
+        detail = (
+            f"review round's PR #{pr_number} is not usable ({problem.detail}); "
+            + (
+                "the branch was pushed but the round is not published"
+                if pushed
+                else "the branch has NOT been pushed"
+            )
+            + " and the feedback stays unacknowledged"
+        )
+        # The round and the task row are written together. Parking the round is what
+        # stops it being retried; clearing the task's own *round* stage is hygiene, so
+        # `_task_round_stage` cannot mirror a stale reason onto a later attempt. An
+        # implementation stage is deliberately preserved — that is another repair's
+        # evidence. Both writes are in one method so no caller can half-apply them.
+        self.store.park_round_outside_publication(
+            round_id,
+            task.id,
+            detail + ". Reopening the pull request does not change this by itself: use "
+            "`review --retry-round` after restoring it, or `review --release` to drop "
+            "this round and let the next handoff carry the same feedback again.",
+        )
+        return DispatchOutcome(
+            action=OUTCOME_NEEDS_ATTENTION,
+            task_ref=task.ref,
+            reason=problem.reason,
+            pr_number=pr_number,
+            session_id=result.session_id if result else task.session_id,
+            run=result,
+            notes=notes + [detail],
+        )
+
+    def _round_pull_problem(
+        self,
+        repo: RepoConfig,
+        task: Task,
+        pr_number: int,
+        *,
+        allow_unreadable: bool,
+    ) -> PrProblem | None:
+        """Why this round's PR cannot be used, or ``None`` when it is still good.
+
+        The single place that answers "is the exact PR this round was claimed against
+        still open, unmerged and provably ours?", shared by the pre-push gate, the
+        post-push re-check and the pre-spawn gate. It exists as one method because the
+        rule is one rule: splitting it into per-call-site copies is how the pre-spawn
+        gate came to be missing while the publication gate was present.
+
+        ``allow_unreadable`` is the one deliberate difference between callers. At
+        publication an unreadable PR must NOT stop the round, because the read failure is
+        transient and the existing recovery stage already retries it; at a *re-drive*
+        the same failure must stop the round, because the alternative is spending a model
+        call on an unproven assumption. Making the difference an explicit, named
+        parameter keeps that reasoning visible instead of hidden in the caller.
+        """
+        try:
+            pull = self.client.get_pull(repo.slug, pr_number)
+        except GitHubError as exc:
+            if allow_unreadable:
+                return None
+            return PrProblem(
+                "review_pr_unreadable", f"PR #{pr_number} could not be read ({exc.kind})"
+            )
+        if pull.state != "open" or pull.merged:
+            return PrProblem("review_pr_not_open", f"PR #{pr_number} is {_pr_state(pull)}")
+        if not _pr_is_ours(pull, repo.slug, task, expected=pr_number):
+            return PrProblem(
+                "review_pr_unowned",
+                f"PR #{pr_number} is no longer provably this task's (head {pull.head_label!r})",
+            )
+        return None
+
+    def _require_live_round_pull(
+        self, repo: RepoConfig, task: Task, pr_number: int | None
+    ) -> tuple[object | None, PrProblem | None]:
+        """Fetch the round's PR and refuse the round when it is not usable.
+
+        Used immediately before a model spawn, where an unreadable PR blocks (see
+        :meth:`_round_pull_problem`). On success returns the pulled request so the caller
+        can describe it to the model rather than reading it twice.
+        """
+        if pr_number is None:
+            return None, PrProblem(
+                "review_pr_unknown",
+                "the round has no recorded pull request, so there is no PR it may act on "
+                "and no PR it may publish to",
+            )
+        # `allow_unreadable=False`: a model call may only be spent on a PR we could
+        # actually read and verify, so here "cannot tell" blocks rather than proceeds.
+        problem = self._round_pull_problem(repo, task, pr_number, allow_unreadable=False)
+        if problem is not None:
+            return None, problem
+        try:
+            return self.client.get_pull(repo.slug, pr_number), None
+        except GitHubError as exc:  # pragma: no cover - the check above already read it
+            return None, PrProblem(
+                "review_pr_unreadable", f"PR #{pr_number} could not be read ({exc.kind})"
+            )
+
     def _confirm_exact_pull_request(
         self,
         task: Task,
@@ -1317,6 +1496,7 @@ class Orchestrator:
         state: WorktreeState,
         *,
         require_pr: int,
+        round_id: int,
         result: RunResult | None,
         notes: list[str],
         on_confirmed: PublishConfirmed | None,
@@ -1363,37 +1543,34 @@ class Orchestrator:
             )
 
         if pull.state != "open" or pull.merged:
-            detail = (
-                f"PR #{require_pr} is {_pr_state(pull)}, so this review round has nowhere "
-                "to publish and no replacement was created. The pushed commits are on the "
-                "branch; the feedback stays unacknowledged."
-            )
-            self.store.mark_needs_attention(task.id, detail)
-            return DispatchOutcome(
-                action=OUTCOME_NEEDS_ATTENTION,
-                task_ref=task.ref,
-                reason="review_pr_not_open",
-                pr_number=require_pr,
-                session_id=result.session_id if result else task.session_id,
-                run=result,
-                notes=notes + [detail],
+            # A structural failure: retrying cannot make a closed PR open again, so the
+            # round is parked for an explicit decision rather than left retryable.
+            return self._park_unusable_round(
+                task,
+                require_pr,
+                round_id,
+                PrProblem(
+                    "review_pr_not_open",
+                    f"it is {_pr_state(pull)} after the push",
+                ),
+                notes,
+                result,
+                pushed=True,
             )
 
         if not _pr_is_ours(pull, repo.slug, task, expected=require_pr):
-            detail = (
-                f"PR #{require_pr} is no longer provably this task's (head "
-                f"{pull.head_label!r}); refusing to publish the round to a pull request "
-                "this task may not own"
-            )
-            self.store.mark_needs_attention(task.id, detail)
-            return DispatchOutcome(
-                action=OUTCOME_NEEDS_ATTENTION,
-                task_ref=task.ref,
-                reason="review_pr_unowned",
-                pr_number=require_pr,
-                session_id=result.session_id if result else task.session_id,
-                run=result,
-                notes=notes + [detail],
+            return self._park_unusable_round(
+                task,
+                require_pr,
+                round_id,
+                PrProblem(
+                    "review_pr_unowned",
+                    f"it is no longer provably this task's (head {pull.head_label!r}) "
+                    "after the push",
+                ),
+                notes,
+                result,
+                pushed=True,
             )
 
         # The `push_branch` operation was already recorded and confirmed by `_publish`.
@@ -2006,7 +2183,43 @@ class Orchestrator:
         session_id = round_row.session_id or self.store.resumable_session(task.id)
         cursor_before = parse_cursor(fresh.feedback_cursor)
 
-        pull = self.client.get_pull(repo.slug, round_row.pr_number or 0)
+        # The exact PR is re-checked BEFORE the model is spawned, not only at
+        # publication. A round can be re-driven hours after it was claimed (a crash
+        # restart, or an explicit `review --retry-round`), and in that window the PR can
+        # be merged, closed, or stop being provably ours. Without this gate the round
+        # would spend another resumed model turn and only discover at publication time
+        # that there is nowhere to publish it — and #5 is explicit that an externally
+        # closed or merged PR receives no new round. An old claim is not evidence that
+        # the PR is still valid now.
+        #
+        # An unreadable PR also blocks here, for the same reason it blocks elsewhere:
+        # "cannot tell" is not evidence that the PR is fine.
+        pull, pr_problem = self._require_live_round_pull(repo, task, round_row.pr_number)
+        if pr_problem is not None:
+            # No model call. The round is parked with the feedback unacknowledged, so the
+            # maintainer can release it (`review --release`) or re-run it
+            # (`review --retry-round`) once the pull request can be acted on again.
+            self.store.park_round_outside_publication(
+                round_row.id,
+                task.id,
+                f"review round {round_row.round} parked without a model call: {pr_problem.detail}",
+            )
+            self._sync_after_transition(task)
+            return DispatchOutcome(
+                action=OUTCOME_NEEDS_ATTENTION,
+                task_ref=task.ref,
+                reason=pr_problem.reason,
+                pr_number=round_row.pr_number,
+                notes=[
+                    pr_problem.detail,
+                    "no model was invoked and the feedback stays unacknowledged. Use "
+                    f"`agent-dispatch review --retry-round --repo {task.repo} --issue "
+                    f"{task.issue_number}` once the pull request is open again, or "
+                    f"`agent-dispatch review --release --repo {task.repo} --issue "
+                    f"{task.issue_number}` to drop this round.",
+                ],
+            )
+
         diff = load_diff(
             git=self.git,
             worktree_path=str(provision.state.path),
@@ -2408,13 +2621,14 @@ class Orchestrator:
         require_pr = round_row.pr_number
         if require_pr is None:
             # A round without a recorded PR cannot be published safely, and guessing is
-            # exactly the failure this guards against.
+            # exactly the failure this guards against. Parked the same way as the other
+            # structural PR failures, so the round is not retried and no stale round
+            # stage is left on the task row.
             detail = (
                 f"review round {round_row.round} has no recorded pull request, so there is "
                 "no PR it may publish to; refusing to create or adopt one"
             )
-            self.store.park_round(round_row.id, state=ROUND_INTERRUPTED, stage=None, note=detail)
-            self.store.mark_needs_attention(task.id, detail)
+            self.store.park_round_outside_publication(round_row.id, task.id, detail)
             self._sync_after_transition(task)
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
@@ -2456,6 +2670,7 @@ class Orchestrator:
             # (or adopt someone else's) when the claimed PR is closed or merged between
             # the claim and the push.
             require_pr=require_pr,
+            round_id=round_row.id,
         )
         if outcome.action in {OUTCOME_PR_READY, OUTCOME_ADOPTED}:
             # The round is published. Nothing is re-armed here: the label this round
@@ -2502,16 +2717,43 @@ class Orchestrator:
                 ],
             )
 
-        # Publication did not complete. The round is left in ``publish_pending`` with
-        # the stage `_publish` recorded, so the next pass finishes it with ZERO further
-        # model calls — and the cursor is untouched, because the feedback is not
+        # Publication did not complete. Two very different reasons land here and they
+        # must not be treated the same, or the round either retries forever or strands
+        # recoverable work.
+        #
+        # *Structural* — the exact PR is closed, merged, or no longer provably ours.
+        # `_publish` has already parked the round as `interrupted` for an explicit
+        # decision. Retrying cannot help: a closed PR does not reopen on the next poll,
+        # so leaving it publish-pending would push to the branch every pass forever while
+        # reporting a reason that never changes. Nothing is written back here.
+        #
+        # *Transient* — a push that failed, a tip that could not be verified, a PR
+        # lookup that errored. The round stays ``publish_pending`` with the stage
+        # `_publish` recorded, so the next pass finishes it with ZERO further model
+        # calls. The cursor is untouched either way, because feedback is not
         # acknowledged until the work it describes is durably on the pull request.
         #
-        # The round is deliberately NOT parked as `interrupted`: that state means "a
-        # human must decide", and finishing a push or a PR lookup is something the
-        # dispatcher can and should retry by itself. Downgrading a specific, retryable
-        # publication reason to a generic interrupted state is the mistake #16's
-        # review had to correct, and it is the same trap here.
+        # Parking every failure as `interrupted` would be wrong for the same reason in
+        # reverse: finishing a push is something the dispatcher can and should retry by
+        # itself, and downgrading that to "a human must decide" is the mistake #16's
+        # review had to correct.
+        if outcome.reason in STRUCTURAL_PR_REASONS:
+            return DispatchOutcome(
+                action=OUTCOME_NEEDS_ATTENTION,
+                task_ref=task.ref,
+                reason=outcome.reason,
+                pr_number=outcome.pr_number or round_row.pr_number,
+                session_id=result.session_id if result else round_row.session_id,
+                run=result,
+                notes=[
+                    *outcome.notes,
+                    (
+                        "no model call is repeated and the feedback stays unacknowledged. "
+                        "This round will not be retried automatically."
+                    ),
+                ],
+            )
+
         self.store.mark_round_publish_pending(
             round_row.id, head_sha=state.head_sha, stage=self._task_round_stage(task)
         )
@@ -2707,8 +2949,11 @@ class Orchestrator:
             self.store.set_phase(
                 task.id,
                 "needs_attention",
-                detail + ". The feedback is unacknowledged. Inspect the worktree, then re-add "
-                f"'{self.config.github.review_handoff_label}' to ask for the round again.",
+                detail + ". The feedback is unacknowledged. Inspect the worktree, then either "
+                f"`review --retry-round --repo {task.repo} --issue {task.issue_number}` to run "
+                "the round again, or "
+                f"`review --release --repo {task.repo} --issue {task.issue_number}` to drop it "
+                "so the next handoff carries the same feedback.",
             )
             self._sync_after_transition(task)
             return [f"{task.ref}: {detail}"]
