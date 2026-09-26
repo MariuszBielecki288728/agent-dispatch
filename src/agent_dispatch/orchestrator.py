@@ -1599,18 +1599,30 @@ class Orchestrator:
             # Ownership already recorded, so there is nothing to publish. A task left
             # in needs_attention for an unrelated reason is NOT silently cleared.
             #
-            # Self-heal: an owned PR means publication *succeeded*, so any surviving
-            # publishable stage is provably stale. That combination could be written by
-            # the pre-atomic finalisation below (record the PR, crash before clearing
-            # the stage), and without this repair it would persist forever — the early
-            # return here is exactly what stopped it from ever being cleared, and
-            # `describe_task` reads the stage before the PR, so the Issue comment would
-            # report "Recovering publication" for finished work indefinitely.
+            # Self-heal, limited to ONE provably inconsistent combination: an owned PR
+            # *plus* a publishable stage. An owned verified PR means publication
+            # completed, so a surviving publication stage is stale by definition. That
+            # pair could be written by the pre-atomic finalisation (record the PR, crash
+            # before clearing the stage), and without this repair the early return here
+            # is exactly what stopped it from ever being cleared.
+            #
+            # It reuses `finalise_publication` rather than only clearing the stage,
+            # because the same crash also leaves the PHASE behind, and repairing one
+            # without the other just produces the *other* inconsistent state (owned PR +
+            # no stage + `needs_attention`), which is wrong for anything gating on a real
+            # `awaiting_review`. Normalising all three facts is the whole point.
+            #
+            # Deliberately narrow: a `needs_attention` row with an owned PR but NO
+            # publishable stage is left alone here, because that can be a legitimate
+            # later intervention rather than this crash signature.
             if task.has_publishable_stage:
-                self.store.clear_recovery_stage(task.id)
+                self.store.finalise_publication(
+                    task.id, pr_number=task.pr_number, pr_url=task.pr_url
+                )
                 return [
-                    f"cleared a stale recovery stage ({task.recovery_stage}): PR "
-                    f"#{task.pr_number} is already owned, so publication had completed"
+                    f"cleared a stale recovery stage ({task.recovery_stage}) and "
+                    f"restored awaiting_review: PR #{task.pr_number} is already owned, "
+                    "so publication had completed"
                 ]
             return []
 

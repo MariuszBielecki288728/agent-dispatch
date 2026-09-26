@@ -2182,17 +2182,28 @@ class PublicationFinalisationTests(StatusCommentCase):
 
     def test_the_two_finalisation_call_sites_share_the_atomic_operation(self) -> None:
         # Both the create path and the adopt path must use it; a single leftover
-        # three-write sequence would reintroduce the window on that path.
+        # three-write sequence would reintroduce the window on that path. The stale-stage
+        # repair in `_reconcile_publish_pending` uses it too, so three call sites.
         source = (SRC / "agent_dispatch" / "orchestrator.py").read_text(encoding="utf-8")
         self.assertEqual(
             source.count("self.store.finalise_publication("),
-            2,
-            "the create and adopt paths must both finalise atomically",
+            3,
+            "the create path, the adopt path and the stale-stage repair must all "
+            "finalise atomically",
         )
         self.assertNotIn(
             "self.store.record_owned_pr(",
             source,
             "no call site may write PR ownership outside finalise_publication",
+        )
+        # `clear_recovery_stage` alone is still legitimate on the handled-recovery path,
+        # which leaves the phase as it found it. What must NOT come back is the crash
+        # window: a stage clear immediately followed by a phase write.
+        self.assertNotIn(
+            "self.store.clear_recovery_stage(task.id)\n            self.store.set_phase(",
+            source,
+            "clearing the stage and setting the phase as separate writes is the crash "
+            "window this fix removed",
         )
 
     def test_a_stale_stage_beside_an_owned_pr_is_repaired(self) -> None:
@@ -2241,12 +2252,77 @@ class PublicationFinalisationTests(StatusCommentCase):
 
         healed = store.get_task(self.slug, 1)
         assert healed is not None
+        # ALL THREE facts must be restored, not just the stage. Clearing only the stage
+        # would leave the *other* inconsistent state from the same crash (owned PR + no
+        # stage + `needs_attention`), which is wrong for anything gating on a real
+        # `awaiting_review` — exactly the gap this repair previously had.
+        self.assertEqual(healed.pr_number, 9, "the owned PR must be kept")
         self.assertIsNone(healed.recovery_stage, "the stale stage must be cleared")
+        self.assertEqual(
+            healed.phase,
+            "awaiting_review",
+            "publication completed, so the phase must be normalised too",
+        )
         self.assertFalse(healed.is_publish_pending)
         self.assertTrue(
             any("stale recovery stage" in note for note in notes),
             f"the repair must be reported, saw {notes}",
         )
+
+        # And the rendered status agrees.
+        from agent_dispatch.statuscomment import task_view as build_view
+
+        body = render_comment(build_view(healed))
+        self.assertIn(STATE_AWAITING_REVIEW, body)
+        self.assertNotIn(STATE_RECOVERING, body)
+
+    def test_an_owned_pr_without_a_stage_is_not_touched(self) -> None:
+        # The repair is deliberately limited to the exact crash signature (owned PR AND
+        # a publishable stage). A `needs_attention` row with an owned PR but no stage may
+        # be a legitimate later intervention, so it must NOT be normalised — a broad
+        # "needs_attention + pr_number => awaiting_review" rule would erase that.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.store import Store as _Store
+
+        self.set_issues(issue(1, "Deliberate intervention", labels=[TRIGGER]))
+        config = load_config(self.world.config_path)
+        store = _Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="m",
+            runtime_effort="high",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        task = store.get_task(self.slug, 1)
+        assert task is not None
+        # An owned PR with NO publishable stage: not the crash signature.
+        store.record_owned_pr(task.id, pr_number=9, pr_url="https://example/9")
+        store.set_phase(task.id, "needs_attention", "an operator parked this later")
+
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+        orchestrator.reconcile()
+
+        after = store.get_task(self.slug, 1)
+        assert after is not None
+        self.assertEqual(
+            after.phase,
+            "needs_attention",
+            "a deliberate intervention must not be normalised away",
+        )
+        self.assertEqual(after.pr_number, 9)
 
 
 class PreStatusSchemaTests(StatusCommentCase):

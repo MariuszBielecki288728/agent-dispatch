@@ -476,9 +476,16 @@ autocommit mode, so writing them separately left two crash windows:
   `needs_attention`, which is not a real `awaiting_review` for anything that gates on
   the phase.
 
-Rows left inconsistent by an older build are **repaired on reconciliation**: when a
-task has both an owned PR and a publishable stage, the stage is provably stale and is
-cleared with a note, rather than being left to report a publication problem forever.
+Rows left inconsistent by an older build are **repaired on reconciliation**: a task
+with an owned PR *and* a publishable stage is the exact old crash signature, so the
+whole publication result is normalised in one statement — the owned PR is kept, the
+stale stage is cleared and the phase becomes `awaiting_review`. Clearing only the stage
+would leave the *other* inconsistent state (an owned PR beside `needs_attention`),
+which is still wrong for anything gating on a real `awaiting_review`.
+
+The repair is deliberately narrow: it applies only to that combination. A
+`needs_attention` row with an owned PR but **no** publishable stage is left alone,
+because that can be a legitimate later intervention rather than this crash signature.
 
 **Its exit status describes the outcome, not the attempt.** The command exits `0`
 only when the work is actually published (an owned PR exists) or when a live worker
