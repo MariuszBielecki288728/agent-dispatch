@@ -1150,6 +1150,40 @@ class Store:
             (pr_number, pr_url, utcnow_iso(), note, utcnow_iso(), task_id),
         )
 
+    def finalise_publication(
+        self,
+        task_id: int,
+        *,
+        pr_number: int,
+        pr_url: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Record an owned PR, clear the recovery stage and mark it awaiting review.
+
+        **One statement, on purpose.** These three facts are only true together, and
+        the connection is in autocommit mode (``isolation_level=None``), so writing them
+        as three separate statements left two crash windows:
+
+        * after the PR is recorded but before the stage is cleared, the row keeps a
+          publishable ``recovery_stage`` while ``pr_number`` is set. The reconcile pass
+          returns early when a PR is owned, so the stage is never cleared, and
+          ``describe_task`` checks ``is_publish_pending`` *before* ``pr_number`` — so the
+          Issue comment would say "Recovering publication" forever for a task whose PR
+          already exists.
+        * after the stage is cleared but before the phase is set, the row keeps
+          ``needs_attention`` with an owned PR. The renderer still shows "Awaiting
+          review" because it trusts the verified PR, but the *durable* phase is wrong,
+          and the review loop depends on a real ``awaiting_review``.
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE tasks SET pr_number = ?, pr_url = ?, "
+            "pr_created_at = COALESCE(pr_created_at, ?), recovery_stage = NULL, "
+            "phase = 'awaiting_review', last_error = COALESCE(?, last_error), "
+            "updated_at = ? WHERE id = ?",
+            (pr_number, pr_url, now, note, now, task_id),
+        )
+
     # ------------------------------------------------- intent-before-action
 
     def intend_operation(self, task_id: int, *, kind: str, detail: str) -> int:

@@ -51,8 +51,11 @@ sees the same terminal flag. The owning thread sets that flag under the lock bef
 its first terminal write, and a background write that begins afterwards is refused.
 Joining the thread is *not* what provides this guarantee: a join is allowed to time
 out while a heartbeat is still inside the transport, so ordering that depended on it
-would leave a real window. A heartbeat tick also only ever PATCHes the comment it
-already owns — marker re-resolution, adoption and recovery stay on the owning thread.
+would leave a real window. A heartbeat tick is also a **strictly narrower operation
+than a foreground write**: it may only PATCH the comment id it already owns, and it
+never resolves ownership, scans, adopts or creates. A scan is a paginated multi-call
+sequence, so allowing one inside a tick would let it outlive its join budget and make
+the terminal write — which sits immediately before commit/push/PR — block behind it.
 
 **Stale status is repaired, never left fresh.** A persisted ``Starting``/``Running``
 state is only ever written by a live process, so finding one at startup means the
@@ -714,21 +717,40 @@ class StatusPublisher:
         best-effort by contract, and an exception from here could otherwise fail a
         run whose actual work succeeded.
 
-        ``background`` marks a heartbeat write. Such a write is refused outright once
-        terminal publication has begun, and the check happens inside the lock rather
-        than before it, so the ordering does not depend on the join having succeeded.
+        ``background`` marks a heartbeat write, and it is a strictly narrower operation
+        than a foreground one: it is refused once terminal publication has begun, and it
+        may only PATCH the comment id it already holds. It never resolves ownership, never
+        scans the Issue, never adopts and never creates. Two reasons:
+
+        * ordering — the terminal write must be last;
+        * duration — a scan is a paginated multi-call sequence, so allowing it here would
+          let one tick outlive its join budget and make the owning thread's
+          ``begin_terminal()`` (which waits on this lock) block behind it, stalling the
+          commit/push/PR path that runs next.
+
+        Marker re-resolution, adoption and recovery are the owning thread's job; a later
+        poll already has that path.
         """
         body = render_comment(view)
         try:
             with self._lock:
-                if background and self._terminal:
-                    self._log.info(
-                        "status_heartbeat_suppressed",
-                        repo=self._repo,
-                        issue=self._issue,
-                        detail="terminal publication has begun; the heartbeat write was dropped",
-                    )
-                    return False
+                if background:
+                    if self._terminal:
+                        self._log.info(
+                            "status_heartbeat_suppressed",
+                            repo=self._repo,
+                            issue=self._issue,
+                            detail=(
+                                "terminal publication has begun; the heartbeat write was dropped"
+                            ),
+                        )
+                        return False
+                    if self._comment_id is None:
+                        # Nothing owned to patch, and resolving ownership is explicitly
+                        # not the heartbeat's job.
+                        return False
+                    # One known-id PATCH, and nothing else.
+                    return self._edit(self._comment_id, body)
                 return self._publish_locked(body, allow_create=allow_create)
         except Exception as exc:  # noqa: BLE001 - status reporting is never fatal
             self._log.warning(

@@ -40,6 +40,7 @@ import json
 import os
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -47,7 +48,11 @@ REPO_ROOT = TESTS_DIR.parent
 SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-from agent_dispatch.github import IssueComment  # noqa: E402
+from agent_dispatch.github import (  # noqa: E402
+    ErrorKind,
+    GitHubError,
+    IssueComment,
+)
 from agent_dispatch.logging_setup import Logger  # noqa: E402
 from agent_dispatch.statuscomment import (  # noqa: E402
     MARKER_TEMPLATE,
@@ -1523,7 +1528,8 @@ class _BlockingStatusClient:
 
     Used to prove the heartbeat/terminal ordering WITHOUT sleeping: the test controls
     exactly when the in-flight heartbeat write completes, so the race is reproduced
-    rather than hoped for.
+    rather than hoped for. It also counts calls, which is what makes "a background tick
+    is one PATCH and no scan" assertable.
     """
 
     def __init__(self) -> None:
@@ -1531,15 +1537,25 @@ class _BlockingStatusClient:
         self.entered = __import__("threading").Event()
         self.release = __import__("threading").Event()
         self.writes: list[str] = []
+        #: Call counters, so a test can assert the shape of the transport usage.
+        self.scans = 0
+        self.edit_attempts = 0
+        self.creates = 0
         self._block_next_edit = False
+        self._fail_next_edit = False
         self._comment_id = 1
 
     def block_next_edit(self) -> None:
         self._block_next_edit = True
 
+    def fail_next_edit(self) -> None:
+        """Make the next PATCH fail the way a rate limit or timeout would."""
+        self._fail_next_edit = True
+
     # -- GitHubClient surface used by StatusPublisher -------------------------
 
     def list_issue_comments(self, slug, issue_number):
+        self.scans += 1
         return [
             IssueComment(
                 id=self._comment_id,
@@ -1549,6 +1565,10 @@ class _BlockingStatusClient:
         ]
 
     def edit_issue_comment(self, slug, comment_id, body):
+        self.edit_attempts += 1
+        if self._fail_next_edit:
+            self._fail_next_edit = False
+            raise GitHubError("gh: API rate limit exceeded (HTTP 403)", kind=ErrorKind.RATE_LIMIT)
         if self._block_next_edit:
             self._block_next_edit = False
             # Announce that the write is in flight, then wait for the test.
@@ -1562,6 +1582,7 @@ class _BlockingStatusClient:
         )
 
     def create_issue_comment(self, slug, issue_number, body):
+        self.creates += 1
         self.writes.append(body)
         return IssueComment(
             id=self._comment_id,
@@ -1833,6 +1854,118 @@ class HeartbeatThreadTests(unittest.TestCase):
         # The final durable sync inside `_finish` must reuse that same publisher.
         self.assertIn("self.sync_task_status(fresh, publisher=publisher)", source)
 
+    def test_a_background_write_only_patches_and_never_scans(self) -> None:
+        # Round-3 blocker. `background=True` originally only checked the terminal flag
+        # and then called `_publish_locked`, so a heartbeat tick whose PATCH failed still
+        # ran a full paginated marker scan and could issue a SECOND patch. That made one
+        # tick a multi-call sequence, so:
+        #   * it could outlive its join budget, and
+        #   * `begin_terminal()` — which waits on this lock — could block behind it,
+        #     stalling the commit/push/PR path that runs immediately afterwards.
+        # A background write must therefore be exactly one known-id PATCH.
+        client = _BlockingStatusClient()
+        store = Store.in_memory()
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        publisher = StatusPublisher(
+            client=client, store=store, log=log, repo="owner/repo", issue_number=1
+        )
+        task = _owned_store_task(store)
+        view = publisher.heartbeat_view(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        self.assertTrue(
+            publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        )
+
+        # Make the PATCH fail, which is what previously triggered the recovery path.
+        client.fail_next_edit()
+        scans_before = client.scans
+        edits_before = client.edit_attempts
+        self.assertFalse(
+            publisher.publish(
+                replace(view, state=STATE_RUNNING), allow_create=False, background=True
+            ),
+            "a failed heartbeat PATCH reports no write",
+        )
+        self.assertEqual(
+            client.edit_attempts - edits_before,
+            1,
+            "a heartbeat tick must make exactly ONE edit attempt",
+        )
+        self.assertEqual(
+            client.scans - scans_before,
+            0,
+            "a heartbeat tick must never scan the Issue for markers",
+        )
+        self.assertEqual(client.creates, 0, "a heartbeat tick must never create")
+
+    def test_a_background_write_without_an_owned_comment_does_not_resolve(self) -> None:
+        # Ownership resolution is the owning thread's job. A tick with no known id must
+        # stay silent rather than scanning to discover one.
+        client = _BlockingStatusClient()
+        store = Store.in_memory()
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        publisher = StatusPublisher(
+            client=client, store=store, log=log, repo="owner/repo", issue_number=1
+        )
+        task = _owned_store_task(store)
+        view = publisher.heartbeat_view(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        scans_before = client.scans
+        self.assertFalse(
+            publisher.publish(
+                replace(view, state=STATE_RUNNING), allow_create=False, background=True
+            ),
+            "no owned comment means no heartbeat write",
+        )
+        self.assertEqual(client.scans - scans_before, 0, "and no scan to find one")
+        self.assertEqual(client.edit_attempts, 0)
+        self.assertEqual(client.creates, 0)
+
+    def test_terminal_publication_does_not_wait_behind_a_heartbeat_scan(self) -> None:
+        # The harm the round-3 blocker described: `begin_terminal()` waits on the shared
+        # lock, and `_finish()` waits for `begin_terminal()` BEFORE the commit/push/PR
+        # path. With a scan allowed in a tick, that wait could cover several sequential
+        # wrapper calls. With a one-PATCH tick it covers at most one bounded call.
+        client = _BlockingStatusClient()
+        store = Store.in_memory()
+        self.addCleanup(store.close)
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        publisher = StatusPublisher(
+            client=client, store=store, log=log, repo="owner/repo", issue_number=1
+        )
+        task = _owned_store_task(store)
+        view = publisher.heartbeat_view(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        self.assertTrue(
+            publisher.begin(task, attempt=1, run_started_at="2026-09-25T00:00:00+00:00")
+        )
+
+        # A failing tick, then terminal publication. The failure must not have queued up
+        # a scan, so the terminal call returns promptly. Scans are counted from HERE:
+        # `begin()` legitimately scans once to resolve ownership, and this assertion is
+        # about the heartbeat, not the start path.
+        scans_after_begin = client.scans
+        client.fail_next_edit()
+        publisher.publish(replace(view, state=STATE_RUNNING), allow_create=False, background=True)
+        self.assertEqual(
+            client.scans - scans_after_begin, 0, "no scan may be triggered by a heartbeat"
+        )
+
+        started = __import__("time").monotonic()
+        publisher.begin_terminal()
+        self.assertTrue(
+            publisher.publish(replace(view, state=STATE_AWAITING_REVIEW), allow_create=False),
+            "terminal publication must still succeed after a failed heartbeat tick",
+        )
+        self.assertLess(
+            __import__("time").monotonic() - started,
+            5.0,
+            "terminal publication must not wait behind a heartbeat recovery chain",
+        )
+        self.assertIn(STATE_AWAITING_REVIEW, client.writes[-1])
+
     def test_a_background_write_is_refused_once_terminal_begins(self) -> None:
         # The unit-level form of the same invariant: the decision is taken under the
         # publisher's own lock, so it holds regardless of thread timing.
@@ -1977,6 +2110,143 @@ max_turns = 40
         self.assertIn(STATE_FAILED, self.status_comment_body())
         self.assertNotIn(STATE_QUEUED, self.status_comment_body())
         self.assert_one_comment(why="a failed spawn still owns exactly one comment")
+
+
+class PublicationFinalisationTests(StatusCommentCase):
+    def test_recording_an_owned_pr_is_atomic_with_the_phase_and_stage(self) -> None:
+        # Round-3 review: recording the PR, clearing the recovery stage and entering
+        # `awaiting_review` were three autocommitted statements, which left two crash
+        # windows. This asserts the durable invariants those windows violated, using the
+        # single operation both the create and adopt paths now call.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.store import Store as _Store
+
+        self.set_issues(issue(1, "Atomic finalise", labels=[TRIGGER]))
+        config = load_config(self.world.config_path)
+        store = _Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="m",
+            runtime_effort="high",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        task = store.get_task(self.slug, 1)
+        assert task is not None
+
+        # Park it the way a failed publication would: needs_attention + a stage.
+        store.park_for_recovery(task.id, stage="push_failed", note="boom")
+
+        store.finalise_publication(task.id, pr_number=42, pr_url="https://example/42")
+
+        after = store.get_task(self.slug, 1)
+        assert after is not None
+        # The three facts are true together, so neither crash window can be observed.
+        self.assertEqual(after.pr_number, 42)
+        self.assertIsNone(after.recovery_stage, "a stale stage must not survive")
+        self.assertEqual(after.phase, "awaiting_review")
+        self.assertFalse(after.is_publish_pending, "no lingering publish-pending state")
+
+        # And the rendered state is the verified PR, not "Recovering publication".
+        from agent_dispatch.statuscomment import task_view as build_view
+
+        body = render_comment(build_view(after))
+        self.assertIn(STATE_AWAITING_REVIEW, body)
+        self.assertNotIn(STATE_RECOVERING, body)
+
+    def test_finalisation_is_one_statement_so_it_cannot_half_apply(self) -> None:
+        # The crash windows are BETWEEN statements, so a test that runs to completion
+        # can never observe them — with three separate writes the previous test passes
+        # either way. What makes them impossible is that the three facts are written by
+        # ONE statement, so that is what is asserted here.
+        source = (SRC / "agent_dispatch" / "store.py").read_text(encoding="utf-8")
+        start = source.index("    def finalise_publication(")
+        end = source.index("    # ----", start)
+        body = source[start:end]
+        self.assertEqual(
+            body.count("self._conn.execute("),
+            1,
+            "finalise_publication must write the PR, the stage and the phase in a "
+            "single statement; separate statements leave crash windows",
+        )
+        for column in ("pr_number = ?", "recovery_stage = NULL", "phase = 'awaiting_review'"):
+            self.assertIn(column, body, f"{column} must be part of that one statement")
+
+    def test_the_two_finalisation_call_sites_share_the_atomic_operation(self) -> None:
+        # Both the create path and the adopt path must use it; a single leftover
+        # three-write sequence would reintroduce the window on that path.
+        source = (SRC / "agent_dispatch" / "orchestrator.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            source.count("self.store.finalise_publication("),
+            2,
+            "the create and adopt paths must both finalise atomically",
+        )
+        self.assertNotIn(
+            "self.store.record_owned_pr(",
+            source,
+            "no call site may write PR ownership outside finalise_publication",
+        )
+
+    def test_a_stale_stage_beside_an_owned_pr_is_repaired(self) -> None:
+        # Rows already written by the old three-write sequence must self-heal: the
+        # reconcile pass returns early when a PR is owned, which is exactly what used to
+        # stop the stale stage from ever being cleared.
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+        from agent_dispatch.orchestrator import Orchestrator
+        from agent_dispatch.store import Store as _Store
+
+        self.set_issues(issue(1, "Stale stage", labels=[TRIGGER]))
+        config = load_config(self.world.config_path)
+        store = _Store(config.worker.state_db)
+        self.addCleanup(store.close)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="m",
+            runtime_effort="high",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        task = store.get_task(self.slug, 1)
+        assert task is not None
+        # Exactly the crash-window-1 row: an owned PR AND a publishable stage.
+        store.record_owned_pr(task.id, pr_number=9, pr_url="https://example/9")
+        store.park_for_recovery(task.id, stage="push_failed", note="crashed mid-finalise")
+        stale = store.get_task(self.slug, 1)
+        assert stale is not None
+        self.assertTrue(stale.is_publish_pending, "precondition: the row is inconsistent")
+
+        log = Logger(fmt="text", stream=open(os.devnull, "w"))  # noqa: SIM115
+        self.addCleanup(log.stream.close)
+        orchestrator = Orchestrator(config, store, GitHubClient(config.github.command), log)
+
+        # `reconcile()` is the real entry point for a stale publish-pending row (it runs
+        # once at startup and on `resume-publish`), not the status-sync pass.
+        notes = orchestrator.reconcile()
+
+        healed = store.get_task(self.slug, 1)
+        assert healed is not None
+        self.assertIsNone(healed.recovery_stage, "the stale stage must be cleared")
+        self.assertFalse(healed.is_publish_pending)
+        self.assertTrue(
+            any("stale recovery stage" in note for note in notes),
+            f"the repair must be reported, saw {notes}",
+        )
 
 
 class PreStatusSchemaTests(StatusCommentCase):

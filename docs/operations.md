@@ -461,6 +461,25 @@ is up the command re-arms the task and hands off, reporting that the worker will
 publish it on its next poll. That hand-off is safe because the worker finishes
 publish-pending work on every poll; it does not depend on a restart.
 
+### Publication is finalised in one statement
+
+Recording the owned PR, clearing `recovery_stage` and entering `awaiting_review` are
+written by **one** SQL statement (`Store.finalise_publication`), on both the create
+and adopt paths. These three facts are only true together, and the connection is in
+autocommit mode, so writing them separately left two crash windows:
+
+* crash after the PR was recorded but before the stage was cleared — the reconcile
+  pass returns early when a PR is owned, so the stale stage was never cleared, and the
+  status renderer reads the stage *before* the PR: the comment would say
+  "Recovering publication" indefinitely for a task whose PR already existed;
+* crash after the stage was cleared but before the phase changed — an owned PR beside
+  `needs_attention`, which is not a real `awaiting_review` for anything that gates on
+  the phase.
+
+Rows left inconsistent by an older build are **repaired on reconciliation**: when a
+task has both an owned PR and a publishable stage, the stage is provably stale and is
+cleared with a note, rather than being left to report a publication problem forever.
+
 **Its exit status describes the outcome, not the attempt.** The command exits `0`
 only when the work is actually published (an owned PR exists) or when a live worker
 holds the lock and has explicitly accepted responsibility for the next poll. If the
@@ -940,9 +959,14 @@ before its first terminal write. A join is deliberately not trusted for this: it
 allowed to time out while a heartbeat is still inside the transport (a failed PATCH,
 a marker re-scan and a second PATCH are several sequential bounded calls), so relying
 on it would leave a window in which `Running` could overwrite `Awaiting review`. Any
-heartbeat write that starts after the flag is set is refused, and a heartbeat tick
-only ever PATCHes the comment it already knows — marker re-resolution, adoption and
-recovery stay on the owning thread.
+heartbeat write that starts after the flag is set is refused, and a heartbeat tick is
+a **strictly narrower operation than a foreground write**: it may only PATCH the
+comment id it already holds. It never resolves ownership, never scans the Issue,
+never adopts and never creates — those stay on the owning thread, and a later poll
+already has that path. Two reasons for the narrowing: a scan is a paginated
+multi-call sequence, so allowing it inside a tick would let one tick outlive its join
+budget *and* make the owning thread's terminal write block behind it — and that write
+sits immediately before commit/push/PR.
 
 ### Ownership survives a crash between create and record
 

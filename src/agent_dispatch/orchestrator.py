@@ -1265,14 +1265,17 @@ class Orchestrator:
                 )
 
             self.store.confirm_operation(pr_op, external_id=str(existing.number))
-            self.store.record_owned_pr(
+            # One atomic write: recording the PR, clearing the recovery stage and
+            # entering `awaiting_review` are only true together. Three separate
+            # autocommitted statements left crash windows that could strand the row
+            # as `Recovering publication` forever (or `needs_attention`) with an
+            # owned PR — see `Store.finalise_publication`.
+            self.store.finalise_publication(
                 task.id,
                 pr_number=existing.number,
                 pr_url=existing.url,
                 note=f"adopted the existing PR for owned branch {state.branch}",
             )
-            self.store.clear_recovery_stage(task.id)
-            self.store.set_phase(task.id, "awaiting_review")
             notes.append(
                 f"PR #{existing.number} already existed for the owned branch {state.branch}; "
                 "adopted it instead of creating a second one"
@@ -1319,9 +1322,9 @@ class Orchestrator:
         # Record the real number GitHub returned. This is the only place ownership
         # is written, and it happens after the PR provably exists.
         self.store.confirm_operation(pr_op, external_id=str(pull.number))
-        self.store.record_owned_pr(task.id, pr_number=pull.number, pr_url=pull.url)
-        self.store.clear_recovery_stage(task.id)
-        self.store.set_phase(task.id, "awaiting_review")
+        # Atomic with the stage clear and the phase change: a crash between separate
+        # statements could leave an owned PR beside a stale publishable stage.
+        self.store.finalise_publication(task.id, pr_number=pull.number, pr_url=pull.url)
         notes.append(f"created PR #{pull.number} referencing #{task.issue_number}")
         self.log.info(
             "pull_request_created",
@@ -1595,6 +1598,20 @@ class Orchestrator:
         if task.pr_number is not None:
             # Ownership already recorded, so there is nothing to publish. A task left
             # in needs_attention for an unrelated reason is NOT silently cleared.
+            #
+            # Self-heal: an owned PR means publication *succeeded*, so any surviving
+            # publishable stage is provably stale. That combination could be written by
+            # the pre-atomic finalisation below (record the PR, crash before clearing
+            # the stage), and without this repair it would persist forever — the early
+            # return here is exactly what stopped it from ever being cleared, and
+            # `describe_task` reads the stage before the PR, so the Issue comment would
+            # report "Recovering publication" for finished work indefinitely.
+            if task.has_publishable_stage:
+                self.store.clear_recovery_stage(task.id)
+                return [
+                    f"cleared a stale recovery stage ({task.recovery_stage}): PR "
+                    f"#{task.pr_number} is already owned, so publication had completed"
+                ]
             return []
 
         result = self._recover_publish_only(task)
