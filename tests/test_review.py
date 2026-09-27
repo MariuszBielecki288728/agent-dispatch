@@ -3314,6 +3314,174 @@ class FinalPromptBoundaryTests(ReviewCase):
             "the guard must measure exactly the required text the builder joins",
         )
 
+    def test_the_built_instruction_emits_every_required_section_exactly_once(self) -> None:
+        """The builder's ACTUAL output, not just the shared helper.
+
+        The earlier version of this check compared `required_instruction_overflow()` with
+        `required_instruction_sections()` directly, so both sides called the same function
+        and agreed even when `build_review_instruction()` appended extra required text
+        afterwards. That is exactly how a duplicate `Requirements:` block slipped in: the
+        guard counted the shared set once while the builder emitted it twice, reopening a
+        ~1.1k window in which a round is claimed and then cannot be built.
+
+        So this builds the real instruction and asserts on it: each required section
+        appears exactly once, and the closing instruction is last.
+        """
+        from agent_dispatch.review import (
+            build_review_instruction,
+            required_instruction_sections,
+            review_expectations,
+        )
+
+        self._near_full_scenario()
+        _, worst_case_diff = self._bloated_instruction_sections()
+        task = self.task_row()
+        repository = self._repo_config()
+        client = self.live_client()
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+        self.assertTrue(feedback.complete)
+        new_items = feedback.new_items(parse_cursor(task.feedback_cursor))
+
+        instruction, _ = build_review_instruction(
+            repo=repository,
+            issue=client.open_issue(self.slug, 1),
+            task=task,
+            round_number=1,
+            pull=client.get_pull(self.slug, PR_NUMBER),
+            feedback=feedback,
+            previous_cursor=parse_cursor(task.feedback_cursor),
+            diff=worst_case_diff,
+            worktree_path=str(task.worktree_path),
+        )
+
+        # Every REQUIRED section appears exactly once. Counted by membership rather than
+        # by position, so an accidental duplicate is caught wherever it lands.
+        shared = required_instruction_sections(
+            repo=repository,
+            issue=client.open_issue(self.slug, 1),
+            task=task,
+            round_number=1,
+            pull=client.get_pull(self.slug, PR_NUMBER),
+            new_items=new_items,
+            expectations=review_expectations(new_items=new_items, diff_available=True),
+            notes=[],
+        )
+        for _, text in shared:
+            self.assertEqual(
+                instruction.count(text),
+                1,
+                "each required section must be emitted exactly once — a second copy is "
+                "required text the pre-claim guard never measured",
+            )
+
+        # And the prompt still ends by asking for the summary, which the duplicated
+        # append had also broken by pushing optional sections after it.
+        self.assertTrue(
+            instruction.rstrip().endswith(shared[-1][1].rstrip()),
+            "the closing instruction must be last, after every optional section",
+        )
+
+    def test_a_near_boundary_required_set_still_builds(self) -> None:
+        """The window the duplicate reopened: required set under the bound, build must fit.
+
+        A second `Requirements:` block is ~1.1k characters of required text. A required
+        set anywhere in the ~1.1k below the bound therefore passed the guard and then
+        failed to build. This asserts the structural consequence directly: a required set
+        that the guard measures as fitting is a set the builder can actually assemble.
+        """
+        import agent_dispatch.review as review_module
+
+        self._near_full_scenario()
+        _, worst_case_diff = self._bloated_instruction_sections()
+        repository = self._repo_config()
+        client = self.live_client()
+        issue = client.open_issue(self.slug, 1)
+        pull = client.get_pull(self.slug, PR_NUMBER)
+
+        from agent_dispatch.review import (
+            FEEDBACK_TOTAL_LIMIT,
+            required_instruction_sections,
+            requirements_section,
+            review_expectations,
+        )
+
+        def required_size() -> int:
+            fresh = self.task_row()
+            live = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+            items = live.new_items(parse_cursor(fresh.feedback_cursor))
+            sections = required_instruction_sections(
+                repo=repository,
+                issue=issue,
+                task=fresh,
+                round_number=1,
+                pull=pull,
+                new_items=items,
+                expectations=review_expectations(new_items=items, diff_available=True),
+                notes=[],
+            )
+            return len("\n\n".join(text for _, text in sections))
+
+        # The width a second `Requirements:` block used to add, measured rather than
+        # hard-coded so the fixture tracks the real text.
+        expectations = review_expectations(new_items=[], diff_available=True)
+        duplicate_width = len(requirements_section(expectations)) + 2
+
+        # Top the fixture up so the required set lands INSIDE the window: close enough to
+        # the bound that a second required section would have pushed it over. A hand-tuned
+        # constant would silently fall out of a <1.2k window when any section text changes,
+        # leaving a test that still passes while covering nothing.
+        target = FEEDBACK_TOTAL_LIMIT - 50
+        deficit = target - required_size()
+        self.assertGreater(
+            deficit,
+            duplicate_width,
+            "the near-full fixture must start below the window, to have room to enter it",
+        )
+        self.add_comment(
+            "Filler: " + ("z" * max(1, deficit - 400)),
+            comment_id=3000,
+            created_at="2026-04-01T10:00:00Z",
+        )
+
+        size = required_size()
+        self.assertLessEqual(size, FEEDBACK_TOTAL_LIMIT, "the fixture must fit the bound")
+        self.assertGreater(
+            size + duplicate_width,
+            FEEDBACK_TOTAL_LIMIT,
+            "the fixture must sit INSIDE the window: fitting now, but overflowed by a "
+            "second required section — otherwise this test covers nothing",
+        )
+
+        task = self.task_row()
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+        previous = parse_cursor(task.feedback_cursor)
+
+        overflow = review_module.required_instruction_overflow(
+            repo=repository,
+            issue=issue,
+            task=task,
+            round_number=1,
+            pull=pull,
+            feedback=feedback,
+            previous_cursor=previous,
+        )
+        self.assertIsNone(overflow, "this fixture must fit the required bound")
+
+        # The guard said it fits, so building it must not raise. Before the fix the
+        # builder added ~1.1k more required text and `fit_instruction` raised here.
+        instruction, _ = review_module.build_review_instruction(
+            repo=repository,
+            issue=issue,
+            task=task,
+            round_number=1,
+            pull=pull,
+            feedback=feedback,
+            previous_cursor=previous,
+            diff=worst_case_diff,
+            worktree_path=str(task.worktree_path),
+        )
+        self.assertLessEqual(len(instruction), review_module.FEEDBACK_TOTAL_LIMIT)
+
     def test_optional_sections_are_dropped_whole_never_the_feedback(self) -> None:
         """With the feedback near the bound, the optional framing gives way instead.
 

@@ -971,29 +971,38 @@ def build_review_instruction(
     # `required_instruction_sections`, which is the same function the pre-claim guard
     # measures — if the two were assembled separately, the guard could pass a handoff the
     # builder then refuses, leaving a claimed round that can never run.
-    sections: list[tuple[str | None, str]] = [
-        *required_instruction_sections(
-            repo=repo,
-            issue=issue,
-            task=task,
-            round_number=round_number,
-            pull=pull,
-            new_items=new_items,
-            expectations=review_expectations(
-                new_items=new_items, diff_available=diff.available, ambiguous=ambiguous
-            ),
-            notes=notes,
+    shared = required_instruction_sections(
+        repo=repo,
+        issue=issue,
+        task=task,
+        round_number=round_number,
+        pull=pull,
+        new_items=new_items,
+        expectations=review_expectations(
+            new_items=new_items, diff_available=diff.available, ambiguous=ambiguous
         ),
-    ]
-    # The diff goes immediately after the metadata and before the untrusted framing, which
-    # is where a reader expects it; it is droppable, so it is inserted rather than being
-    # part of the required list.
-    sections.insert(2, ("diff", _diff_section(diff, branch=task.branch or "(unknown)")))
-    # The requirements text was appended by `required_instruction_sections`; the closing
-    # summary instruction is part of that list too, so nothing further is added here.
+        notes=notes,
+    )
+    # The interleaving below depends on the shared list's shape, so it is asserted rather
+    # than assumed: the closing instruction is LAST, and the requirements block is the one
+    # before it. A change to the shared list then fails loudly here instead of silently
+    # reordering the prompt or — as happened once — letting a second required section be
+    # appended after the guard had already counted the set.
+    if len(shared) < 2 or shared[-1][0] is not None:
+        raise ValueError("the shared required sections must end with the closing instruction")
+    closing = shared[-1:]
+    head = list(shared[:-1])
+
+    # The diff belongs right after the metadata and before the untrusted-text warning,
+    # which is where a reader expects it. It is droppable, so it is interleaved here rather
+    # than being part of the required list.
+    head.insert(2, ("diff", _diff_section(diff, branch=task.branch or "(unknown)")))
 
     if context_items:
-        sections.append(
+        # Earlier feedback is background for the new requests, so it sits between them and
+        # the behavioural requirements — immediately before the last head section.
+        head.insert(
+            len(head) - 1,
             (
                 "context",
                 f"{UNTRUSTED_BEGIN}\n# Earlier feedback, already dealt with "
@@ -1003,19 +1012,11 @@ def build_review_instruction(
                 "already made. If one of these items is still unresolved in the current code, say "
                 "so in your summary.\n\n"
                 f"{_render_items(_trim_context(context_items, notes), notes)}\n{UNTRUSTED_END}",
-            )
+            ),
         )
 
-    # ONE source of truth for the requirements text, shared with the pre-claim size guard so
-    # the guard counts exactly what is emitted here. Duplicating the list would let the two
-    # drift, which is the claim-vs-required mismatch the guard exists to prevent.
-    expectations = review_expectations(
-        new_items=new_items, diff_available=diff.available, ambiguous=ambiguous
-    )
-    sections.append((None, requirements_section(expectations)))
-
     if agents_text:
-        sections.append(
+        head.append(
             (
                 "agents",
                 f"The repository's own instructions ({repo.agents_file}) follow. Follow them for "
@@ -1025,7 +1026,9 @@ def build_review_instruction(
             )
         )
 
-    return fit_instruction(sections, notes), notes
+    # The closing instruction goes back last, after every optional section, so the prompt
+    # still ends by asking for the summary.
+    return fit_instruction([*head, *closing], notes), notes
 
 
 def fit_instruction(sections: list[tuple[str | None, str]], notes: list[str]) -> str:

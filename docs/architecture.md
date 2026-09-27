@@ -611,6 +611,15 @@ requirements list and the new-feedback block, because a guard that measures text
 builder never produces is checking the wrong number — which is how both this mismatch and
 the earlier section-versus-instruction mismatch arose.
 
+Sharing the function is necessary but **not sufficient**: the builder must add no further
+*required* text of its own. Anything appended after the shared call is emitted without
+being measured, so it reopens the very window the sharing closed — a second
+`Requirements:` block did exactly that. The builder therefore interleaves only *droppable*
+sections (the diff, the earlier context, `AGENTS.md`) and asserts the shared list's shape
+before doing so: the closing instruction must be last, and the requirements block must be
+the one immediately before it. A change to the shared list then fails loudly at the build
+instead of silently reordering the prompt or emitting a section the guard never counted.
+
 **The whole-prompt bound gives up whole sections; it never slices.** Measuring only the
 new-feedback section is not sufficient on its own, because the assembled instruction is
 bounded too — and a character cut at that bound can land *inside* the new-feedback block,

@@ -1142,7 +1142,7 @@ a mock. The cases most worth knowing about:
 | `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
 | `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
-| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating; feedback that fits only *without* the framing defers before anything is claimed, and the guard's measurement equals what the builder joins |
+| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard's measurement equals what the builder joins, and the built instruction emits each required section exactly once with the closing instruction last |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
