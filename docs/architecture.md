@@ -589,13 +589,27 @@ the restart parked as `review_snapshot_unreproducible` although no maintainer fe
 changed. One predicate now feeds both the claimed snapshot and the post-publication
 acknowledgement, so the two cannot diverge.
 
-**Delivery is proven before anything is claimed.** Claiming acknowledges every new item, so
-an item that cannot fit the bounded instruction must not be claimed at all. Otherwise the
-model never sees the request while publication marks it handled forever — silent feedback
-loss that a "the section was truncated" note does not repair. So `evaluate()` measures the
-rendered new set against the bound and **defers** the handoff when it overflows, and the
-new-feedback render never slices whole items out. Per-item *body* truncation remains, since
-that is the declared representation of one very long comment.
+**Delivery is proven before anything is claimed, and the proof covers the required-only
+instruction.** Claiming acknowledges every new item, so anything that cannot be delivered
+must not be claimed at all. Otherwise the model never sees the request while publication
+marks it handled forever — silent feedback loss that a "the section was truncated" note
+does not repair.
+
+The quantity that matters is **not** the feedback block on its own. The required framing —
+the untrusted-text warning, session/repo metadata, the behavioural requirements, the
+closing instruction — is roughly 1.8k characters and can never be dropped, so a block that
+fits its own bound can still leave the required set over it. Admitting that handoff is
+worse than deferring it: the round is *durably claimed* and the builder then refuses to
+build it, so the error escapes after the claim, a restart finds the same claimed round, and
+it fails again — a deterministic crash/re-drive loop for a perfectly valid batch, with no
+model call and no acknowledgement ever produced.
+
+So `required_instruction_overflow()` and `build_review_instruction()` share one
+`required_instruction_sections()` function: the guard measures exactly the text the builder
+will join, and the guard runs *before* the claim. The same sharing was applied to the
+requirements list and the new-feedback block, because a guard that measures text the
+builder never produces is checking the wrong number — which is how both this mismatch and
+the earlier section-versus-instruction mismatch arose.
 
 **The whole-prompt bound gives up whole sections; it never slices.** Measuring only the
 new-feedback section is not sufficient on its own, because the assembled instruction is
@@ -606,8 +620,10 @@ diff and `AGENTS.md` contents are not yet assembled, so any reserve is a guess t
 enough diff could defeat. So `fit_instruction()` tags each section as required (the
 framing, the new feedback, the behavioural requirements) or droppable (the diff summary,
 earlier acknowledged context, the repository's `AGENTS.md`), and drops droppable sections
-**whole**, disclosure included, until the join fits. Reaching the bound with only required
-sections left raises, because that means the pre-claim guard and this assembly disagree.
+**whole**, disclosure included, until the join fits. A required-only set that still exceeds
+the bound raises rather than truncating — and that branch is deliberately **not** marked
+`pragma: no cover`, because the guard above is what makes it unreachable and marking it
+unreachable is what hid the previous mismatch.
 
 | What | May be dropped? | Why |
 |---|---|---|

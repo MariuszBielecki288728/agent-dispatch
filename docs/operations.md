@@ -1142,7 +1142,7 @@ a mock. The cases most worth knowing about:
 | `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
 | `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
-| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating |
+| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating; feedback that fits only *without* the framing defers before anything is claimed, and the guard's measurement equals what the builder joins |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
@@ -1249,7 +1249,7 @@ poll. Nothing is lost and you do not have to re-add a label you already added:
 | **No new feedback** since the last round | Deferred. Add your comments and the same still-present label starts the round on the next poll. |
 | The task is **paused**, or `take-it` was removed | Deferred. Both are reversible: `unpause`, or re-add `take-it`, and the kept handoff resumes on the next poll. |
 | The feedback listing was incomplete, or the PR could not be read | Deferred and retried. Claiming from a partial read would acknowledge feedback the model never saw. |
-| The **new feedback does not fit** the bounded instruction | Deferred. Claiming acknowledges every new item, so the ones past the bound would be marked handled without ever reaching the model. Split the batch or shorten the longest comments and the same still-present label starts the round on the next poll — nothing has been acknowledged meanwhile. |
+| The **new feedback does not fit** the bounded instruction | Deferred. Claiming acknowledges every new item, so the ones past the bound would be marked handled without ever reaching the model. Split the batch or shorten the longest comments and the same still-present label starts the round on the next poll — nothing has been acknowledged meanwhile. The check covers the whole *required* instruction, not just the feedback block, so a batch that fits alone but not alongside the fixed framing is deferred too rather than claimed and then failing to build. |
 
 ### When a handoff is refused
 

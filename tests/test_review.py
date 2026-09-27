@@ -3187,6 +3187,133 @@ class FinalPromptBoundaryTests(ReviewCase):
             "the final prompt must never be character-sliced",
         )
 
+    def _required_set_overflows_scenario(self) -> None:
+        """Feedback that fits its OWN bound but not together with the required framing.
+
+        The boundary round 7 named, and the reason the guard has to measure the
+        required-only instruction rather than the feedback block: the required framing is
+        ~1.8k characters that can never be dropped, so a block just under the bound leaves
+        the required set just over it. Thirteen full-size items plus a *shorter* fourteenth
+        lands the block at ~59.4k — under the bound, so a feedback-only guard would admit
+        it — while the framing pushes the required set past 60k.
+        """
+        self.first_run()
+        self.hand_off()
+        for index in range(13):
+            self.add_comment(
+                f"Request {index}: " + ("x" * 4000),
+                comment_id=1000 + index,
+                created_at=f"2026-02-{index + 1:02d}T10:00:00Z",
+            )
+        # The shorter item is what tunes the block into the reachable window.
+        self.add_comment(
+            "Request 13: " + ("y" * 2800),
+            comment_id=2000,
+            created_at="2026-03-01T10:00:00Z",
+        )
+        self.review_scenario()
+
+    def test_feedback_that_fits_but_framing_does_not_defers_before_claiming(self) -> None:
+        """The claim gate must prove the same bound the builder enforces.
+
+        Before the shared required-section measurement this sequence claimed the round,
+        then `build_review_instruction()` raised `ValueError` with no handler, so the
+        error escaped the worker/CLI *after the durable claim*. A restart found the same
+        claimed round and hit the same error: a deterministic crash/re-drive loop for a
+        perfectly valid batch, with no model call and no acknowledgement ever produced.
+
+        Asserted as that harm: the handoff stays unclaimed and unacknowledged, and no
+        exception escapes.
+        """
+        from agent_dispatch.review import FEEDBACK_TOTAL_LIMIT, new_feedback_block
+
+        self._required_set_overflows_scenario()
+        task = self.task_row()
+        client = self.live_client()
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+        self.assertTrue(feedback.complete)
+
+        # The precondition the reviewer named: the block alone fits, so a feedback-only
+        # guard would have admitted this handoff.
+        block = new_feedback_block(feedback.new_items(parse_cursor(task.feedback_cursor)), [])
+        self.assertLessEqual(
+            len(block),
+            FEEDBACK_TOTAL_LIMIT,
+            "the fixture must sit in the reachable window: block under the bound",
+        )
+
+        calls_before = self.runtime_calls()
+        result = self.run_cli("review")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(
+            "required instruction sections exceed",
+            result.stdout + result.stderr,
+            "the builder must never raise after a claim: the guard must refuse first",
+        )
+        self.assertEqual(self.rounds(), [], "no round may be claimed for an undeliverable batch")
+        self.assertEqual(self.runtime_calls(), calls_before, "and no model call is spent")
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+        self.assertIsNone(
+            self.store().open_round(task.id),
+            "no round may be left open, or a restart re-drives the same failure",
+        )
+        self.assertTrue(
+            self.task_row().handoff_claimable,
+            "a deferral keeps the handoff, so it starts once the batch is split",
+        )
+
+    def test_the_required_measurement_matches_what_the_builder_enforces(self) -> None:
+        """The two must agree, or the guard is checking a number the builder ignores.
+
+        Asserted directly on the shared functions: the guard's measurement and the
+        builder's required-only join are the same text, so a future change to one cannot
+        silently reopen the claim-vs-required mismatch.
+        """
+        from agent_dispatch.review import (
+            FEEDBACK_TOTAL_LIMIT,
+            required_instruction_overflow,
+            required_instruction_sections,
+            review_expectations,
+        )
+
+        self._required_set_overflows_scenario()
+        task = self.task_row()
+        repository = self._repo_config()
+        client = self.live_client()
+        pull = client.get_pull(self.slug, PR_NUMBER)
+        issue = client.open_issue(self.slug, 1)
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+
+        overflow = required_instruction_overflow(
+            repo=repository,
+            issue=issue,
+            task=task,
+            round_number=task.review_round + 1,
+            pull=pull,
+            feedback=feedback,
+            previous_cursor=parse_cursor(task.feedback_cursor),
+        )
+
+        self.assertIsNotNone(overflow, "this fixture must be measured as overflowing")
+        new_items = feedback.new_items(parse_cursor(task.feedback_cursor))
+        sections = required_instruction_sections(
+            repo=repository,
+            issue=issue,
+            task=task,
+            round_number=task.review_round + 1,
+            pull=pull,
+            new_items=new_items,
+            expectations=review_expectations(new_items=new_items, diff_available=True),
+            notes=[],
+        )
+        joined = "\n\n".join(text for _, text in sections)
+        self.assertEqual(
+            len(joined) - FEEDBACK_TOTAL_LIMIT,
+            overflow,
+            "the guard must measure exactly the required text the builder joins",
+        )
+
     def test_optional_sections_are_dropped_whole_never_the_feedback(self) -> None:
         """With the feedback near the bound, the optional framing gives way instead.
 
