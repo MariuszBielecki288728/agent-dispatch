@@ -450,6 +450,15 @@ class ReviewCase(ExecutionCase):
             config, store, GitHubClient(config.github.command), Logger(fmt="text", stream=stream)
         )
 
+    def live_client(self):
+        """A GitHubClient wired to the fake wrapper, for direct reads in a test."""
+        from agent_dispatch.config import load_config
+        from agent_dispatch.github import GitHubClient
+
+        config = load_config(self.world.config_path)
+        os.environ["FAKE_GH_WORLD"] = str(self.world.world_path)
+        return GitHubClient(config.github.command)
+
     def run_all_reconcile_passes(self, store) -> None:
         """One poll's worth of the automatic passes, in the worker's real order.
 
@@ -3063,6 +3072,159 @@ class OversizedFeedbackIsNeverSilentlyAcknowledgedTests(ReviewCase):
             new_feedback_overflow(FeedbackSet(items=items(self.FITTING_ITEMS)), {}),
             "a set that fits must not be refused, or the guard is 'refuse everything'",
         )
+
+
+class FinalPromptBoundaryTests(ReviewCase):
+    """Every claimed item must survive the FINAL instruction, not just its own section.
+
+    The round-5 guard measured the new-feedback section in isolation, but the assembled
+    instruction was still sliced at the same bound — so a section that fit by itself
+    could be cut by the outer truncation once metadata, diff and framing were added, and
+    the cursor would still acknowledge the items that never reached the model. Same
+    invariant as round 5, one level higher.
+
+    These tests assert at the exact string the runtime is given (`-p` in the recorded
+    argv), because that is the only place the whole instruction is observable. A guard
+    that checks an intermediate value cannot catch a later slice.
+    """
+
+    #: Items at the per-item cap whose block lands just UNDER the section bound, so the
+    #: section passes its own guard while the assembled instruction does not fit. Thirteen
+    #: renders 55,742 characters against a 60,000 bound; fourteen exceeds it and is
+    #: deferred, which is the round-5 guard doing its job.
+    NEARLY_FULL_ITEMS = 13
+
+    def _near_full_scenario(self):
+        """A claimed round whose new feedback very nearly fills the bound on its own."""
+        self.first_run()
+        self.hand_off()
+        for index in range(self.NEARLY_FULL_ITEMS):
+            self.add_comment(
+                f"Request {index}: " + ("x" * 4000),
+                comment_id=1000 + index,
+                created_at=f"2026-02-{index + 1:02d}T10:00:00Z",
+            )
+        self.review_scenario()
+
+    def _bloated_instruction_sections(self):
+        """The real section list, with the optional parts inflated to realistic maxima.
+
+        Built by calling the real builder with a large diff rather than by reaching into
+        its internals, so the test measures the assembled instruction the runtime is
+        actually given. The diff is capped at 40 files and 12 stat lines, and `AGENTS.md`
+        at 8,000 characters, so this is the worst case the code can produce — and the
+        worst case is what the invariant has to survive.
+        """
+        from agent_dispatch.review import (
+            DiffContext,
+            build_review_instruction,
+        )
+
+        diff = DiffContext(
+            commits=[f"{'a' * 8} {'b' * 60}" for _ in range(40)],
+            files=[f"path/{'f' * 80}.py" for _ in range(40)],
+            stat="\n".join([" " * 20 + "|" + " " * 60 for _ in range(12)]),
+            available=True,
+        )
+        return build_review_instruction, diff
+
+    def test_the_instruction_is_never_sliced_through_new_feedback(self) -> None:
+        """The exact `-p` string contains every claimed item, or nothing is claimed.
+
+        Driven through the real builder with a worst-case diff, because the assembled
+        instruction is the only place the whole-prompt bound is observable: a check on an
+        intermediate value cannot catch a later slice, which is exactly how the round-5
+        guard came to be satisfied while the prompt was still cut.
+        """
+        self._near_full_scenario()
+        build, worst_case_diff = self._bloated_instruction_sections()
+        task = self.task_row()
+        repository = self._repo_config()
+        client = self.live_client()
+        pull = client.get_pull(self.slug, PR_NUMBER)
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+        self.assertTrue(feedback.complete)
+
+        instruction, notes = build(
+            repo=repository,
+            issue=client.open_issue(self.slug, 1),
+            task=task,
+            round_number=1,
+            pull=pull,
+            feedback=feedback,
+            previous_cursor=parse_cursor(task.feedback_cursor),
+            diff=worst_case_diff,
+            worktree_path=str(task.worktree_path),
+        )
+
+        from agent_dispatch.review import FEEDBACK_TOTAL_LIMIT
+
+        claimed_keys = set(parse_cursor(serialise_cursor(feedback.cursor())))
+        self.assertTrue(claimed_keys, "the fixture must have feedback to deliver")
+        instruction_keys = {
+            key for key in claimed_keys if f"#issuecomment-{key.split(':', 1)[1]}" in instruction
+        }
+        # The harm, asserted as the harm and asserted FIRST: not "the string is short"
+        # but "these specific items would be acknowledged without ever reaching the
+        # model". With the outer slice restored this loses exactly one item, so a
+        # length-based assertion cannot satisfy it by coincidence — and putting it
+        # first means a failure reports the real consequence rather than the symptom.
+        self.assertEqual(
+            claimed_keys - instruction_keys,
+            set(),
+            "the cursor would acknowledge feedback the model was never given",
+        )
+        self.assertLessEqual(
+            len(instruction),
+            FEEDBACK_TOTAL_LIMIT,
+            "the assembled instruction must respect the bound without slicing",
+        )
+        # The optional sections are what give way, and that must be disclosed.
+        self.assertTrue(notes, "dropping optional sections must be reported in the notes")
+        self.assertNotIn(
+            "instruction truncated by the dispatcher",
+            instruction,
+            "the final prompt must never be character-sliced",
+        )
+
+    def test_optional_sections_are_dropped_whole_never_the_feedback(self) -> None:
+        """With the feedback near the bound, the optional framing gives way instead.
+
+        This is the positive half: a round still runs, and the way the prompt shrinks is
+        by losing whole optional sections — never by cutting into the required block.
+        """
+        from agent_dispatch.review import FEEDBACK_TOTAL_LIMIT, fit_instruction
+
+        block = "REQUIRED-FEEDBACK-BLOCK-" + ("y" * (FEEDBACK_TOTAL_LIMIT - 100))
+        sections = [
+            (None, "framing"),
+            ("diff", "d" * 50_000),
+            (None, block),
+            ("context", "c" * 50_000),
+            ("agents", "a" * 50_000),
+        ]
+        notes: list[str] = []
+
+        text = fit_instruction(sections, notes)
+
+        self.assertLessEqual(len(text), FEEDBACK_TOTAL_LIMIT, "the bound must still hold")
+        self.assertIn(block, text, "the required feedback block must survive whole")
+        self.assertIn("framing", text, "required framing must survive")
+        self.assertNotIn("d" * 50_000, text, "the oversized diff must be the thing dropped")
+        self.assertTrue(notes, "dropping sections must be disclosed in the notes")
+
+    def test_required_sections_overflowing_is_an_error_not_a_silent_cut(self) -> None:
+        """A required set past the bound is a bug, so it raises instead of truncating.
+
+        Unreachable through the claim path — the pre-claim guard refuses first — but if
+        the guard and the assembly ever disagree, silently truncating is exactly the
+        failure this whole sequence of fixes has been removing.
+        """
+        from agent_dispatch.review import FEEDBACK_TOTAL_LIMIT, fit_instruction
+
+        sections = [(None, "z" * (FEEDBACK_TOTAL_LIMIT + 1000))]
+        with self.assertRaises(ValueError):
+            fit_instruction(sections, [])
 
 
 class SnapshotReproductionTests(ReviewCase):

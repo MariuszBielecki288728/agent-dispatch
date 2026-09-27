@@ -597,11 +597,24 @@ rendered new set against the bound and **defers** the handoff when it overflows,
 new-feedback render never slices whole items out. Per-item *body* truncation remains, since
 that is the declared representation of one very long comment.
 
+**The whole-prompt bound gives up whole sections; it never slices.** Measuring only the
+new-feedback section is not sufficient on its own, because the assembled instruction is
+bounded too — and a character cut at that bound can land *inside* the new-feedback block,
+dropping items the cursor still acknowledges. This is the same silent-acknowledgement bug
+one level higher, and a reserve for framing cannot close it either: at claim time the exact
+diff and `AGENTS.md` contents are not yet assembled, so any reserve is a guess that a large
+enough diff could defeat. So `fit_instruction()` tags each section as required (the
+framing, the new feedback, the behavioural requirements) or droppable (the diff summary,
+earlier acknowledged context, the repository's `AGENTS.md`), and drops droppable sections
+**whole**, disclosure included, until the join fits. Reaching the bound with only required
+sections left raises, because that means the pre-claim guard and this assembly disagree.
+
 | What | May be dropped? | Why |
 |---|---|---|
 | A **new** item, whole | Never — the handoff defers instead | It would be acknowledged without being delivered |
 | A new item's **body**, beyond the per-item cap | Yes, and disclosed | The declared representation of a very long comment |
 | An already-acknowledged **context** item | Yes, summarised to a count | It was delivered and acknowledged in an earlier round |
+| The **diff** summary, or `AGENTS.md` | Yes, whole section, disclosed | A hint the agent can re-read from the worktree; `AGENTS.md` describes *how* to work, not *what* was asked |
 
 Deferring rather than refusing is deliberate: the label stays in place, so the round starts
 by itself once the maintainer splits the batch or shortens the longest comments. Nothing

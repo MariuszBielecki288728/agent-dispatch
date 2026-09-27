@@ -1142,6 +1142,7 @@ a mock. The cases most worth knowing about:
 | `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
 | `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
+| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
@@ -1404,6 +1405,15 @@ A single very long comment is still capped per item, with the truncation stated 
 instruction itself: that is the declared representation of one enormous comment, and the
 model is told it is seeing a truncated view. What never happens is a whole comment
 vanishing from the prompt while its version enters the cursor.
+
+The bound applies to the **whole instruction**, not only to the feedback section, and it is
+respected by giving up whole optional sections — the diff summary, earlier acknowledged
+context, and `AGENTS.md` — rather than by cutting the text at a character offset. A
+character cut is what made this rule vacuous once already: it could land inside the
+new-feedback block, so items the cursor acknowledged were never rendered. Losing the diff
+summary costs nothing (the agent can read the worktree) and losing `AGENTS.md` changes
+*how* the agent works, not *what* it was asked; dropping either is disclosed in the
+instruction's notes.
 
 ### What the agent is asked to do
 
