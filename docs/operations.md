@@ -1140,6 +1140,8 @@ a mock. The cases most worth knowing about:
 | `ReviewHandoffCrashTests` | a failed label removal cannot start a second round; a claimed-but-unstarted round is re-driven; a round from a dead process is parked with no new model call; a restart after publication leaves exactly one applied round with the same PR and cursor |
 | `FinalisationAtomicityTests` | the handover is one SQLite transaction (asserted on the statement trace), and a failure inside it rolls back every coupled fact |
 | `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
+| `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
+| `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
@@ -1246,6 +1248,7 @@ poll. Nothing is lost and you do not have to re-add a label you already added:
 | **No new feedback** since the last round | Deferred. Add your comments and the same still-present label starts the round on the next poll. |
 | The task is **paused**, or `take-it` was removed | Deferred. Both are reversible: `unpause`, or re-add `take-it`, and the kept handoff resumes on the next poll. |
 | The feedback listing was incomplete, or the PR could not be read | Deferred and retried. Claiming from a partial read would acknowledge feedback the model never saw. |
+| The **new feedback does not fit** the bounded instruction | Deferred. Claiming acknowledges every new item, so the ones past the bound would be marked handled without ever reaching the model. Split the batch or shorten the longest comments and the same still-present label starts the round on the next poll — nothing has been acknowledged meanwhile. |
 
 ### When a handoff is refused
 
@@ -1365,6 +1368,15 @@ of running when:
 All three park with no model call, and the feedback stays unacknowledged either way.
 The message names the reason and the action (`--release`).
 
+The snapshot covers **feedback only**. The dispatcher's own status comment (§13's single
+comment, edited in place) is excluded from the claimed snapshot, because it is outbound
+status rather than review text and is excluded from the model input for the same reason.
+That distinction is load-bearing rather than cosmetic: a round's status comment is
+rewritten to `Applying feedback` right after the claim and may be rewritten again by the
+heartbeat, so if it were part of the snapshot a crash mid-round would make the
+dispatcher's *own* write look like feedback edited after the claim — and the restarted
+round would park as unreproducible although nothing a maintainer wrote had changed.
+
 A re-driven round re-checks its **pull request** as well, immediately before the model
 is spawned. A round can be re-driven hours after it was claimed — a crash restart, or
 an explicit `--retry-round` — and in that window the PR can be merged, closed, or stop
@@ -1375,6 +1387,23 @@ so it is the one most likely to be aimed at a PR that has since become unusable.
 Failure means **zero runtime calls**, an unacknowledged cursor, and a parked round — the
 `review --retry-round` command then exits non-zero, which is the honest report: you
 asked for the round to be retried and it was not.
+
+### Nothing is acknowledged that was not delivered
+
+A round's acknowledgement cursor is a promise that the model actually received each
+item. Two rules keep that promise, and both matter because a very long comment can
+otherwise become invisible:
+
+* a **new** item is never dropped. If the whole new set does not fit the bounded
+  instruction, the handoff is *deferred* rather than claimed (see the deferral table
+  above), so nothing is acknowledged until everything can be delivered;
+* an **already-acknowledged** item may be summarised away, because it was delivered and
+  acknowledged in an earlier round.
+
+A single very long comment is still capped per item, with the truncation stated in the
+instruction itself: that is the declared representation of one enormous comment, and the
+model is told it is seeing a truncated view. What never happens is a whole comment
+vanishing from the prompt while its version enters the cursor.
 
 ### What the agent is asked to do
 

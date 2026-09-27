@@ -572,6 +572,41 @@ The exact-PR check itself runs **twice** around the push — once before, once a
 - *After*: the same predicate re-applied, to catch the PR changing state while our own
   push was in flight. It is the same rule, not a second one.
 
+### Nothing is acknowledged that was not delivered (#5)
+
+The round's purpose is that the model *receives* feedback, and the acknowledgement cursor
+is a promise that it did. Two invariants keep that promise honest, and both were violated
+in the same way — a value asserted about feedback the model never saw:
+
+**The cursor covers feedback only.** `FeedbackSet.cursor()` excludes
+`PROVENANCE_DISPATCHER` items, because this service's own status comment (#17) is
+outbound status, not review text. It is excluded from the model input for that reason, so
+including it in the snapshot would assert something about a comment the model was never
+given. The reachable consequence was concrete: the round's status comment is edited to
+`Applying feedback` immediately after the claim and may be edited again by the heartbeat,
+so a crash mid-round made the dispatcher's own write look like *post-claim feedback* and
+the restart parked as `review_snapshot_unreproducible` although no maintainer feedback had
+changed. One predicate now feeds both the claimed snapshot and the post-publication
+acknowledgement, so the two cannot diverge.
+
+**Delivery is proven before anything is claimed.** Claiming acknowledges every new item, so
+an item that cannot fit the bounded instruction must not be claimed at all. Otherwise the
+model never sees the request while publication marks it handled forever — silent feedback
+loss that a "the section was truncated" note does not repair. So `evaluate()` measures the
+rendered new set against the bound and **defers** the handoff when it overflows, and the
+new-feedback render never slices whole items out. Per-item *body* truncation remains, since
+that is the declared representation of one very long comment.
+
+| What | May be dropped? | Why |
+|---|---|---|
+| A **new** item, whole | Never — the handoff defers instead | It would be acknowledged without being delivered |
+| A new item's **body**, beyond the per-item cap | Yes, and disclosed | The declared representation of a very long comment |
+| An already-acknowledged **context** item | Yes, summarised to a count | It was delivered and acknowledged in an earlier round |
+
+Deferring rather than refusing is deliberate: the label stays in place, so the round starts
+by itself once the maintainer splits the batch or shortens the longest comments. Nothing
+has been acknowledged in the meantime, so no feedback can be lost by waiting.
+
 ### One boundary, one read (#5)
 
 Every PR check reads the pull request exactly once and judges **that** object. The rule

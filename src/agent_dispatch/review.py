@@ -90,8 +90,12 @@ FEEDBACK_BODY_LIMIT = 4000
 FEEDBACK_TOTAL_LIMIT = 60000
 
 #: When the snapshot is longer than this, the *oldest* already-answered items are
-#: summarised to a count instead of being listed individually. New feedback is never
-#: trimmed: it is the thing the round exists for.
+#: summarised to a count instead of being listed individually.
+#:
+#: Only **context** is ever dropped this way. New feedback is never omitted: an item the
+#: model did not receive cannot be acknowledged, so a handoff whose new feedback does not
+#: fit the bounded instruction is deferred rather than claimed — see
+#: :func:`new_feedback_overflow` and :data:`Reason.FEEDBACK_TOO_LARGE`.
 CONTEXT_ITEM_LIMIT = 20
 
 #: Feedback kinds, used as cursor key prefixes and for reporting.
@@ -143,6 +147,10 @@ class Reason:
     PR_NOT_OPEN = "pr_not_open"
     PR_FOREIGN = "pr_not_owned_by_this_task"
     FEEDBACK_INCOMPLETE = "feedback_listing_incomplete"
+    #: The new feedback is larger than the bounded instruction can carry, so claiming it
+    #: would acknowledge items the model was never shown. Deferrable: the maintainer can
+    #: split or shorten the request, and a DEFER keeps the label so it starts once it fits.
+    FEEDBACK_TOO_LARGE = "new_feedback_exceeds_instruction_bound"
     NO_NEW_FEEDBACK = "no_new_feedback"
     NO_SESSION = "session_not_resumable"
     WORKTREE_UNOWNED = "worktree_not_owned"
@@ -165,6 +173,7 @@ DEFERRABLE_REASONS = frozenset(
         Reason.PUBLICATION_PENDING,
         Reason.PR_UNREADABLE,
         Reason.FEEDBACK_INCOMPLETE,
+        Reason.FEEDBACK_TOO_LARGE,
         Reason.NO_NEW_FEEDBACK,
         Reason.DIFF_UNAVAILABLE,
     }
@@ -222,15 +231,32 @@ class FeedbackSet:
     problems: list[str] = field(default_factory=list)
 
     def cursor(self) -> dict[str, str]:
-        """Every observed item's id -> version: the acknowledgement after a round.
+        """The acknowledgement cursor: every **feedback** item's id -> version.
 
-        Deliberately covers **all** observed items, not only the new ones. A round
+        Deliberately covers all observed *feedback*, not only the new subset. A round
         whose model turn ran has seen the whole current conversation (the new items as
         requests, the older ones as context), so acknowledging all of it is truthful —
-        and it keeps an old item from being re-delivered merely because it was not
-        part of the new subset.
+        and it keeps an old item from being re-delivered merely because it was not part
+        of the new subset.
+
+        It deliberately **excludes** this service's own status comments. Those are
+        outbound status/provenance (#17), not review feedback, and they are excluded
+        from the model input for exactly that reason — so including them here would make
+        the durable snapshot assert something about a comment the model was never given.
+        It is also a correctness bug, not just a tidiness one: a round's status comment
+        is edited to `Applying feedback` right after the claim and may be edited again by
+        the heartbeat, so a crash mid-round would make the dispatcher's own status write
+        look like "claimed feedback edited after the claim" and the restarted round would
+        be parked as unreproducible although no maintainer feedback changed.
+
+        This is the one source of truth for both the claimed snapshot and the
+        acknowledgement after publication, so the two cannot drift.
         """
-        return {item.key: item.version for item in self.items}
+        return {
+            item.key: item.version
+            for item in self.items
+            if item.provenance != PROVENANCE_DISPATCHER
+        }
 
     def dispatcher_items(self) -> list[FeedbackItem]:
         return [item for item in self.items if item.provenance == PROVENANCE_DISPATCHER]
@@ -750,6 +776,26 @@ class ReviewLoop:
                 feedback=feedback,
             )
 
+        # A handoff may not claim more than the instruction can actually deliver.
+        # Claiming acknowledges **every** new item, so an item that does not fit would be
+        # marked handled without ever reaching the model — silent feedback loss, and the
+        # note admitting a truncation does not repair it. Deferring keeps the label in
+        # place, so the round starts by itself once the request fits.
+        overflow = new_feedback_overflow(feedback, previous)
+        if overflow is not None:
+            return HandoffDecision(
+                HandoffAction.DEFER,
+                Reason.FEEDBACK_TOO_LARGE,
+                f"the new feedback renders {overflow} characters past the instruction bound "
+                f"({FEEDBACK_TOTAL_LIMIT}), so claiming it would acknowledge comments the "
+                "round cannot deliver. Split the handoff into smaller batches (or shorten "
+                "the longest comments) and the round starts on the next poll; nothing has "
+                "been acknowledged in the meantime.",
+                task_ref=ref,
+                pr_number=pull.number,
+                feedback=feedback,
+            )
+
         # --- resumability: the gate that must not be papered over -------------
         session = self.store.resumable_session(task.id)
         if not session:
@@ -928,7 +974,10 @@ def build_review_instruction(
         "not do it — report the conflict in your final summary instead."
     )
 
-    body = _render_items(new_items, notes)
+    # `allow_slice=False`: every new item must appear, because the claimed cursor
+    # acknowledges every one of them. `evaluate()` refuses the handoff outright when the
+    # new feedback cannot fit, so by the time this runs the whole set is known to fit.
+    body = _render_items(new_items, notes, allow_slice=False)
     if not body:
         # Unreachable through the normal path (a claim requires new feedback), but a
         # silent empty instruction would be worse than an explicit one.
@@ -1022,7 +1071,19 @@ def _diff_section(diff: DiffContext, *, branch: str) -> str:
     )
 
 
-def _render_items(items: list[FeedbackItem], notes: list[str]) -> str:
+def _render_items(items: list[FeedbackItem], notes: list[str], *, allow_slice: bool = True) -> str:
+    """Render feedback items, per-item bounded, optionally slice-bounded as a whole.
+
+    ``allow_slice=False`` is the load-bearing case for **new** feedback: every item must
+    appear, because the claimed cursor acknowledges every item. Dropping whole items
+    behind an aggregate slice is silent feedback loss — the model never sees them, and
+    publication then marks them handled forever. So the caller that renders new feedback
+    passes ``False`` and relies on the explicit size check in
+    :func:`build_review_instruction` instead of on a slice here.
+
+    Context items keep the slice: they are already acknowledged, so omitting them loses
+    nothing, and they are the right thing to give up when a prompt must shrink.
+    """
     blocks: list[str] = []
     for item in items:
         body = item.body.strip()
@@ -1056,10 +1117,33 @@ def _render_items(items: list[FeedbackItem], notes: list[str]) -> str:
         lines.append(body)
         blocks.append("\n".join(lines))
     rendered = "\n\n".join(blocks)
-    if len(rendered) > FEEDBACK_TOTAL_LIMIT:
+    if allow_slice and len(rendered) > FEEDBACK_TOTAL_LIMIT:
         rendered = rendered[:FEEDBACK_TOTAL_LIMIT]
         notes.append("the feedback section was truncated to the configured bound")
     return rendered
+
+
+def new_feedback_overflow(feedback: FeedbackSet, previous_cursor: dict[str, str]) -> int | None:
+    """How many characters the rendered new feedback exceeds its bound by, or ``None``.
+
+    The fail-closed guard for the handoff, and the reason it exists: claiming a round
+    acknowledges **every** new item, so an item that does not fit in the instruction must
+    not be claimed at all. The alternative is silent feedback loss — the model never sees
+    the request while publication marks it handled forever, and the note saying "the
+    section was truncated" does not repair that.
+
+    Per-item *body* truncation is fine, because that is the declared representation of a
+    very long comment. Whole items disappearing behind an aggregate slice is not.
+
+    Measured on the rendered new-feedback section, which is the thing that has to fit;
+    the section's budget is :data:`FEEDBACK_TOTAL_LIMIT`, the same bound
+    :func:`_render_items` applies to the feedback section as a whole.
+    """
+    notes: list[str] = []
+    rendered = _render_items(feedback.new_items(previous_cursor), notes, allow_slice=False)
+    if len(rendered) <= FEEDBACK_TOTAL_LIMIT:
+        return None
+    return len(rendered) - FEEDBACK_TOTAL_LIMIT
 
 
 def _trim_context(items: list[FeedbackItem], notes: list[str]) -> list[FeedbackItem]:
@@ -1161,6 +1245,7 @@ __all__ = [
     "comment_item",
     "inline_item",
     "load_diff",
+    "new_feedback_overflow",
     "open_round_states",
     "parse_cursor",
     "review_item",

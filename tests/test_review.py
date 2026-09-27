@@ -52,6 +52,7 @@ SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 from agent_dispatch.review import (  # noqa: E402
+    KIND_CONVERSATION,
     collect_feedback,
     parse_cursor,
     serialise_cursor,
@@ -2818,6 +2819,250 @@ class RetryOfCompletedTurnIsPublicationOnlyTests(ReviewCase):
             "an unstarted round's retry is meant to run the model once",
         )
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+
+
+class StatusCommentIsNotFeedbackTests(ReviewCase):
+    """The dispatcher's own status comment is never part of the feedback contract (#5/#17).
+
+    It is outbound status/provenance, so it is excluded from the model input — and it
+    must therefore also be excluded from the durable acknowledgement snapshot. Including
+    it was a real crash bug rather than a tidiness one: the round's own status comment is
+    edited to `Applying feedback` immediately after the claim and may be edited again by
+    the heartbeat, so a crash mid-round made the dispatcher's own write look like
+    "claimed feedback edited after the claim" and the restart refused to re-drive although
+    no maintainer feedback had changed.
+
+    The sequence below is the real one — a genuine #17 comment, a genuine claim, and the
+    status edit that actually happens — rather than a synthetic cursor, because a
+    synthetic one cannot show whether the production path puts the comment in the cursor.
+    """
+
+    def _claimed_round_with_status_comment(self):
+        """Own a status comment, claim a round, then edit the comment as a round does."""
+        self.first_run()
+        self.assertEqual(len(self.status_comments()), 1, "the implementation owns a status comment")
+        self.hand_off()
+        self.add_comment("Please rework the helper.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        return store, task, claimed, cursor
+
+    def _edit_status_comment_like_a_round_would(self) -> None:
+        """Rewrite the owned status comment exactly as `begin_review`/heartbeat do.
+
+        Done through the fake world rather than the publisher so the edit is guaranteed
+        to have happened before the restart is simulated; the point under test is the
+        snapshot check, not the publisher's transport.
+        """
+        world = self.current_world()
+        repo = world["repos"][self.slug]
+        edited = False
+        for record in repo.get("comments", []):
+            if "agent-dispatch:status" in str(record.get("body", "")):
+                record["body"] = "<!-- agent-dispatch:status -->\n**Status:** Applying feedback"
+                record["updated_at"] = "2026-05-01T00:00:00Z"
+                edited = True
+        self.assertTrue(edited, "the fixture must actually edit the owned status comment")
+        self.world.world = world
+        self.world.write_world()
+
+    def test_the_status_comment_is_not_in_the_claimed_cursor(self) -> None:
+        """The contract, asserted directly: no dispatcher item is ever acknowledged."""
+        _, _, claimed, cursor = self._claimed_round_with_status_comment()
+        keys = parse_cursor(claimed.cursor)
+
+        status_keys = [
+            str(record["id"])
+            for record in self.status_comments()
+            if "agent-dispatch:status" in str(record.get("body", ""))
+        ]
+        self.assertTrue(status_keys, "there is a status comment to exclude")
+        for key in status_keys:
+            self.assertNotIn(
+                key,
+                keys,
+                "the dispatcher's own status comment must not be claimed as feedback",
+            )
+        self.assertEqual(
+            set(keys),
+            set(parse_cursor(cursor)),
+            "the claimed snapshot is exactly the maintainer feedback",
+        )
+
+    def test_a_status_edit_after_the_claim_still_reproduces_the_snapshot(self) -> None:
+        """The crash case: the round is re-drivable even though its own status changed."""
+        store, task, claimed, _ = self._claimed_round_with_status_comment()
+        self._edit_status_comment_like_a_round_would()
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        self.assertNotEqual(
+            self.runtime_calls(),
+            calls_before,
+            "the round must re-drive: no maintainer feedback changed",
+        )
+        self.assertEqual(
+            self.rounds()[0].state,
+            ROUND_PUBLISHED,
+            "the round must not be parked for the dispatcher's own status write",
+        )
+
+    def test_editing_real_feedback_still_refuses_the_restart(self) -> None:
+        """The negative control, so the exclusion is not "the check stopped working"."""
+        store, task, claimed, _ = self._claimed_round_with_status_comment()
+        self._edit_status_comment_like_a_round_would()
+
+        def edit_the_real_feedback() -> None:
+            world = self.current_world()
+            for record in world["repos"][self.slug].get("comments", []):
+                if record.get("body") == "Please rework the helper.":
+                    record["body"] = "Please rework the helper. (Scope changed.)"
+                    record["updated_at"] = "2026-05-02T00:00:00Z"
+            self.world.world = world
+            self.world.write_world()
+
+        edit_the_real_feedback()
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "maintainer feedback edited after the claim must still refuse to run",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertIsNone(self.task_row().feedback_cursor)
+
+
+class OversizedFeedbackIsNeverSilentlyAcknowledgedTests(ReviewCase):
+    """A handoff may not claim more than the instruction can deliver (#5).
+
+    Claiming acknowledges **every** new item, so an item that never fits in the bounded
+    instruction must not be claimed at all. Otherwise the model never sees the request
+    while publication marks it handled forever — silent feedback loss, which the note
+    admitting a truncation does not repair.
+
+    The feedback is genuinely oversized rather than the bound being patched down: the
+    bound is read inside the `review` subprocess, so a monkeypatch in the test process
+    would not reach the code under test, and a test that only appeared to lower it would
+    assert nothing. One rendered item is ~4.3k characters (its metadata plus the 4k body
+    cap), so fifteen exceed the 60k bound while two comfortably fit.
+    """
+
+    #: Items whose rendered size exceeds the real bound, and a count that fits it.
+    OVERFLOWING_ITEMS = 15
+    FITTING_ITEMS = 2
+
+    def _scenario(self, *, comments: int):
+        """An owned PR carrying `comments` large maintainer comments, fully readable."""
+        self.first_run()
+        self.hand_off()
+        for index in range(comments):
+            # Each body is at the per-item cap, so the rendered size is dominated by the
+            # item itself and the fixture cannot accidentally fit or accidentally
+            # overflow through the metadata.
+            self.add_comment(
+                f"Request {index}: " + ("x" * 4000),
+                comment_id=1000 + index,
+                created_at=f"2026-02-{index + 1:02d}T10:00:00Z",
+            )
+        self.review_scenario()
+
+    def test_oversized_new_feedback_defers_instead_of_claiming(self) -> None:
+        """No round is claimed, nothing is acknowledged, and the label stays put."""
+        self._scenario(comments=self.OVERFLOWING_ITEMS)
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "no model call may be spent on feedback the round cannot carry",
+        )
+        self.assertEqual(self.rounds(), [], "no round may be claimed")
+        self.assertIsNone(
+            self.task_row().feedback_cursor,
+            "nothing may be acknowledged: the model never saw these requests",
+        )
+        self.assertTrue(
+            self.task_row().handoff_claimable,
+            "a deferral keeps the handoff, so it starts by itself once the batch fits",
+        )
+
+    def test_a_claimable_batch_delivers_every_acknowledged_item(self) -> None:
+        """The positive control and the invariant: cursor items == delivered items.
+
+        Without this, a guard that refused every handoff would satisfy the test above
+        while breaking the feature. It also pins the shape the review asked for: every
+        item present in the claimed cursor actually appears in the model instruction.
+        """
+        self._scenario(comments=self.FITTING_ITEMS)
+        calls_before = self.runtime_calls()
+
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        self.assertEqual(self.runtime_calls(), calls_before + 1, "a fitting handoff must run")
+        rounds = self.rounds()
+        self.assertEqual(len(rounds), 1)
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+
+        argv = self.recorded_argv()[-1]
+        instruction = argv[argv.index("-p") + 1]
+        claimed_keys = set(parse_cursor(rounds[0].cursor))
+        self.assertEqual(len(claimed_keys), self.FITTING_ITEMS, "both items are claimed")
+        for key in claimed_keys:
+            comment_id = key.split(":", 1)[1]
+            self.assertIn(
+                f"#issuecomment-{comment_id}",
+                instruction,
+                f"claimed item {key} must actually appear in the instruction",
+            )
+
+    def test_the_overflow_guard_refuses_rather_than_slicing(self) -> None:
+        """A slice would drop whole items; the guard must report overflow instead.
+
+        Asserted on the helper directly, because this is the decision the whole fix
+        turns on and it must not depend on the render path's slicing behaviour.
+        """
+        from agent_dispatch.review import FeedbackItem, FeedbackSet, new_feedback_overflow
+
+        def items(count: int) -> list:
+            return [
+                FeedbackItem(
+                    key=f"conversation:{1000 + index}",
+                    kind=KIND_CONVERSATION,
+                    id=1000 + index,
+                    version="v1",
+                    author="maintainer",
+                    body="y" * 4000,
+                    url="",
+                )
+                for index in range(count)
+            ]
+
+        overflow = new_feedback_overflow(FeedbackSet(items=items(self.OVERFLOWING_ITEMS)), {})
+        self.assertIsNotNone(overflow, "an oversized set must be reported as overflowing")
+        assert overflow is not None
+        self.assertGreater(overflow, 0, "the overflow is reported as a positive excess")
+        self.assertIsNone(
+            new_feedback_overflow(FeedbackSet(items=items(self.FITTING_ITEMS)), {}),
+            "a set that fits must not be refused, or the guard is 'refuse everything'",
+        )
 
 
 class SnapshotReproductionTests(ReviewCase):

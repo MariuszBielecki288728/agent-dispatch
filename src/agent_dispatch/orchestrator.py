@@ -1982,7 +1982,13 @@ class Orchestrator:
                 worktree_path=decision.worktree_path,
                 session_id=decision.session_id,
                 cursor_json=cursor_json,
-                snapshot_json=serialise_cursor({item.key: item.version for item in feedback.items}),
+                # The snapshot is `feedback.cursor()` — the same non-dispatcher view the
+                # acknowledgement uses — rather than a second comprehension over
+                # `feedback.items`. Two expressions for one invariant is how the two
+                # would drift; and including this service's own status comment here would
+                # make a #17 status write look like post-claim feedback when the round is
+                # re-driven.
+                snapshot_json=serialise_cursor(feedback.cursor()),
             )
         except ValueError as exc:
             # Lost the claim race (another process claimed first). Not an error: the
