@@ -1306,6 +1306,32 @@ bring it back on its own; choose `review --retry-round` after restoring the pull
 request, or `review --release` to drop the round and let the next handoff carry the
 same feedback.
 
+### Retrying a parked round: the model runs only if it never ran
+
+`review --retry-round` re-opens the parked round and preserves its claimed snapshot. What
+it does *next* depends on one question — **had the model turn already completed?** — and
+the round's state records the answer, so the command never has to guess:
+
+| Round state when parked | What the turn did | What `--retry-round` does |
+|---|---|---|
+| `publication_blocked` | Completed cleanly; only the push/PR was blocked | **Publication only.** The committed changes are pushed and the round is finalised, with **zero** further model calls. |
+| `interrupted` | Never started, or was cut off mid-turn | Runs the turn once, which is the maintainer deliberately asking for it. |
+| `failed` | Failed | Runs the turn once. |
+
+The middle column is the part that matters, and it is the reason the two parked states are
+kept apart rather than collapsed into one "needs a human". Once a resumed Command Code turn
+has completed cleanly, a later publication failure must stay publish-only: re-running the
+model would spend a second turn answering feedback the first turn already answered, which
+is precisely the guarantee #5 exists to enforce. Encoding the distinction in the state is
+what makes the rule structural — `reopen_round` routes on it, and the round that comes back
+as `publish_pending` goes straight to publication recovery rather than to a spawn.
+
+This is also why the status comment distinguishes them: a `publish_pending` round heals on
+the next pass, so it says the dispatcher will finish the push, while a blocked round names
+`review --retry-round` and says explicitly that no second model run is involved. A message
+that promised "a later pass" for a blocked round would leave a maintainer waiting forever
+for a poll that was never going to act.
+
 ### One boundary, one read
 
 Each PR check reads the pull request exactly once and judges **that** object. This is a

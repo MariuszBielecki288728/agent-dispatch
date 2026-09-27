@@ -75,6 +75,7 @@ from .store import (
     OPEN_ROUND_STATES,
     ROUND_FAILED,
     ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
     Store,
     Task,
 )
@@ -1124,7 +1125,7 @@ def load_diff(
 
 
 #: States in which a review round needs a decision from the poll loop.
-PENDING_ROUND_STATES = frozenset({ROUND_FAILED, ROUND_INTERRUPTED})
+PENDING_ROUND_STATES = frozenset({ROUND_FAILED, ROUND_INTERRUPTED, ROUND_PUBLICATION_BLOCKED})
 
 
 def round_needs_attention(round_row) -> bool:

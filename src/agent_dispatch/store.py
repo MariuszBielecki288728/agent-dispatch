@@ -106,6 +106,22 @@ ROUND_PUBLISH_PENDING = "publish_pending"
 ROUND_PUBLISHED = "published"
 ROUND_FAILED = "failed"
 ROUND_INTERRUPTED = "interrupted"
+#: The model turn completed cleanly and only publication remains, but the exact pull
+#: request is **structurally** unusable (closed, merged, or no longer provably ours), so
+#: no automatic retry can finish the job.
+#:
+#: Kept distinct from ``interrupted`` because the two demand opposite responses to the
+#: same maintainer command. An ``interrupted`` round may not have a completed turn
+#: behind it, so retrying it may legitimately spend one; a ``publication_blocked`` round
+#: has already been paid for, and retrying it must be **publication-only**. Collapsing
+#: them made `--retry-round` spawn a second model turn on feedback the first turn had
+#: already answered — the precise outcome the zero-extra-runtime rule of #5 exists to
+#: forbid. Encoding the difference in the state is what makes that structural rather
+#: than something each call site has to remember:
+#: :meth:`Store.reopen_round` routes by it, and
+#: :meth:`~agent_dispatch.orchestrator.Orchestrator._reconcile_one_round` sends the
+#: resulting ``publish_pending`` round to publication recovery, never to a spawn.
+ROUND_PUBLICATION_BLOCKED = "publication_blocked"
 #: A round a maintainer explicitly gave up on. Terminal *for that round*: it is no
 #: longer unresolved, so a fresh handoff can be claimed, but its feedback was never
 #: acknowledged — the cursor was not advanced — so the same feedback is carried again
@@ -119,27 +135,42 @@ ROUND_STATES = (
     ROUND_PUBLISHED,
     ROUND_FAILED,
     ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
     ROUND_RELEASED,
 )
 
 #: The states a maintainer must resolve by hand. Named for that purpose rather than
 #: reusing ``UNRESOLVED_ROUND_STATES``, so a future addition to the latter cannot
 #: silently widen what counts as "parked for a human".
-STATES_NEEDING_ATTENTION = frozenset({ROUND_FAILED, ROUND_INTERRUPTED})
+STATES_NEEDING_ATTENTION = frozenset({ROUND_FAILED, ROUND_INTERRUPTED, ROUND_PUBLICATION_BLOCKED})
 
 #: A round that has been claimed but not finally published. At most one of these
 #: may exist per task at a time, which is what makes "one round at most" structural.
 OPEN_ROUND_STATES = frozenset({ROUND_CLAIMED, ROUND_RUNNING, ROUND_PUBLISH_PENDING})
 
 #: Round states in which a model turn has already been paid for.
-STARTED_ROUND_STATES = frozenset({ROUND_RUNNING, ROUND_PUBLISH_PENDING})
+STARTED_ROUND_STATES = frozenset({ROUND_RUNNING, ROUND_PUBLISH_PENDING, ROUND_PUBLICATION_BLOCKED})
+
+#: Round states whose model turn has **completed cleanly**. A round in one of these has
+#: nothing left to run: whatever remains is a commit, a push or a pull request. Named
+#: as its own set because "a turn was paid for" and "a turn finished" are different
+#: facts, and only the second one makes a further model call forbidden rather than a
+#: deliberate choice.
+COMPLETED_ROUND_STATES = frozenset({ROUND_PUBLISH_PENDING, ROUND_PUBLICATION_BLOCKED})
 
 #: Round states that still require a decision from the review pass. Anything else
 #: (``published``, ``released``) means the round is settled: for ``published`` the task
 #: is back to being an ordinary ``awaiting_review`` task, and for ``released`` a fresh
 #: explicit handoff is what moves it forward.
 UNRESOLVED_ROUND_STATES = frozenset(
-    {ROUND_CLAIMED, ROUND_RUNNING, ROUND_PUBLISH_PENDING, ROUND_FAILED, ROUND_INTERRUPTED}
+    {
+        ROUND_CLAIMED,
+        ROUND_RUNNING,
+        ROUND_PUBLISH_PENDING,
+        ROUND_FAILED,
+        ROUND_INTERRUPTED,
+        ROUND_PUBLICATION_BLOCKED,
+    }
 )
 
 #: ``recovery_stage`` values a *review* round can park with. Kept in the same space
@@ -1712,7 +1743,9 @@ class Store:
             (state, stage, note, utcnow_iso(), round_id),
         )
 
-    def park_round_outside_publication(self, round_id: int, task_id: int, note: str) -> None:
+    def park_round_outside_publication(
+        self, round_id: int, task_id: int, note: str, *, turn_completed: bool
+    ) -> None:
         """Park a round as unfinished and retire the stale stage it left on its task.
 
         Two writes that belong together, so they are issued together rather than as a
@@ -1738,18 +1771,39 @@ class Store:
         alone: it is evidence for a different repair, and a round has no business
         discarding it.
 
+        **The parked state preserves which side of the model boundary the round
+        reached.** A round whose turn completed cleanly is parked
+        ``publication_blocked``; anything else is parked ``interrupted``. Both need a
+        human, but they need *opposite* things from that human: retrying a completed
+        round must be publication-only, while retrying an unfinished one may legitimately
+        spend a turn. Recording the distinction here is what lets :meth:`reopen_round`
+        act correctly without having to reconstruct the answer later.
+
+        ``turn_completed`` is required rather than inferred, because the caller is the
+        only thing that knows and the durable state is not always enough on its own: the
+        ``no recorded PR`` park happens while the round still reads ``running`` (its turn
+        is over, but publication had not started far enough to mark it), so a purely
+        state-derived answer would be wrong for exactly that path. The two are combined
+        rather than chosen between — an explicit ``False`` is overridden by a state that
+        has already recorded completion, because a round that reached
+        ``publish_pending`` cannot *un*-reach it.
+
         **One transaction, not two autocommitted statements.** The connection runs with
         ``isolation_level=None``, so statements commit individually unless they are
-        wrapped; a crash between them would leave the round already ``interrupted``
-        (so no automatic publication retry) while the task row still carried the old
+        wrapped; a crash between them would leave the round already parked (so no
+        automatic publication retry) while the task row still carried the old
         publication phase and stage — the half-applied state this method exists to
         prevent. Living in one method is not atomicity; sharing one transaction is.
         """
+        current = self.review_round_by_id(round_id)
+        already_completed = current is not None and current.state in COMPLETED_ROUND_STATES
+        completed = turn_completed or already_completed
+        parked_state = ROUND_PUBLICATION_BLOCKED if completed else ROUND_INTERRUPTED
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = ?, "
                 "finished_at = ? WHERE id = ?",
-                (ROUND_INTERRUPTED, note, utcnow_iso(), round_id),
+                (parked_state, note, utcnow_iso(), round_id),
             )
             # `CASE` rather than `= NULL`: only this round's own stage is stale. An
             # implementation stage is another repair's evidence and survives untouched.
@@ -1846,6 +1900,18 @@ class Store:
                 (note, now, task_id),
             )
 
+    def review_round_by_id(self, round_id: int) -> ReviewRound | None:
+        """A round row by primary key, or ``None``.
+
+        Needed because the park decision depends on the round's *current* state — was
+        the model turn completed? — and the caller holding the id may not have a fresh
+        row. Reading it here keeps that decision inside the write that depends on it.
+        """
+        if not self._table_present("review_rounds"):
+            return None
+        row = self._conn.execute("SELECT * FROM review_rounds WHERE id = ?", (round_id,)).fetchone()
+        return _row_to_review_round(row) if row is not None else None
+
     def reopen_round(self, task_id: int, round_id: int, *, note: str) -> None:
         """Re-open a parked round for one more attempt, keeping its claimed snapshot.
 
@@ -1853,13 +1919,30 @@ class Store:
         feedback retried rather than a fresh handoff. The snapshot is preserved, so the
         retried round carries exactly the feedback it was claimed with — nothing that
         arrived since.
+
+        **The destination depends on whether the model turn already completed**, and
+        that is a correctness rule rather than a convenience:
+
+        * a round whose turn completed cleanly goes back to ``publish_pending``, because
+          the only thing left is committing, pushing and confirming the pull request.
+          Re-entering ``claimed`` here would send the round back through
+          `_execute_review_round` and spawn a second model turn on feedback the first
+          one already answered — the zero-extra-runtime guarantee #5 exists to enforce;
+        * a round that never started, or was interrupted mid-turn, returns to
+          ``claimed`` so the deliberate human choice to spend a turn is honoured.
+
+        Reading the *current* state is what makes this safe to call after any park,
+        rather than requiring each caller to know which kind of park happened.
         """
         now = utcnow_iso()
+        current = self.review_round_by_id(round_id)
+        completed = current is not None and current.state in COMPLETED_ROUND_STATES
+        target = ROUND_PUBLISH_PENDING if completed else ROUND_CLAIMED
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = NULL, "
                 "finished_at = NULL WHERE id = ?",
-                (ROUND_CLAIMED, round_id),
+                (target, round_id),
             )
             conn.execute(
                 "UPDATE tasks SET phase = 'awaiting_review', recovery_stage = NULL, "

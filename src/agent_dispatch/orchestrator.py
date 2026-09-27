@@ -86,6 +86,7 @@ from .store import (
     ROUND_CLAIMED,
     ROUND_FAILED,
     ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
     ROUND_PUBLISH_PENDING,
     ROUND_PUBLISHED,
     ROUND_RELEASED,
@@ -1451,13 +1452,20 @@ class Orchestrator:
         # stops it being retried; clearing the task's own *round* stage is hygiene, so
         # `_task_round_stage` cannot mirror a stale reason onto a later attempt. An
         # implementation stage is deliberately preserved — that is another repair's
-        # evidence. Both writes are in one method so no caller can half-apply them.
+        # evidence. Both writes are in one store method so no caller can half-apply
+        # them.
+        #
+        # `turn_completed=True`: this method is only reached while *publishing*, so the
+        # model turn is behind us. Saying so is what makes `--retry-round` resume the
+        # publication instead of spawning a second model turn against the same feedback.
         self.store.park_round_outside_publication(
             round_id,
             task.id,
             detail + ". Reopening the pull request does not change this by itself: use "
-            "`review --retry-round` after restoring it, or `review --release` to drop "
-            "this round and let the next handoff carry the same feedback again.",
+            "`review --retry-round` to finish publishing this round, or "
+            "`review --release` to drop it and let the next handoff carry the same "
+            "feedback again.",
+            turn_completed=True,
         )
         return DispatchOutcome(
             action=OUTCOME_NEEDS_ATTENTION,
@@ -2263,13 +2271,14 @@ class Orchestrator:
         # "cannot tell" is not evidence that the PR is fine.
         pull, pr_problem = self._require_live_round_pull(repo, task, round_row.pr_number)
         if pr_problem is not None:
-            # No model call. The round is parked with the feedback unacknowledged, so the
-            # maintainer can release it (`review --release`) or re-run it
-            # (`review --retry-round`) once the pull request can be acted on again.
+            # No model call, and none is owed: this gate runs *before* the spawn, so the
+            # round is parked as unfinished and the documented `review --retry-round` may
+            # legitimately start the turn once the pull request is usable again.
             self.store.park_round_outside_publication(
                 round_row.id,
                 task.id,
                 f"review round {round_row.round} parked without a model call: {pr_problem.detail}",
+                turn_completed=False,
             )
             self._sync_after_transition(task)
             return DispatchOutcome(
@@ -2690,12 +2699,16 @@ class Orchestrator:
             # A round without a recorded PR cannot be published safely, and guessing is
             # exactly the failure this guards against. Parked the same way as the other
             # structural PR failures, so the round is not retried and no stale round
-            # stage is left on the task row.
+            # stage is left on the task row — and marked as having completed its turn,
+            # because reaching this point means the model already ran: this is the
+            # publication step, not a pre-run gate.
             detail = (
                 f"review round {round_row.round} has no recorded pull request, so there is "
                 "no PR it may publish to; refusing to create or adopt one"
             )
-            self.store.park_round_outside_publication(round_row.id, task.id, detail)
+            self.store.park_round_outside_publication(
+                round_row.id, task.id, detail, turn_completed=True
+            )
             self._sync_after_transition(task)
             return DispatchOutcome(
                 action=OUTCOME_NEEDS_ATTENTION,
@@ -3029,7 +3042,7 @@ class Orchestrator:
             outcome = self._recover_review_publication(task, repo, round_row)
             return [f"{task.ref}: {outcome}"] if outcome else []
 
-        if round_row.state in {ROUND_FAILED, ROUND_INTERRUPTED}:
+        if round_row.state in {ROUND_FAILED, ROUND_INTERRUPTED, ROUND_PUBLICATION_BLOCKED}:
             # Parked for a human by an earlier pass. Left exactly as it is, but the task
             # phase is re-asserted so the state is visible in `status` rather than
             # hidden behind an `awaiting_review` that would imply the round succeeded.

@@ -514,11 +514,39 @@ started boundary is what decides whether a failure may be retried automatically:
 | `claimed` (no turn started) | Re-drive the **same** round — same snapshot, same session. No model turn was paid for, so this costs nothing but a repeated read. |
 | `running` (a turn was in flight) | Park as `interrupted`. A turn may already have been paid for and its commits may be half-written, so **nothing** is auto-repeated; the reason is recorded and the feedback stays unacknowledged. |
 | `publish_pending` (the turn completed cleanly) | Finish the publication on a later pass with **zero** model calls, after verifying the remote tip equals the completed local tip. The round is marked published only once that matches. |
+| `publication_blocked` (the turn completed, but the PR is structurally unusable) | Parked for a human, because no automatic retry can help. **Out of** the automatic path on purpose: a closed PR does not reopen on a poll, so leaving it retryable would push to the branch every pass forever. `--retry-round` finishes the publication with zero model calls. |
 | `failed` (the turn itself failed) | Parked for a human. The snapshot stays unacknowledged, so fixing the cause and re-adding the label retries the *same* feedback rather than losing it. |
 
 A publication failure never overwrites a more specific reason: the recorded stage is
 the evidence that finished work exists, and downgrading it would make the round
 permanently unpublishable after one transient outage (§9's rule, applied to review).
+
+### One parked state is not enough: which side of the model boundary?
+
+`interrupted` and `publication_blocked` both mean "a human must decide", and it is
+tempting to collapse them. They demand **opposite** responses to the same command, so the
+distinction is load-bearing rather than descriptive:
+
+| | `interrupted` | `publication_blocked` |
+|---|---|---|
+| The model turn | never ran, or was cut off | completed cleanly |
+| `--retry-round` must | run the turn (a deliberate choice to spend one) | **push only**, never touch the model |
+| Automatic retry | none | none |
+
+Collapsing them made `--retry-round` spawn a second model turn on feedback the first turn
+had already answered — the exact outcome the zero-extra-runtime rule forbids. The state now
+records which side of the boundary the round reached, so `reopen_round` routes on durable
+evidence instead of each call site having to remember:
+
+- a `publication_blocked` round goes back to `publish_pending`, which
+  `_reconcile_one_round` sends to `_recover_review_publication()` — no spawn;
+- anything else goes back to `claimed`, which reaches `_execute_review_round()`.
+
+`turn_completed` is a **required** argument to `park_round_outside_publication` rather than
+something inferred, because the caller is the only thing that knows: the pre-spawn gate
+parks a round that never ran, while every path inside `_publish_review_round` is reached
+only *after* the turn. Inferring it from state alone would misread the
+`require_pr is None` park, which fires while the round is still `running`.
 
 ### Structural vs. transient publication failures (#5)
 

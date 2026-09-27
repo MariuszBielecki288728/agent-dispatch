@@ -67,6 +67,7 @@ from agent_dispatch.store import (  # noqa: E402
     ROUND_CLAIMED,
     ROUND_FAILED,
     ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
     ROUND_PUBLISH_PENDING,
     ROUND_PUBLISHED,
     ROUND_RELEASED,
@@ -1826,7 +1827,11 @@ class ExactPullRequestTests(ReviewCase):
         # A structural failure must NOT be left auto-retryable: a publish-pending round is
         # retried every pass, and no retry can reopen a closed PR. Left that way the
         # dispatcher would push to the branch on every poll forever.
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        #
+        # `publication_blocked`, not `interrupted`: the model turn completed cleanly, so
+        # the only thing left is a push. The distinction is what later tells
+        # `--retry-round` to resume publication instead of spending a second model turn.
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertNotEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
         self.assertEqual(self.task_row().phase, "needs_attention")
@@ -1865,7 +1870,7 @@ class ExactPullRequestTests(ReviewCase):
             pulls_before,
             "no replacement PR either",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(self.runtime_calls(), calls_before)
         self.assertIsNone(self.task_row().feedback_cursor)
 
@@ -1883,11 +1888,11 @@ class ExactPullRequestTests(ReviewCase):
                 pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}]
             ),
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
 
         # Every pass that could pick the round up again, run in the worker's order.
         self.run_all_reconcile_passes(store)
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(
             self._remote_tip(task.branch), tip_before, "a later pass must not push either"
         )
@@ -1963,7 +1968,7 @@ class ExactPullRequestTests(ReviewCase):
             tip_before,
             "a PR that is not provably ours must not be pushed to either",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(
             self.task_row().pr_number,
             PR_NUMBER,
@@ -1998,7 +2003,7 @@ class ExactPullRequestTests(ReviewCase):
         )
 
         self.assertEqual(outcome.reason, "review_pr_unknown")
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(
             len(self.current_world()["repos"][self.slug]["pulls"]),
             pulls_before,
@@ -2023,7 +2028,7 @@ class ExactPullRequestTests(ReviewCase):
         # ROUND is what enforces this: the re-drive is driven by the round's state, so
         # leaving it `publish_pending` would push to the branch on every pass forever.
         self.run_all_reconcile_passes(store)
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(self.runtime_calls(), calls_before)
         self.assertEqual(self._remote_tip(task.branch), tip_before)
         self.assertIsNone(self.task_row().feedback_cursor)
@@ -2050,7 +2055,9 @@ class ExactPullRequestTests(ReviewCase):
             snapshot_json=cursor,
         )
 
-        store.park_round_outside_publication(claimed.id, task.id, "the round was parked")
+        store.park_round_outside_publication(
+            claimed.id, task.id, "the round was parked", turn_completed=False
+        )
 
         after = self.task_row()
         self.assertEqual(
@@ -2087,7 +2094,7 @@ class ExactPullRequestTests(ReviewCase):
         # Structural, so parked for an explicit decision: a PR that stopped being ours
         # does not become ours again on the next poll, and leaving the round
         # publish-pending would push to the branch every pass forever.
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertIsNone(self.task_row().feedback_cursor)
         self.assertEqual(self.task_row().phase, "needs_attention")
 
@@ -2123,7 +2130,7 @@ class ExactPullRequestTests(ReviewCase):
             pulls_before,
             "recovery must not create a replacement pull request either",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
 
     def test_recovery_never_adopts_another_open_pr_on_the_branch(self) -> None:
@@ -2165,7 +2172,7 @@ class ExactPullRequestTests(ReviewCase):
             PR_NUMBER,
             "the task must keep its own PR number, not the replacement's",
         )
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
 
 
@@ -2330,7 +2337,9 @@ class StructuralParkAtomicityTests(ReviewCase):
         statements: list[str] = []
         store._conn.set_trace_callback(statements.append)
         try:
-            store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+            store.park_round_outside_publication(
+                claimed.id, task.id, "structurally unusable", turn_completed=True
+            )
         finally:
             store._conn.set_trace_callback(None)
 
@@ -2341,7 +2350,7 @@ class StructuralParkAtomicityTests(ReviewCase):
 
         after = self.task_row()
         assert after is not None
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(after.phase, "needs_attention")
 
     def test_a_failure_inside_the_park_rolls_the_round_back_too(self) -> None:
@@ -2361,7 +2370,9 @@ class StructuralParkAtomicityTests(ReviewCase):
         )
         try:
             with self.assertRaises(sqlite3.DatabaseError):
-                store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+                store.park_round_outside_publication(
+                    claimed.id, task.id, "structurally unusable", turn_completed=True
+                )
         finally:
             store._conn.executescript("DROP TRIGGER fail_park")
 
@@ -2376,10 +2387,12 @@ class StructuralParkAtomicityTests(ReviewCase):
         self.assertEqual(after.recovery_stage, before.recovery_stage, "stage must not move")
 
         # The retry then succeeds and moves both facts together.
-        store.park_round_outside_publication(claimed.id, task.id, "structurally unusable")
+        store.park_round_outside_publication(
+            claimed.id, task.id, "structurally unusable", turn_completed=True
+        )
         final = self.task_row()
         assert final is not None
-        self.assertEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
         self.assertEqual(final.phase, "needs_attention")
         self.assertNotIn(final.recovery_stage, ROUND_STAGES)
 
@@ -2564,6 +2577,247 @@ class UnreadablePrBeforePushTests(ReviewCase):
         self.assertNotEqual(
             self._remote_tip(task.branch), tip_before, "the retry did push the round"
         )
+
+
+class RetryOfCompletedTurnIsPublicationOnlyTests(ReviewCase):
+    """A round whose turn completed must never be re-run by `--retry-round`.
+
+    The zero-extra-runtime rule of #5: once the resumed turn completed cleanly and
+    validation passed, any later commit/push/PR failure stays publish-only. Structural
+    exact-PR parking created a hole in exactly that rule, because `interrupted` was
+    standing for three materially different situations:
+
+    1. no turn happened yet — an explicit retry may legitimately run the model;
+    2. the turn was interrupted or failed — retrying is a deliberate human choice;
+    3. the turn completed cleanly and only publication was blocked — retry must be
+       **publication-only**.
+
+    The durable state now records which side of the model boundary the round reached
+    (``publication_blocked`` versus ``interrupted``), so the routing is structural
+    rather than something each call site has to remember.
+    """
+
+    def _publish_full(self, store, task, mutate_world=None):
+        """Drive the real publication path, with genuine unpushed work present."""
+        worktree = Path(task.worktree_path)
+        (worktree / "round-work.txt").write_text("round work\n", encoding="utf-8")
+        if mutate_world is not None:
+            mutate_world()
+        repository = self._repo_config()
+        orchestrator, manager, state = self._orchestrator(store, repository, task)
+        committed, note = manager.commit_all(worktree, task.branch, "review round: apply feedback")
+        self.assertTrue(committed, note)
+        state = manager.inspect(worktree, task.branch)
+        self.assertNotEqual(
+            state.head_sha,
+            self._remote_tip(task.branch),
+            "there must be a commit that is not on the remote yet",
+        )
+        return orchestrator, orchestrator._publish_review_round(
+            task, repository, manager, state, self.rounds()[0], result=None
+        )
+
+    def _structurally_blocked_round(self, *, close_before_push: bool):
+        """A completed turn whose publication was structurally blocked.
+
+        ``close_before_push`` picks the boundary: the pre-push gate (nothing reached the
+        remote) or the post-push re-check (the completed head is already on the remote).
+        Both are reachable, and they leave different things behind, so both are pinned.
+        """
+        self.first_run()
+        store, task, claimed = self.parked_publish_pending_round()
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISH_PENDING)
+
+        def close_it() -> None:
+            if close_before_push:
+                self.mutate(
+                    pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}]
+                )
+            else:
+                # The PR is open for the pre-push gate and closed for the re-check, which
+                # is exactly the race the post-push read exists to catch. The override is
+                # keyed by read index, so this models the change of state rather than
+                # approximating it with a stub.
+                world = self.current_world()
+                world["pr_read_overrides"] = {
+                    f"{self.slug}#{PR_NUMBER}": {
+                        "2": {
+                            **self.pr(),
+                            "state": "closed",
+                            "merged_at": "2026-04-01T00:00:00Z",
+                        }
+                    }
+                }
+                self.world.world = world
+                self.world.write_world()
+
+        _, outcome = self._publish_full(store, task, mutate_world=close_it)
+        self.assertEqual(outcome.reason, "review_pr_not_open")
+        return store, task, claimed
+
+    def _repair_pr(self) -> None:
+        self.mutate(pulls=[{**self.pr(), "state": "open", "merged_at": None}])
+
+    def test_a_pre_push_structural_block_parks_as_publication_blocked(self) -> None:
+        """The state distinguishes a completed turn from an unfinished one."""
+        store, task, claimed = self._structurally_blocked_round(close_before_push=True)
+
+        self.assertEqual(
+            self.rounds()[0].state,
+            ROUND_PUBLICATION_BLOCKED,
+            "a completed turn must not be parked as merely interrupted",
+        )
+        self.assertNotEqual(self.rounds()[0].state, ROUND_INTERRUPTED)
+        self.assertIsNone(self.task_row().feedback_cursor, "nothing may be acknowledged")
+
+    def test_retry_after_a_pre_push_block_never_runs_the_model(self) -> None:
+        """Regression A: reopen the PR, `--retry-round`, zero extra runtime calls."""
+        store, task, claimed = self._structurally_blocked_round(close_before_push=True)
+        cursor_before = self.task_row().feedback_cursor
+        calls_before = self.runtime_calls()
+        tip_before = self._remote_tip(task.branch)
+        head_sha = self.rounds()[0].head_sha
+
+        self._repair_pr()
+        result = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "the turn already completed: retrying must be publication-only",
+        )
+        rounds = self.rounds()
+        self.assertEqual(len(rounds), 1, "the SAME round is finished, never duplicated")
+        self.assertEqual(rounds[0].id, claimed.id)
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+        self.assertEqual(
+            rounds[0].cursor,
+            claimed.cursor,
+            "the round keeps the snapshot it was claimed with",
+        )
+        self.assertIsNotNone(self.task_row().feedback_cursor, "the cursor advances")
+        self.assertNotEqual(self.task_row().feedback_cursor, cursor_before)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+        # The work the completed turn produced is what reached the PR.
+        self.assertNotEqual(self._remote_tip(task.branch), tip_before, "the push happened")
+        self.assertIsNotNone(head_sha)
+
+    def test_retry_after_a_post_push_block_never_runs_the_model(self) -> None:
+        """Regression B: the completed head is already remote; retry confirms it.
+
+        Distinct from the pre-push case because the push already happened, so the retry
+        must adopt the existing tip rather than produce anything new.
+        """
+        store, task, claimed = self._structurally_blocked_round(close_before_push=False)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
+        calls_before = self.runtime_calls()
+        cursor_before = self.task_row().feedback_cursor
+
+        self._repair_pr()
+        result = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before,
+            "a completed turn must never be re-run, including after the push",
+        )
+        rounds = self.rounds()
+        self.assertEqual(len(rounds), 1, "no duplicate round")
+        self.assertEqual(rounds[0].id, claimed.id)
+        self.assertEqual(rounds[0].state, ROUND_PUBLISHED)
+        self.assertEqual(self.task_row().phase, "awaiting_review")
+        self.assertNotEqual(self.task_row().feedback_cursor, cursor_before)
+
+    def test_retrying_a_blocked_round_twice_is_still_publication_only(self) -> None:
+        """A second repair-and-retry must not creep back into running the model.
+
+        The routing reads durable state, so it has to stay correct on repetition rather
+        than only on the first retry after the park.
+        """
+        store, task, claimed = self._structurally_blocked_round(close_before_push=True)
+        self._repair_pr()
+        self.assertEqual(
+            self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1").returncode,
+            0,
+        )
+        calls_after_first = self.runtime_calls()
+
+        result = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+
+        self.assertEqual(result.returncode, 1, "nothing is parked any more, so it refuses")
+        self.assertEqual(self.runtime_calls(), calls_after_first, "and runs no model")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+
+    def test_a_blocked_round_tells_the_maintainer_the_command_that_works(self) -> None:
+        """The status comment must not promise a later pass that will never come.
+
+        `publish_pending` heals on the next poll, so "the dispatcher finishes this" is
+        true there. A structurally blocked round was parked *out of* that retry path, so
+        the same wording would leave a maintainer waiting indefinitely. The two states
+        now render different next actions, and this pins the blocked one.
+        """
+        store, task, claimed = self._structurally_blocked_round(close_before_push=True)
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLICATION_BLOCKED)
+
+        self.live_orchestrator(store).sync_task_status(self.task_row())
+
+        body = self.status_body()
+        self.assertIn("review --retry-round", body, "name the command that finishes it")
+        self.assertIn("without another model run", body, "and promise no second model turn")
+        self.assertNotIn(
+            "The dispatcher finishes the push on a later pass",
+            body,
+            "a blocked round is never finished by a later pass — that is why it was parked",
+        )
+
+    def test_a_round_parked_before_its_turn_still_retries_by_running_it(self) -> None:
+        """The positive opposite case, so the fix is not "never run the model".
+
+        A round parked by the pre-spawn gate never reached the model, so an explicit
+        `--retry-round` is the maintainer deliberately asking for that turn — and it must
+        actually run.
+        """
+        self.first_run()
+        self.hand_off()
+        self.add_comment("A request.")
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        self.mutate(pulls=[{**self.pr(), "state": "closed", "merged_at": "2026-04-01T00:00:00Z"}])
+        self.review_scenario()
+        calls_before = self.runtime_calls()
+
+        # The pre-spawn gate parks it as unfinished, because the turn never happened.
+        self.assertEqual(self.run_cli("review").returncode, 0)
+        self.assertEqual(self.runtime_calls(), calls_before, "no model call while closed")
+        self.assertEqual(
+            self.rounds()[0].state,
+            ROUND_INTERRUPTED,
+            "a round that never reached the model is interrupted, not publication_blocked",
+        )
+
+        # With the PR usable again, retrying legitimately starts the turn.
+        self._repair_pr()
+        result = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.runtime_calls(),
+            calls_before + 1,
+            "an unstarted round's retry is meant to run the model once",
+        )
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
 
 
 class SnapshotReproductionTests(ReviewCase):

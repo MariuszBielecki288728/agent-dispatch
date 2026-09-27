@@ -81,6 +81,8 @@ from .store import (
     RECOVERY_INTERRUPTED,
     RECOVERY_PR_FAILED,
     RECOVERY_PUSH_FAILED,
+    ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
     StatusComment,
     Store,
     Task,
@@ -210,6 +212,24 @@ _REVIEW_UNFINISHED_NEXT_ACTION = (
     "decision is needed first."
 )
 
+#: A round parked because its exact PR is structurally unusable (closed, merged, or no
+#: longer provably this task's).
+#:
+#: Kept separate from the message above because the two make **opposite predictions**.
+#: ``publish_pending`` heals by itself on the next pass, so telling a maintainer to wait
+#: is correct there. A structurally blocked round can never heal by waiting — a closed PR
+#: does not reopen on a poll — which is exactly why it was parked out of the retry path.
+#: Promise "the dispatcher finishes this" for it and the maintainer waits indefinitely for
+#: something that will never happen, so the action names the command that actually works.
+_REVIEW_BLOCKED_NEXT_ACTION = (
+    "A review round finished its agent turn but could not be published: the pull request it "
+    "was claimed against is closed, merged, or no longer provably this task's. The feedback "
+    "stays unacknowledged, so nothing was lost. Restore or reopen that pull request, then "
+    "run `agent-dispatch review --retry-round`: the changes are already committed and will "
+    "be pushed **without another model run**. Use `review --release` instead to drop the "
+    "round and have the next handoff carry the same feedback again."
+)
+
 _FOOTER = (
     "_Status written by agent-dispatch. Review feedback belongs on the pull request; a comment "
     "here never starts agent work by itself._"
@@ -281,7 +301,25 @@ def format_elapsed(seconds: int | None) -> str | None:
     return f"{minutes} min"
 
 
-def describe_task(task: Task, *, review_pending: bool = False) -> tuple[str, str | None]:
+def _round_is_parked(round_row) -> bool:
+    """Whether an unresolved round is one a human must free, rather than one that heals.
+
+    A ``publish_pending`` round is finished by the next poll, so waiting is the right
+    advice. A round parked ``interrupted`` or ``publication_blocked`` is deliberately
+    outside the automatic retry path, so waiting would never help — the round needs
+    either `review --retry-round` or `review --release`.
+
+    Read from the state rather than passed in by each caller, because the state is the
+    durable fact and every call site that renders a comment must agree about it.
+    """
+    if round_row is None:
+        return False
+    return round_row.state in {ROUND_INTERRUPTED, ROUND_PUBLICATION_BLOCKED}
+
+
+def describe_task(
+    task: Task, *, review_pending: bool = False, review_blocked: bool = False
+) -> tuple[str, str | None]:
     """The state label and next action for a durable task row.
 
     This is the **only** place a status comment's state is derived from stored
@@ -309,6 +347,12 @@ def describe_task(task: Task, *, review_pending: bool = False) -> tuple[str, str
     feedback has not been acknowledged. Whoever knows a round is open — the round's own
     publisher, and :meth:`StatusPublisher.sync_from_task` reading the store — passes
     this so the comment says what is actually true.
+
+    ``review_blocked`` splits that case once more, because an unfinished round is not
+    always one that heals itself. A round whose exact PR is structurally unusable is
+    parked for a maintainer and will never be finished by a later pass, so it needs the
+    command rather than the reassurance. Reading it from the round's state keeps the
+    comment and the CLI from telling different stories about the same round.
     """
     if task.phase == "paused":
         if task.pause_reason == PAUSE_MAINTAINER:
@@ -323,6 +367,10 @@ def describe_task(task: Task, *, review_pending: bool = False) -> tuple[str, str
 
     if task.phase == "finished":
         return STATE_FINISHED, None
+
+    if review_blocked:
+        # Parked, not merely unfinished: no later pass will finish this one.
+        return STATE_NEEDS_ATTENTION, _REVIEW_BLOCKED_NEXT_ACTION
 
     if review_pending:
         # An unfinished review round, reported whichever phase it parked in. It is never
@@ -467,6 +515,7 @@ def task_view(
     max_attempts: int | None = None,
     interrupted: bool = False,
     review_pending: bool = False,
+    review_blocked: bool = False,
 ) -> StatusView:
     """Build the view for a task row, optionally overriding the derived state.
 
@@ -481,10 +530,14 @@ def task_view(
 
     ``review_pending`` says an unfinished review round owns this task, which stops an
     owned PR from making the comment claim ``Awaiting review`` (#5).
+    ``review_blocked`` refines it for a round parked outside the automatic retry path,
+    so the comment asks for the command instead of promising a pass that will never come.
     """
     if interrupted and not state:
         state = STATE_INTERRUPTED
-    derived_state, derived_action = describe_task(task, review_pending=review_pending)
+    derived_state, derived_action = describe_task(
+        task, review_pending=review_pending, review_blocked=review_blocked
+    )
     resolved_state = state or derived_state
     clock = now or utcnow_iso()
     started = run_started_at or (task.last_run_at if resolved_state in LIVE_STATES else None)
@@ -768,6 +821,7 @@ class StatusPublisher:
             max_attempts=self._max_attempts or None,
             interrupted=interrupted,
             review_pending=open_round is not None,
+            review_blocked=_round_is_parked(open_round),
         )
         return self._publish_and_record(view, allow_create=True)
 
