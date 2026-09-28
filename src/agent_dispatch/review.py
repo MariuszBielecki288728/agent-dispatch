@@ -162,10 +162,14 @@ class Reason:
     #: inferred from a possibly-stale local observation.
     TRIGGER_MISSING_LIVE = "trigger_label_missing_live"
     LABEL_NOT_CLEARED = "handoff_label_not_cleared"
-    DIFF_UNAVAILABLE = "diff_unavailable"
 
 
 #: Reasons that mean "wait and try again"; the label is deliberately left in place.
+#:
+#: An unreadable branch diff is deliberately NOT one of these. The round still runs — the
+#: agent has the worktree — and the instruction states that no file list could be read.
+#: That is also why the pre-claim guard measures the LONGER requirement variant: the diff
+#: is read after the claim, so the guard cannot know which variant it will get.
 DEFERRABLE_REASONS = frozenset(
     {
         Reason.RUN_IN_FLIGHT,
@@ -175,7 +179,6 @@ DEFERRABLE_REASONS = frozenset(
         Reason.FEEDBACK_INCOMPLETE,
         Reason.FEEDBACK_TOO_LARGE,
         Reason.NO_NEW_FEEDBACK,
-        Reason.DIFF_UNAVAILABLE,
     }
 )
 
@@ -1303,6 +1306,12 @@ def required_instruction_overflow(
     A handoff admitted that way is *durably claimed* and then cannot be built at all —
     a crash/re-drive loop for a perfectly valid batch, which is exactly what this prevents.
 
+    The measurement has to be an UPPER BOUND over every required set the builder can
+    produce, not only the one this round happens to produce, because the decision is made
+    before those inputs exist. Whether the branch diff could be read is the one such input,
+    and the unreadable case states an extra requirement, so that is the case measured — see
+    the comment at the call site.
+
     ``None`` means claimable. The excess is returned rather than a boolean so the refusal
     can tell the maintainer how far over they are.
     """
@@ -1314,7 +1323,16 @@ def required_instruction_overflow(
         round_number=round_number,
         pull=pull,
         new_items=new_items,
-        expectations=review_expectations(new_items=new_items, diff_available=True),
+        # Measured with the diff UNAVAILABLE, which is the strictly LONGER variant: the
+        # builder states one extra behavioural requirement when no file list could be read.
+        # This function cannot know which variant will apply — the worktree diff is loaded
+        # later, per round, and a git failure is exactly when the longer one is used — so it
+        # measures the one that covers both. That is the maximum rather than a guess:
+        # `diff_available=False` is a superset of `True` (one extra item, 156 characters),
+        # so a handoff admitted here fits whether or not the diff read succeeds. Measuring
+        # `True` under-counts by exactly that requirement and reopens the claim-vs-build
+        # window on precisely the rounds whose diff read failed.
+        expectations=review_expectations(new_items=new_items, diff_available=False),
         notes=[],
     )
     text = "\n\n".join(text for _, text in sections)

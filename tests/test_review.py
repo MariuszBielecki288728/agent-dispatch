@@ -3266,9 +3266,14 @@ class FinalPromptBoundaryTests(ReviewCase):
     def test_the_required_measurement_matches_what_the_builder_enforces(self) -> None:
         """The two must agree, or the guard is checking a number the builder ignores.
 
-        Asserted directly on the shared functions: the guard's measurement and the
-        builder's required-only join are the same text, so a future change to one cannot
-        silently reopen the claim-vs-required mismatch.
+        Asserted on the shared functions: the guard's measurement and the builder's
+        required-only join are the same text, so a future change to one cannot silently
+        reopen the claim-vs-required mismatch.
+
+        Measured against BOTH diff availabilities rather than one. The guard decides before
+        the diff is loaded, so it has to cover the variant it does not get to choose —
+        asserting equality with a single variant is what let the unreadable case go
+        uncounted.
         """
         from agent_dispatch.review import (
             FEEDBACK_TOTAL_LIMIT,
@@ -3297,22 +3302,33 @@ class FinalPromptBoundaryTests(ReviewCase):
 
         self.assertIsNotNone(overflow, "this fixture must be measured as overflowing")
         new_items = feedback.new_items(parse_cursor(task.feedback_cursor))
-        sections = required_instruction_sections(
-            repo=repository,
-            issue=issue,
-            task=task,
-            round_number=task.review_round + 1,
-            pull=pull,
-            new_items=new_items,
-            expectations=review_expectations(new_items=new_items, diff_available=True),
-            notes=[],
-        )
-        joined = "\n\n".join(text for _, text in sections)
+        joins: dict[bool, int] = {}
+        for available in (True, False):
+            sections = required_instruction_sections(
+                repo=repository,
+                issue=issue,
+                task=task,
+                round_number=task.review_round + 1,
+                pull=pull,
+                new_items=new_items,
+                expectations=review_expectations(new_items=new_items, diff_available=available),
+                notes=[],
+            )
+            joins[available] = len("\n\n".join(text for _, text in sections))
+
+        longest = max(joins.values())
         self.assertEqual(
-            len(joined) - FEEDBACK_TOTAL_LIMIT,
             overflow,
-            "the guard must measure exactly the required text the builder joins",
+            longest - FEEDBACK_TOTAL_LIMIT,
+            "the guard must measure the LONGEST required text the builder can join, not "
+            "only the variant this round happens to produce",
         )
+        for available, size in joins.items():
+            self.assertLessEqual(
+                size,
+                longest,
+                f"the guard's measurement must cover the diff_available={available} variant",
+            )
 
     def test_the_built_instruction_emits_every_required_section_exactly_once(self) -> None:
         """The builder's ACTUAL output, not just the shared helper.
@@ -3406,6 +3422,10 @@ class FinalPromptBoundaryTests(ReviewCase):
         )
 
         def required_size() -> int:
+            # Measured with the diff UNAVAILABLE, because that is the variant the pre-claim
+            # guard measures: it cannot know the diff's readability at claim time, and the
+            # unreadable case states one extra requirement. Calibrating on the other variant
+            # would put the fixture outside the bound the guard actually enforces.
             fresh = self.task_row()
             live = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
             items = live.new_items(parse_cursor(fresh.feedback_cursor))
@@ -3416,7 +3436,7 @@ class FinalPromptBoundaryTests(ReviewCase):
                 round_number=1,
                 pull=pull,
                 new_items=items,
-                expectations=review_expectations(new_items=items, diff_available=True),
+                expectations=review_expectations(new_items=items, diff_available=False),
                 notes=[],
             )
             return len("\n\n".join(text for _, text in sections))
@@ -3430,12 +3450,19 @@ class FinalPromptBoundaryTests(ReviewCase):
         # the bound that a second required section would have pushed it over. A hand-tuned
         # constant would silently fall out of a <1.2k window when any section text changes,
         # leaving a test that still passes while covering nothing.
+        #
+        # This precondition only has to leave room for the filler; WHERE the fixture lands
+        # is asserted after it, and that is what pins the window. (The worst-case variant
+        # measured above sits closer to the bound than the readable one, so demanding a
+        # whole `duplicate_width` of slack here would make the fixture's starting position,
+        # rather than its ending position, the thing under test.)
         target = FEEDBACK_TOTAL_LIMIT - 50
         deficit = target - required_size()
         self.assertGreater(
             deficit,
-            duplicate_width,
-            "the near-full fixture must start below the window, to have room to enter it",
+            400,
+            "the near-full fixture must start far enough below the target for one filler "
+            "comment to carry it into the window",
         )
         self.add_comment(
             "Filler: " + ("z" * max(1, deficit - 400)),
@@ -3444,7 +3471,11 @@ class FinalPromptBoundaryTests(ReviewCase):
         )
 
         size = required_size()
-        self.assertLessEqual(size, FEEDBACK_TOTAL_LIMIT, "the fixture must fit the bound")
+        self.assertLessEqual(
+            size,
+            FEEDBACK_TOTAL_LIMIT,
+            "the fixture must fit the bound the guard enforces (the worst-case variant)",
+        )
         self.assertGreater(
             size + duplicate_width,
             FEEDBACK_TOTAL_LIMIT,
@@ -3467,8 +3498,134 @@ class FinalPromptBoundaryTests(ReviewCase):
         )
         self.assertIsNone(overflow, "this fixture must fit the required bound")
 
-        # The guard said it fits, so building it must not raise. Before the fix the
-        # builder added ~1.1k more required text and `fit_instruction` raised here.
+        # The guard said it fits, so building it must not raise — under EITHER diff
+        # availability, because the guard's admission is a promise about both: it measured
+        # the longer (unreadable) variant, so a diff read that fails mid-round cannot turn
+        # an admitted handoff into an unbuildable one.
+        for available in (True, False):
+            diff = worst_case_diff if available else review_module.DiffContext(available=False)
+            instruction, _ = review_module.build_review_instruction(
+                repo=repository,
+                issue=issue,
+                task=task,
+                round_number=1,
+                pull=pull,
+                feedback=feedback,
+                previous_cursor=previous,
+                diff=diff,
+                worktree_path=str(task.worktree_path),
+            )
+            self.assertLessEqual(len(instruction), review_module.FEEDBACK_TOTAL_LIMIT)
+
+    def test_a_batch_that_only_fits_when_the_diff_is_readable_is_refused(self) -> None:
+        """The round-9 window: the guard must not admit what only one variant can build.
+
+        `review_expectations()` states one MORE required requirement when the diff could
+        not be read, so the required set the builder joins depends on an input the guard
+        cannot know at claim time. This lands a fixture in that 156-character band — the
+        readable variant fits, the unreadable one does not — and asserts the guard refuses
+        it, because admitting it would claim a round whose diff read may then fail and
+        leave `fit_instruction()` raising after the durable claim.
+
+        The refusal is justified rather than cautious: the same fixture built with an
+        unreadable diff genuinely raises, which is asserted here so the test cannot pass
+        merely because the guard became pessimistic.
+        """
+        import agent_dispatch.review as review_module
+
+        self._near_full_scenario()
+        _, worst_case_diff = self._bloated_instruction_sections()
+        repository = self._repo_config()
+        client = self.live_client()
+        issue = client.open_issue(self.slug, 1)
+        pull = client.get_pull(self.slug, PR_NUMBER)
+
+        from agent_dispatch.review import (
+            FEEDBACK_TOTAL_LIMIT,
+            required_instruction_sections,
+            review_expectations,
+        )
+
+        def required_size(*, available: bool) -> int:
+            fresh = self.task_row()
+            live = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+            items = live.new_items(parse_cursor(fresh.feedback_cursor))
+            sections = required_instruction_sections(
+                repo=repository,
+                issue=issue,
+                task=fresh,
+                round_number=1,
+                pull=pull,
+                new_items=items,
+                expectations=review_expectations(new_items=items, diff_available=available),
+                notes=[],
+            )
+            return len("\n\n".join(text for _, text in sections))
+
+        # Calibrate on the READABLE variant, which is the shorter one: the fixture must fit
+        # there (so the old guard would have admitted it) while the unreadable variant goes
+        # over. Sizing against the bound the WRONG way round would put the fixture outside
+        # the window and the test would assert nothing.
+        target = FEEDBACK_TOTAL_LIMIT - 25
+        deficit = target - required_size(available=True)
+        self.assertGreater(deficit, 400, "the near-full fixture must start below the target")
+        self.add_comment(
+            "Filler: " + ("z" * max(1, deficit - 400)),
+            comment_id=3000,
+            created_at="2026-04-01T10:00:00Z",
+        )
+
+        readable = required_size(available=True)
+        unreadable = required_size(available=False)
+        self.assertLessEqual(
+            readable,
+            FEEDBACK_TOTAL_LIMIT,
+            "precondition: the readable variant must fit, or the old guard would have "
+            "refused this fixture for the round-7 reason instead",
+        )
+        self.assertGreater(
+            unreadable,
+            FEEDBACK_TOTAL_LIMIT,
+            "precondition: the unreadable variant must overflow, or this test covers nothing",
+        )
+
+        task = self.task_row()
+        feedback = collect_feedback(client, repo=self.slug, pr_number=PR_NUMBER, issue_number=1)
+        previous = parse_cursor(task.feedback_cursor)
+
+        overflow = review_module.required_instruction_overflow(
+            repo=repository,
+            issue=issue,
+            task=task,
+            round_number=1,
+            pull=pull,
+            feedback=feedback,
+            previous_cursor=previous,
+        )
+        self.assertEqual(
+            overflow,
+            unreadable - FEEDBACK_TOTAL_LIMIT,
+            "the guard must measure the longer variant and refuse this handoff — admitting "
+            "it claims a round that cannot be built once the diff read fails",
+        )
+
+        # And the refusal is necessary, not paranoia: the builder really cannot assemble
+        # this fixture when the diff is unreadable.
+        with self.assertRaises(ValueError):
+            review_module.build_review_instruction(
+                repo=repository,
+                issue=issue,
+                task=task,
+                round_number=1,
+                pull=pull,
+                feedback=feedback,
+                previous_cursor=previous,
+                diff=review_module.DiffContext(available=False),
+                worktree_path=str(task.worktree_path),
+            )
+
+        # The readable variant DOES build, which is what made the old guard's admission
+        # look reasonable — the round only failed when its diff read happened to fail.
         instruction, _ = review_module.build_review_instruction(
             repo=repository,
             issue=issue,
@@ -3480,7 +3637,34 @@ class FinalPromptBoundaryTests(ReviewCase):
             diff=worst_case_diff,
             worktree_path=str(task.worktree_path),
         )
-        self.assertLessEqual(len(instruction), review_module.FEEDBACK_TOTAL_LIMIT)
+        self.assertLessEqual(len(instruction), FEEDBACK_TOTAL_LIMIT)
+
+    def test_the_unreadable_diff_case_is_never_the_smaller_requirement_set(self) -> None:
+        """Pins the property the guard's choice rests on.
+
+        The guard measures with `diff_available=False` because that variant is a SUPERSET
+        of the readable one, which is what makes one measurement cover both cases. If a
+        future expectation were added that appears only when the diff IS readable, the
+        superset would break, the guard would silently under-count again, and the
+        claim-vs-build window would reopen. So assert the containment directly rather than
+        relying on a comment.
+        """
+        from agent_dispatch.review import review_expectations
+
+        readable = review_expectations(new_items=[], diff_available=True)
+        unreadable = review_expectations(new_items=[], diff_available=False)
+
+        self.assertTrue(
+            set(readable) <= set(unreadable),
+            "the unreadable-diff requirement set must contain every readable-diff "
+            "requirement, otherwise the guard's single measurement is not an upper bound",
+        )
+        self.assertLess(
+            len("\n\n".join(readable)),
+            len("\n\n".join(unreadable)),
+            "the unreadable variant must be the strictly longer one, or measuring it "
+            "proves nothing about the readable case",
+        )
 
     def test_optional_sections_are_dropped_whole_never_the_feedback(self) -> None:
         """With the feedback near the bound, the optional framing gives way instead.

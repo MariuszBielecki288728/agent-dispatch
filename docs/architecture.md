@@ -605,8 +605,8 @@ it fails again — a deterministic crash/re-drive loop for a perfectly valid bat
 model call and no acknowledgement ever produced.
 
 So `required_instruction_overflow()` and `build_review_instruction()` share one
-`required_instruction_sections()` function: the guard measures exactly the text the builder
-will join, and the guard runs *before* the claim. The same sharing was applied to the
+`required_instruction_sections()` function: the guard measures the text the builder will
+join, and the guard runs *before* the claim. The same sharing was applied to the
 requirements list and the new-feedback block, because a guard that measures text the
 builder never produces is checking the wrong number — which is how both this mismatch and
 the earlier section-versus-instruction mismatch arose.
@@ -619,6 +619,17 @@ sections (the diff, the earlier context, `AGENTS.md`) and asserts the shared lis
 before doing so: the closing instruction must be last, and the requirements block must be
 the one immediately before it. A change to the shared list then fails loudly at the build
 instead of silently reordering the prompt or emitting a section the guard never counted.
+
+Third, the shared call must be made with the **same inputs**, because one of them is not
+known when the guard runs. Whether the branch diff could be read adds a behavioural
+requirement when it could not, and the diff is loaded later and per round — so the guard
+measures the **longer** variant. It has to prove the handoff fits for every variant the
+builder might produce, not merely the one this round happens to produce. That is an upper
+bound rather than a guess: the unreadable requirement set is a strict superset of the
+readable one (one extra item, ~156 characters), so a single measurement covers both.
+Measuring the readable variant instead under-counts by exactly that requirement and reopens
+the same window on precisely the rounds whose diff read failed — the same crash/re-drive
+loop, reached through the guard's arguments rather than through a duplicated section.
 
 **The whole-prompt bound gives up whole sections; it never slices.** Measuring only the
 new-feedback section is not sufficient on its own, because the assembled instruction is
