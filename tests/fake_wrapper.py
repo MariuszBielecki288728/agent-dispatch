@@ -188,6 +188,12 @@ def main(argv: list[str]) -> int:
     # which the discovery path correctly treats as fail-closed, so the task would never
     # be queued and the comment behaviour under test could not be reached at all.
     pad_comments = int(os.environ.get("FAKE_GH_PAD_COMMENTS", "0") or 0)
+    # `FAKE_GH_PAD_REVIEWS=N` does the same for the INLINE REVIEW COMMENT and
+    # SUBMITTED REVIEW listings only. Kept separate for the same reason as the comment
+    # padding: truncating every endpoint would also truncate the PR listing, which
+    # discovery correctly treats as fail-closed, so the review path could never be
+    # reached at all.
+    pad_reviews = int(os.environ.get("FAKE_GH_PAD_REVIEWS", "0") or 0)
 
     if endpoint == "user":
         spec = consume_failure(world, "user")
@@ -414,11 +420,114 @@ def main(argv: list[str]) -> int:
         emit({"name": branch, "commit": {"sha": "0" * 40}}, jq)
         return 0
 
+    if resource == "issues" and len(tail) == 4 and tail[2] == "labels" and method == "DELETE":
+        # `repos/<slug>/issues/<n>/labels/<name>` — remove one label.
+        #
+        # GitHub serves PR labels through this same issues endpoint, which is why a
+        # single call removes the review-handoff label from a PR. A label that is not
+        # there answers 404, which the service treats as the intended end state rather
+        # than a failure; the fake must reproduce that, or a test could pass on a
+        # response real GitHub never gives.
+        spec = consume_failure(world, f"{slug}:label_remove")
+        if spec:
+            fail_with(spec)
+        name = tail[3]
+        number = int(tail[1])
+        removed = False
+        for record in repo.get("issues", []) + repo.get("pulls", []):
+            if int(record.get("number", -1)) != number:
+                continue
+            labels = record.get("labels") or []
+            keep = [item for item in labels if label_name(item) != name]
+            if len(keep) != len(labels):
+                record["labels"] = keep
+                removed = True
+        if removed:
+            save_world(world)
+        if not removed:
+            die(f"gh: Not Found (HTTP 404) — label {name} on {slug}#{number}", 1)
+        emit([], jq)
+        return 0
+
+    if resource == "pulls" and len(tail) == 3 and tail[2] == "comments":
+        # `repos/<slug>/pulls/<n>/comments` — INLINE review comments (diff context).
+        spec = consume_failure(world, f"{slug}:review_comments")
+        if spec:
+            fail_with(spec)
+        pr_number = int(tail[1])
+        records = [
+            record
+            for record in repo.get("review_comments", [])
+            if int(record.get("pull_number", 0)) == pr_number
+        ]
+        if pad_reviews and page <= pad_reviews:
+            # An exactly-full page keeps the client paginating to its own cap: a
+            # genuinely truncated feedback scan, which must NOT be claimed from.
+            real = records[:per_page]
+            filler = [
+                {
+                    "id": 800000 + (page - 1) * per_page + index,
+                    "body": "unrelated filler",
+                    "html_url": f"https://github.com/{slug}/pull/{pr_number}#discussion_r{index}",
+                    "path": "filler.txt",
+                    "line": 1,
+                }
+                for index in range(len(real), per_page)
+            ]
+            emit(real + filler, jq)
+            return 0
+        emit(paginate(records, page, per_page), jq)
+        return 0
+
+    if resource == "pulls" and len(tail) == 3 and tail[2] == "reviews":
+        # `repos/<slug>/pulls/<n>/reviews` — SUBMITTED reviews (body + verdict).
+        spec = consume_failure(world, f"{slug}:reviews")
+        if spec:
+            fail_with(spec)
+        pr_number = int(tail[1])
+        records = [
+            record
+            for record in repo.get("reviews", [])
+            if int(record.get("pull_number", 0)) == pr_number
+        ]
+        if pad_reviews and page <= pad_reviews:
+            real = records[:per_page]
+            filler = [
+                {
+                    "id": 700000 + (page - 1) * per_page + index,
+                    "body": "unrelated filler",
+                    "state": "COMMENTED",
+                    "submitted_at": "2026-01-01T00:00:00Z",
+                    "html_url": f"https://github.com/{slug}/pull/{pr_number}#pullrequestreview-{index}",
+                }
+                for index in range(len(real), per_page)
+            ]
+            emit(real + filler, jq)
+            return 0
+        emit(paginate(records, page, per_page), jq)
+        return 0
+
     if resource == "pulls" and len(tail) == 2:
         number = int(tail[1])
         spec = consume_failure(world, f"{slug}:pull:{number}")
         if spec:
             fail_with(spec)
+        # Count reads of this exact PR. A caller that validates one response and then
+        # uses a *second* one is a TOCTOU hole that is invisible from the outside — the
+        # only way a test can catch it is by knowing how many times the endpoint was
+        # asked. Recorded per PR number so a test asserts the count for its own boundary
+        # rather than a global total that other code paths also move.
+        reads = world.setdefault("pr_reads", {})
+        key = f"{slug}#{number}"
+        reads[key] = int(reads.get(key, 0)) + 1
+        save_world(world)
+        # An optional per-read override lets a test model "the PR changed between two
+        # reads": `pr_read_overrides` maps a 1-based read index to a full PR record.
+        overrides = (world.get("pr_read_overrides") or {}).get(key) or {}
+        override = overrides.get(str(reads[key]))
+        if override is not None:
+            emit(override, jq)
+            return 0
         for pr in repo.get("pulls", []):
             if int(pr["number"]) == number:
                 emit(pr, jq)
@@ -520,10 +629,18 @@ def paginate(items: list, page: int, per_page: int) -> list:
 
 def label_names(issue: dict) -> list[str]:
     """GitHub returns labels as objects; the service reads ``label['name']``."""
-    return [
-        str(item["name"]) if isinstance(item, dict) else str(item)
-        for item in (issue.get("labels") or [])
-    ]
+    return [label_name(item) for item in (issue.get("labels") or [])]
+
+
+def label_name(item) -> str:
+    """One label entry, whether GitHub sent an object or a bare string.
+
+    The remove-label path needs this on fixture objects too, so it is a shared helper
+    rather than inlined: a fixture that stores ``labels: ["agent:fix"]`` (a plain
+    string, as this repo's own `pull()`/`issue()` helpers do not, but the review
+    fixtures do) must still be removable.
+    """
+    return str(item["name"]) if isinstance(item, dict) else str(item)
 
 
 if __name__ == "__main__":

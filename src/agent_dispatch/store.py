@@ -20,12 +20,13 @@ not evidence that anything was implemented.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from .util import utcnow_iso
 
@@ -79,6 +80,11 @@ INTERRUPTED_RUN_MARKER = "interrupted: the worker process ended while this run w
 
 #: Stages whose preserved local work is finished work and may be published without a
 #: model call. Deliberately excludes `interrupted`.
+#:
+#: The review-round stages are included because a resumed review turn that completed
+#: cleanly is finished work in exactly the same sense: once the turn has been paid for
+#: and validated, a later push/PR failure must finish the publication rather than
+#: invoke the model again.
 PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RECOVERY_PR_FAILED})
 
 #: The one phase a publish-pending task can correctly be in. Publication is finished
@@ -86,6 +92,95 @@ PUBLISHABLE_STAGES = frozenset({RECOVERY_COMMIT_FAILED, RECOVERY_PUSH_FAILED, RE
 #: reconciliation pass" bucket as other ambiguous states — never in `queued`, which
 #: means "an implementation run is wanted".
 PUBLISH_PENDING_PHASE = "needs_attention"
+
+#: Review-round states (#5). One row per claim of the review-handoff label.
+#:
+#: ``claimed`` is deliberately distinct from ``running``. A round is claimed the
+#: moment its feedback snapshot is durable — *before* the label is cleared and
+#: before any model turn starts — so a crash in that window leaves a round that is
+#: safe to re-drive. Once a turn has actually started (``running``) a failure must
+#: never silently re-run the model: that is what ``interrupted``/``failed`` park for.
+ROUND_CLAIMED = "claimed"
+ROUND_RUNNING = "running"
+ROUND_PUBLISH_PENDING = "publish_pending"
+ROUND_PUBLISHED = "published"
+ROUND_FAILED = "failed"
+ROUND_INTERRUPTED = "interrupted"
+#: The model turn completed cleanly and only publication remains, but the exact pull
+#: request is **structurally** unusable (closed, merged, or no longer provably ours), so
+#: no automatic retry can finish the job.
+#:
+#: Kept distinct from ``interrupted`` because the two demand opposite responses to the
+#: same maintainer command. An ``interrupted`` round may not have a completed turn
+#: behind it, so retrying it may legitimately spend one; a ``publication_blocked`` round
+#: has already been paid for, and retrying it must be **publication-only**. Collapsing
+#: them made `--retry-round` spawn a second model turn on feedback the first turn had
+#: already answered — the precise outcome the zero-extra-runtime rule of #5 exists to
+#: forbid. Encoding the difference in the state is what makes that structural rather
+#: than something each call site has to remember:
+#: :meth:`Store.reopen_round` routes by it, and
+#: :meth:`~agent_dispatch.orchestrator.Orchestrator._reconcile_one_round` sends the
+#: resulting ``publish_pending`` round to publication recovery, never to a spawn.
+ROUND_PUBLICATION_BLOCKED = "publication_blocked"
+#: A round a maintainer explicitly gave up on. Terminal *for that round*: it is no
+#: longer unresolved, so a fresh handoff can be claimed, but its feedback was never
+#: acknowledged — the cursor was not advanced — so the same feedback is carried again
+#: by the next round.
+ROUND_RELEASED = "released"
+
+ROUND_STATES = (
+    ROUND_CLAIMED,
+    ROUND_RUNNING,
+    ROUND_PUBLISH_PENDING,
+    ROUND_PUBLISHED,
+    ROUND_FAILED,
+    ROUND_INTERRUPTED,
+    ROUND_PUBLICATION_BLOCKED,
+    ROUND_RELEASED,
+)
+
+#: The states a maintainer must resolve by hand. Named for that purpose rather than
+#: reusing ``UNRESOLVED_ROUND_STATES``, so a future addition to the latter cannot
+#: silently widen what counts as "parked for a human".
+STATES_NEEDING_ATTENTION = frozenset({ROUND_FAILED, ROUND_INTERRUPTED, ROUND_PUBLICATION_BLOCKED})
+
+#: A round that has been claimed but not finally published. At most one of these
+#: may exist per task at a time, which is what makes "one round at most" structural.
+OPEN_ROUND_STATES = frozenset({ROUND_CLAIMED, ROUND_RUNNING, ROUND_PUBLISH_PENDING})
+
+#: Round states in which a model turn has already been paid for.
+STARTED_ROUND_STATES = frozenset({ROUND_RUNNING, ROUND_PUBLISH_PENDING, ROUND_PUBLICATION_BLOCKED})
+
+#: Round states whose model turn has **completed cleanly**. A round in one of these has
+#: nothing left to run: whatever remains is a commit, a push or a pull request. Named
+#: as its own set because "a turn was paid for" and "a turn finished" are different
+#: facts, and only the second one makes a further model call forbidden rather than a
+#: deliberate choice.
+COMPLETED_ROUND_STATES = frozenset({ROUND_PUBLISH_PENDING, ROUND_PUBLICATION_BLOCKED})
+
+#: Round states that still require a decision from the review pass. Anything else
+#: (``published``, ``released``) means the round is settled: for ``published`` the task
+#: is back to being an ordinary ``awaiting_review`` task, and for ``released`` a fresh
+#: explicit handoff is what moves it forward.
+UNRESOLVED_ROUND_STATES = frozenset(
+    {
+        ROUND_CLAIMED,
+        ROUND_RUNNING,
+        ROUND_PUBLISH_PENDING,
+        ROUND_FAILED,
+        ROUND_INTERRUPTED,
+        ROUND_PUBLICATION_BLOCKED,
+    }
+)
+
+#: ``recovery_stage`` values a *review* round can park with. Kept in the same space
+#: as the implementation stages so the publish-only machinery (which is shared) can
+#: re-use them, but named after the round so `status`/`open` can explain which step
+#: of a round is unfinished.
+ROUND_STAGE_PUSH = "review_push_failed"
+ROUND_STAGE_PR = "review_pr_failed"
+ROUND_STAGE_COMMIT = "review_commit_failed"
+ROUND_STAGES = frozenset({ROUND_STAGE_PUSH, ROUND_STAGE_PR, ROUND_STAGE_COMMIT})
 
 #: The only phases in which an automatic publish reconciliation pass may act.
 #:
@@ -97,10 +192,27 @@ PUBLISH_PENDING_PHASE = "needs_attention"
 #: the same reason: publication is never something a queued task silently acquires.
 PUBLISH_RECONCILE_PHASES = frozenset({"awaiting_review", PUBLISH_PENDING_PHASE})
 
+#: Every stage a task row may carry that means "do not start an implementation run".
+#: The implementation stages plus the review stages, because both are finished work
+#: awaiting publication and neither may be re-queued for a fresh implementation.
+ALL_PUBLISHABLE_STAGES = PUBLISHABLE_STAGES | ROUND_STAGES
+
 #: `recovery_stage` values that mean "do not start a model run". Interpolated into one
 #: SQL predicate below; every member is a module-level constant defined in this file,
 #: never caller input, so the interpolation cannot carry anything user-supplied.
-_PUBLISHABLE_STAGE_SQL = "(" + ", ".join(f"'{stage}'" for stage in sorted(PUBLISHABLE_STAGES)) + ")"
+_PUBLISHABLE_STAGE_SQL = (
+    "("
+    + ", ".join(f"'{stage}'" for stage in sorted(PUBLISHABLE_STAGES))
+    + ", "
+    + ", ".join(f"'{stage}'" for stage in sorted(ROUND_STAGES))
+    + ")"
+)
+
+#: The same trick for the *round* stages alone. Kept separate from the combined list
+#: above because "which stages may be published" and "which stages does a round own" are
+#: different questions: clearing a round's stale stage must not also clear an
+#: implementation stage, which is evidence for a different repair.
+ROUND_STAGE_SQL = "(" + ", ".join(f"'{stage}'" for stage in sorted(ROUND_STAGES)) + ")"
 
 #: SQL predicate: true when this task has finished work awaiting publication, so a
 #: model run must not be started for it. Used by every mutation that could otherwise
@@ -141,7 +253,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id        TEXT,
   -- review loop (#5)
   review_round      INTEGER NOT NULL DEFAULT 0,
-  feedback_cursor   TEXT,
+  feedback_cursor   TEXT,                      -- JSON: item id -> acknowledged version
+  -- 1 while a *present* review-handoff label may still be claimed as a new round.
+  -- Set to 0 when a round is claimed and back to 1 only when the label has been
+  -- OBSERVED absent, which is what makes a permanently present label inert across
+  -- polls, restarts and crashes. See `Store.observe_handoff_absent`.
+  handoff_armed     INTEGER NOT NULL DEFAULT 1,
   -- bookkeeping
   attempts          INTEGER NOT NULL DEFAULT 0,
   last_error        TEXT,
@@ -229,6 +346,38 @@ CREATE TABLE IF NOT EXISTS status_comments (
   updated_at        TEXT    NOT NULL,
   PRIMARY KEY (repo, issue_number)
 );
+
+-- One review round per claim of the review-handoff label (#5).
+--
+-- Same intent-before-action discipline as `operations`: the row is written BEFORE
+-- the label is cleared and BEFORE the model is resumed, so a crash at any point
+-- leaves a recoverable record of what was claimed and what has been published.
+--
+-- `cursor` holds the item id -> version map that this round is handing to the
+-- model. It is a set of GitHub identities and versions, never comment bodies:
+-- Issue and PR *text* stays on GitHub (architecture §6), and the instruction is
+-- rendered from a fresh read matched against these ids.
+CREATE TABLE IF NOT EXISTS review_rounds (
+  id                INTEGER PRIMARY KEY,
+  task_id           INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  round             INTEGER NOT NULL,           -- also written to tasks.review_round
+  state             TEXT    NOT NULL,           -- see ROUND_STATES
+  pr_number         INTEGER,                    -- the PR verified as owned at claim
+  branch            TEXT,                       -- branch this round must push to
+  worktree_path     TEXT,                       -- worktree the round ran in
+  session_id        TEXT,                       -- session the round resumed
+  claimed_at        TEXT    NOT NULL,
+  started_at        TEXT,
+  finished_at       TEXT,
+  cursor            TEXT,                       -- JSON: item id -> claimed version
+  snapshot          TEXT,                       -- JSON: compact digest list (no bodies)
+  run_id            TEXT,                       -- run row id of the round's turn
+  head_sha          TEXT,                       -- local tip the round produced
+  recovery_stage    TEXT,                       -- round-specific publication stage
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  error             TEXT,
+  UNIQUE (task_id, round)
+);
 """
 
 
@@ -236,6 +385,43 @@ CREATE TABLE IF NOT EXISTS status_comments (
 #: An interrupted run has no transcript (runtime §2.3.1), so it must never be
 #: offered as a resume target — which is why resumability is a query, not a flag.
 RESUMABLE_RUN_OUTCOMES = frozenset({"succeeded"})
+
+
+#: SQL choosing the phase a restored task belongs in, built from its own row.
+#:
+#: Named once, as a function, so the several restore paths cannot drift: a duplicated
+#: copy of this rule is exactly how the dead end described below stayed reachable after
+#: the first copy was fixed.
+#:
+#: Three cases, and the order is the point — the *most specific* reason wins:
+#:
+#: 1. **Finished work awaiting publication** — a publishable stage means the model's
+#:    commits are not on the remote yet, so the task belongs in ``needs_attention``
+#:    for the publish pass to finish. This is checked first because it is the only
+#:    case where the work is genuinely incomplete: such a task may well already own a
+#:    PR, and choosing ``awaiting_review`` for it would tell the review loop there is
+#:    something to review while the push that carries the round is still pending.
+#:    Skipping this also breaks #16/#18: ``recovery_stage`` deliberately survives a
+#:    pause *so that* releasing the pause can restore publication.
+#: 2. **It owns a PR.** The work is published, so the task belongs in
+#:    ``awaiting_review``. This is the case that used to fall through: re-adding
+#:    `take-it` after a withdrawal put such a task back in ``queued``, where
+#:    implementation dispatch refuses it ("this worker already owns PR #N") and the
+#:    review loop ignores it (`phase != awaiting_review`). A dead end reachable from
+#:    the documented trigger protocol.
+#: 3. **Anything else** — back to the implementation queue.
+#:
+#: ``column`` is interpolated rather than bound because it is the one thing SQL cannot
+#: parameterise here; every caller passes a constant from this module, never caller
+#: input.
+def _restored_phase_sql(column: str) -> str:
+    return (
+        "CASE "
+        f"WHEN {column}.recovery_stage IN {_PUBLISHABLE_STAGE_SQL} THEN "
+        f"'{PUBLISH_PENDING_PHASE}' "
+        f"WHEN {column}.pr_number IS NOT NULL THEN 'awaiting_review' "
+        "ELSE 'queued' END"
+    )
 
 
 @dataclass(frozen=True)
@@ -318,6 +504,50 @@ class StatusComment:
 
 
 @dataclass(frozen=True)
+class ReviewRound:
+    """One claim of the review-handoff label: the unit of "one round at most" (#5).
+
+    ``cursor`` is the feedback snapshot this round was claimed with, kept as an
+    item id -> version map rather than as text. It is what the atomic finaliser
+    copies into ``tasks.feedback_cursor`` once the round's work is durably
+    published, which is the difference between "feedback was handed to the model"
+    and "feedback has been dealt with".
+    """
+
+    id: int
+    task_id: int
+    round: int
+    state: str
+    pr_number: int | None
+    branch: str | None
+    worktree_path: str | None
+    session_id: str | None
+    claimed_at: str
+    started_at: str | None
+    finished_at: str | None
+    cursor: str | None
+    snapshot: str | None
+    run_id: str | None
+    head_sha: str | None
+    recovery_stage: str | None
+    attempts: int
+    error: str | None
+
+    @property
+    def is_open(self) -> bool:
+        return self.state in OPEN_ROUND_STATES
+
+    @property
+    def started(self) -> bool:
+        """Whether a model turn has already been paid for by this round."""
+        return self.state in STARTED_ROUND_STATES or self.attempts > 0
+
+    @property
+    def has_publishable_stage(self) -> bool:
+        return self.recovery_stage in ROUND_STAGES
+
+
+@dataclass(frozen=True)
 class Task:
     """One ``(repo, Issue)`` task row, joined with its last observed GitHub state."""
 
@@ -355,6 +585,26 @@ class Task:
     #: :data:`RECOVERY_COMMIT_FAILED` and friends for why the phase alone is not
     #: enough to decide whether preserved edits are finished work.
     recovery_stage: str | None = None
+    #: Whether a *present* review-handoff label may still be claimed as a new round
+    #: (#5). ``0`` means "this label has already been consumed"; it returns to ``1``
+    #: only after the label was observed absent. Defaults to ``1`` so an existing
+    #: row written before the review loop existed is claimable.
+    handoff_armed: int = 1
+
+    @property
+    def handoff_claimable(self) -> bool:
+        """Whether a present handoff label is still an unclaimed handoff."""
+        return bool(self.handoff_armed)
+
+    @property
+    def has_own_pr(self) -> bool:
+        """Whether this worker created a PR for the task.
+
+        ``linked_pr_number`` is any PR that *references* the Issue and is only an
+        observation; ownership is this column alone (§4, and the #3 review finding
+        that a second poll must never promote a foreign PR to owned).
+        """
+        return self.pr_number is not None
 
     @property
     def has_publishable_stage(self) -> bool:
@@ -378,16 +628,6 @@ class Task:
     @property
     def is_terminal(self) -> bool:
         return self.phase in TERMINAL_PHASES
-
-    @property
-    def has_own_pr(self) -> bool:
-        """Whether this worker created a PR for the task.
-
-        ``linked_pr_number`` is any PR that *references* the Issue and is only an
-        observation; ownership is this column alone (§4, and the #3 review finding
-        that a second poll must never promote a foreign PR to owned).
-        """
-        return self.pr_number is not None
 
     def dispatchability(self) -> tuple[bool, str]:
         """Whether this task could be dispatched, and why not when it cannot.
@@ -468,7 +708,14 @@ class Store:
         written. Returns an empty store when this one does not exist yet.
         """
         clone = Store.in_memory()
-        for table in ("tasks", "observed_state", "runs", "operations", "status_comments"):
+        for table in (
+            "tasks",
+            "observed_state",
+            "runs",
+            "operations",
+            "status_comments",
+            "review_rounds",
+        ):
             if not self._table_present(table):
                 # An optional table an older build never created. Skipping it keeps a
                 # read-only `dry-run` working against a pre-#17 database instead of
@@ -509,6 +756,10 @@ class Store:
         # and only publishing failed" (recoverable without a model call) from "the
         # agent was killed mid-edit" (must NOT be auto-committed).
         ("tasks", "recovery_stage", "TEXT"),
+        # Issue #5. An existing database must default to "a present handoff label is
+        # claimable", which is the honest reading of a row written before the review
+        # loop existed: no round was ever claimed for it.
+        ("tasks", "handoff_armed", "INTEGER NOT NULL DEFAULT 1"),
     )
 
     def _add_missing_columns(self) -> None:
@@ -577,6 +828,28 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run several writes as ONE durable SQLite transaction.
+
+        Exists for the review-round finalisation (#5), which must not be split: a
+        cursor advanced without the round being published loses feedback, and a
+        round published without its cursor advanced replays it. Those two facts are
+        only true together, so they are written together or not at all.
+
+        The connection runs in autocommit mode (``isolation_level=None``), so
+        ``BEGIN IMMEDIATE`` is issued explicitly: it takes the write lock up front
+        and makes a concurrent writer (the running worker) wait rather than fail
+        half-way through a multi-statement write.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self._conn
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
 
     def __enter__(self) -> "Store":
         return self
@@ -736,18 +1009,25 @@ class Store:
     def unpause(self, repo: str, issue_number: int) -> Task:
         """Release a maintainer pause.
 
-        A task with finished work awaiting publication returns to
-        ``needs_attention`` rather than the implementation queue: unpausing a
-        publish-pending task means "carry on with the publication", and putting it in
-        ``queued`` would let the next poll start a second model run on work that is
-        already done.
+        The destination is decided by :func:`_restored_phase_sql`, shared with the
+        label-withdrawal release, because the question is identical: this task was
+        suspended and is now wanted again, so where does it belong?
+
+        For a task that **owns a PR** the answer is ``awaiting_review``. Sending it to
+        ``queued`` was the same dead end the label path had: implementation dispatch
+        refuses an owned PR, and the review loop only looks at ``awaiting_review``, so
+        an `unpause` of a finished task parked it permanently with no automatic way
+        forward.
         """
         task = self._require(repo, issue_number)
         if task.phase != "paused":
             raise ValueError(f"{task.ref} is {task.phase}, not paused")
-        return self._release_to(
-            task, PUBLISH_PENDING_PHASE if task.is_publish_pending else "queued"
+        self._conn.execute(
+            f"UPDATE tasks SET phase = {_restored_phase_sql('tasks')}, pause_reason = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task.id),
         )
+        return self._require(repo, issue_number)
 
     def _release_to(self, task: Task, phase: str) -> Task:
         """Move a task out of a paused/parked state to ``phase``, clearing the pause."""
@@ -770,21 +1050,23 @@ class Store:
         )
 
     def release_label_withdrawn_pause(self, task_id: int) -> bool:
-        """Return a label-withdrawn task to the queue. Returns True if released.
+        """Return a label-withdrawn task to where it actually belongs. True if released.
 
         A maintainer pause is left untouched: only a pause that *this* rule
         created is reversed when the trigger label comes back.
 
-        Publish-pending work is released to ``needs_attention`` instead of ``queued``,
-        for the same reason as :meth:`unpause`: re-adding `take-it` restores
-        *dispatch intent*, but a task whose model run already completed does not need
-        another implementation run — it needs its push/PR finished.
+        The destination comes from :func:`_restored_phase_sql`, so this and :meth:`unpause`
+        cannot disagree. Both used to send everything except publish-pending work to
+        ``queued``, which for a task that **owns a PR** is a dead end: implementation
+        dispatch refuses it and the review loop ignores it. So removing and re-adding
+        `take-it` — the documented way to suspend and resume a task — could permanently
+        strand a finished one.
         """
         cursor = self._conn.execute(
-            f"UPDATE tasks SET phase = CASE WHEN {_IS_PUBLISH_PENDING} THEN ? ELSE 'queued' END, "
-            "pause_reason = NULL, updated_at = ? "
+            f"UPDATE tasks SET phase = {_restored_phase_sql('tasks')}, pause_reason = NULL, "
+            "updated_at = ? "
             "WHERE id = ? AND phase = 'paused' AND pause_reason = ?",
-            (PUBLISH_PENDING_PHASE, utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
+            (utcnow_iso(), task_id, PAUSE_LABEL_WITHDRAWN),
         )
         return cursor.rowcount > 0
 
@@ -1036,8 +1318,19 @@ class Store:
         kind: str,
         resumed_from: str | None,
         log_path: str,
+        consumes_attempt: bool = True,
     ) -> int:
-        """Open a ``runs`` row in the ``running`` state and return its id."""
+        """Open a ``runs`` row in the ``running`` state and return its id.
+
+        ``consumes_attempt=False`` records the run **without** incrementing
+        ``tasks.attempts``. Only an *implementation* run consumes an attempt: the
+        attempt budget bounds how many times this service will try to implement the
+        Issue, and a review round is a different activity with its own budget on
+        ``review_rounds.attempts``. Letting review runs increment the shared counter
+        inflated the number the status comment renders — a task with a successful
+        implementation plus three rounds displayed "Attempt 4 of 3", which is both
+        nonsense and a misleading signal about the implementation budget.
+        """
         now = utcnow_iso()
         cursor = self._conn.execute(
             "INSERT INTO runs (task_id, run_id, kind, resumed_from, outcome, log_path, started_at) "
@@ -1045,10 +1338,26 @@ class Store:
             (task_id, run_id, kind, resumed_from, log_path, now),
         )
         self._conn.execute(
-            "UPDATE tasks SET attempts = attempts + 1, last_run_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE tasks SET last_run_at = ?, updated_at = ? WHERE id = ?",
             (now, now, task_id),
         )
+        if consumes_attempt:
+            self._conn.execute("UPDATE tasks SET attempts = attempts + 1 WHERE id = ?", (task_id,))
         return int(cursor.lastrowid)
+
+    def review_round_attempts(self, task_id: int) -> int:
+        """Model turns this task has spent on review rounds.
+
+        Read from ``review_rounds.attempts`` rather than derived, so the review budget
+        is answerable without conflating it with the implementation attempt budget.
+        """
+        if not self._table_present("review_rounds"):
+            return 0
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(attempts), 0) AS n FROM review_rounds WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row["n"]) if row is not None else 0
 
     def finish_run(
         self,
@@ -1232,6 +1541,429 @@ class Store:
             raise ValueError(f"no task recorded for {repo}#{issue_number}")
         return task
 
+    # ------------------------------------------------------ review loop (#5)
+
+    def arm_handoff(self, task_id: int) -> None:
+        """Re-arm the review-handoff label for one further round.
+
+        Called when the label was **observed absent**, which is the only evidence
+        that a later appearance of it is a new handoff. This is what makes a
+        permanently present label inert: no observation of its absence means no new
+        round, no matter how many polls happen or how many times the process
+        restarts.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET handoff_armed = 1, updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task_id),
+        )
+
+    def observe_handoff_absent(self, task_id: int) -> bool:
+        """Record that the handoff label is not currently present. Returns whether
+        this call actually re-armed the task (i.e. it was not already armed)."""
+        cursor = self._conn.execute(
+            "UPDATE tasks SET handoff_armed = 1, updated_at = ? WHERE id = ? AND handoff_armed = 0",
+            (utcnow_iso(), task_id),
+        )
+        return cursor.rowcount > 0
+
+    def disarm_handoff(self, task_id: int, note: str | None = None) -> None:
+        """Consume the handoff without claiming a round. Returns nothing.
+
+        Used when a handoff is **refused** — structurally unusable, so waiting cannot
+        help: a merged or foreign PR, a task with no resumable session, a withdrawn
+        ``take-it``. The label may well still be visible on GitHub (the service does
+        not remove a label it never claimed), so leaving ``handoff_armed`` set would
+        mean re-evaluating and re-reporting the same refusal on every poll forever,
+        while the label looks like an outstanding request a maintainer is waiting on.
+
+        The reason is recorded on the task so ``status``/``open`` show why the label is
+        being ignored, which is the honest alternative to silently doing nothing.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET handoff_armed = 0, last_error = COALESCE(?, last_error), "
+            "updated_at = ? WHERE id = ?",
+            (note, utcnow_iso(), task_id),
+        )
+
+    def open_round(self, task_id: int) -> ReviewRound | None:
+        """The round currently claimed for this task, if any.
+
+        At most one can exist: :meth:`claim_review_round` refuses to insert a second
+        while an unresolved one is present, and the check is inside the same
+        transaction as the insert.
+        """
+        if not self._table_present("review_rounds"):
+            return None
+        placeholders = ", ".join(f"'{state}'" for state in sorted(UNRESOLVED_ROUND_STATES))
+        row = self._conn.execute(
+            f"SELECT * FROM review_rounds WHERE task_id = ? AND state IN ({placeholders}) "
+            "ORDER BY round DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_review_round(row) if row is not None else None
+
+    def last_round(self, task_id: int) -> ReviewRound | None:
+        """The most recent round whatever its state, published or not."""
+        if not self._table_present("review_rounds"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM review_rounds WHERE task_id = ? ORDER BY round DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_review_round(row) if row is not None else None
+
+    def review_round(self, task_id: int, round_number: int) -> ReviewRound | None:
+        if not self._table_present("review_rounds"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM review_rounds WHERE task_id = ? AND round = ?",
+            (task_id, round_number),
+        ).fetchone()
+        return _row_to_review_round(row) if row is not None else None
+
+    def rounds_for(self, task_id: int) -> list[ReviewRound]:
+        if not self._table_present("review_rounds"):
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM review_rounds WHERE task_id = ? ORDER BY round", (task_id,)
+        ).fetchall()
+        return [_row_to_review_round(row) for row in rows]
+
+    def claim_review_round(
+        self,
+        task_id: int,
+        *,
+        pr_number: int,
+        branch: str | None,
+        worktree_path: str | None,
+        session_id: str | None,
+        cursor_json: str,
+        snapshot_json: str,
+    ) -> ReviewRound:
+        """Durably claim exactly one round, then disarm the label. Atomic.
+
+        Three facts are written in ONE transaction because a crash between any two
+        of them is a duplicate-round bug:
+
+        * the round row (what was claimed, with which snapshot);
+        * ``tasks.review_round`` (the round number the instance is now on);
+        * ``tasks.handoff_armed = 0`` (this appearance of the label is consumed).
+
+        Disarming here — before the label is removed on GitHub — is what makes a
+        crash safe: after a restart the label is still present but no longer armed,
+        so it cannot start a second round, while the ``claimed`` row lets the SAME
+        round be re-driven. The label itself is cleared afterwards by the caller,
+        and a failure to clear it is reported rather than retried as a new round.
+
+        Raises :class:`ValueError` when a round is already open, so the caller can
+        report the refusal instead of silently double-claiming.
+        """
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            existing = self.open_round(task_id)
+            if existing is not None:
+                raise ValueError(f"round {existing.round} is already open (state={existing.state})")
+            row = conn.execute(
+                "SELECT COALESCE(MAX(round), 0) AS n FROM review_rounds WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            number = int(row["n"]) + 1
+            conn.execute(
+                "INSERT INTO review_rounds (task_id, round, state, pr_number, branch, "
+                "worktree_path, session_id, claimed_at, cursor, snapshot) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    number,
+                    ROUND_CLAIMED,
+                    pr_number,
+                    branch,
+                    worktree_path,
+                    session_id,
+                    now,
+                    cursor_json,
+                    snapshot_json,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET review_round = ?, handoff_armed = 0, updated_at = ? WHERE id = ?",
+                (number, now, task_id),
+            )
+        claimed = self.review_round(task_id, number)
+        if claimed is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"failed to record review round {number} for task {task_id}")
+        return claimed
+
+    def start_review_round(self, round_id: int, *, session_id: str | None) -> None:
+        """Mark the round's model turn as started, incrementing its attempt count.
+
+        Written immediately BEFORE the runtime is spawned. This is the boundary that
+        decides whether a crash may re-drive the round automatically: a round still
+        in ``claimed`` never reached the model, so repeating it costs nothing except
+        a repeated read, whereas a round already ``running`` has spent a turn and
+        must be parked for a human instead of silently re-run.
+        """
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE review_rounds SET state = ?, started_at = COALESCE(started_at, ?), "
+            "session_id = COALESCE(?, session_id), attempts = attempts + 1 WHERE id = ?",
+            (ROUND_RUNNING, now, session_id, round_id),
+        )
+
+    def record_round_run(self, round_id: int, *, run_id: str) -> None:
+        self._conn.execute("UPDATE review_rounds SET run_id = ? WHERE id = ?", (run_id, round_id))
+
+    def mark_round_publish_pending(
+        self, round_id: int, *, head_sha: str | None, stage: str | None = None
+    ) -> None:
+        """The round's turn completed cleanly; only publication remains.
+
+        From this point the round must never invoke the model again, which is the
+        #16 invariant applied to review: the resumed turn has already been paid for
+        and its commits are on the branch.
+        """
+        self._conn.execute(
+            "UPDATE review_rounds SET state = ?, head_sha = COALESCE(?, head_sha), "
+            "recovery_stage = COALESCE(?, recovery_stage), error = NULL WHERE id = ?",
+            (ROUND_PUBLISH_PENDING, head_sha, stage, round_id),
+        )
+
+    def park_round(self, round_id: int, *, state: str, stage: str | None, note: str) -> None:
+        """Park a round in a state that needs a human, preserving its reason.
+
+        ``stage`` is only overwritten when a *more specific* one is supplied, so a
+        transient publication failure cannot destroy the evidence that finished work
+        exists — the same rule the implementation path had to learn in #16.
+        """
+        if state not in ROUND_STATES:  # pragma: no cover - defensive
+            raise ValueError(f"{state!r} is not a review-round state")
+        self._conn.execute(
+            "UPDATE review_rounds SET state = ?, recovery_stage = COALESCE(?, recovery_stage), "
+            "error = ?, finished_at = ? WHERE id = ?",
+            (state, stage, note, utcnow_iso(), round_id),
+        )
+
+    def park_round_outside_publication(
+        self, round_id: int, task_id: int, note: str, *, turn_completed: bool
+    ) -> None:
+        """Park a round as unfinished and retire the stale stage it left on its task.
+
+        Two writes that belong together, so they are issued together rather than as a
+        sequence a caller could half-apply or a crash could split. #16's review removed
+        exactly that "clear the stage, then set the phase" window from
+        `finalise_publication`, and its structural test still forbids the adjacency.
+
+        What each write actually does — stated precisely, because the honest division of
+        labour here is not the obvious one:
+
+        * **Parking the round** is what stops the round being retried. The re-drive is
+          driven by the *round's* state (`_reconcile_one_round` re-drives
+          ``publish_pending``), so leaving it ``publish_pending`` would push to the branch
+          on every pass forever, against a pull request that can never accept it.
+        * **Clearing the task's stage** is hygiene, not the gate. `Task.has_publishable_stage`
+          recognises only *implementation* stages, so a surviving round stage does not by
+          itself make the task publishable or dispatchable. What it does do is linger as
+          stale evidence: `_task_round_stage` reads the task row back to mirror the stage
+          onto the round, so a later publication attempt would re-attach a reason
+          belonging to the parked round.
+
+        A round stage is cleared, but an **implementation** stage is deliberately left
+        alone: it is evidence for a different repair, and a round has no business
+        discarding it.
+
+        **The parked state preserves which side of the model boundary the round
+        reached.** A round whose turn completed cleanly is parked
+        ``publication_blocked``; anything else is parked ``interrupted``. Both need a
+        human, but they need *opposite* things from that human: retrying a completed
+        round must be publication-only, while retrying an unfinished one may legitimately
+        spend a turn. Recording the distinction here is what lets :meth:`reopen_round`
+        act correctly without having to reconstruct the answer later.
+
+        ``turn_completed`` is required rather than inferred, because the caller is the
+        only thing that knows and the durable state is not always enough on its own: the
+        ``no recorded PR`` park happens while the round still reads ``running`` (its turn
+        is over, but publication had not started far enough to mark it), so a purely
+        state-derived answer would be wrong for exactly that path. The two are combined
+        rather than chosen between — an explicit ``False`` is overridden by a state that
+        has already recorded completion, because a round that reached
+        ``publish_pending`` cannot *un*-reach it.
+
+        **One transaction, not two autocommitted statements.** The connection runs with
+        ``isolation_level=None``, so statements commit individually unless they are
+        wrapped; a crash between them would leave the round already parked (so no
+        automatic publication retry) while the task row still carried the old
+        publication phase and stage — the half-applied state this method exists to
+        prevent. Living in one method is not atomicity; sharing one transaction is.
+        """
+        current = self.review_round_by_id(round_id)
+        already_completed = current is not None and current.state in COMPLETED_ROUND_STATES
+        completed = turn_completed or already_completed
+        parked_state = ROUND_PUBLICATION_BLOCKED if completed else ROUND_INTERRUPTED
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = ?, "
+                "finished_at = ? WHERE id = ?",
+                (parked_state, note, utcnow_iso(), round_id),
+            )
+            # `CASE` rather than `= NULL`: only this round's own stage is stale. An
+            # implementation stage is another repair's evidence and survives untouched.
+            conn.execute(
+                f"UPDATE tasks SET phase = 'needs_attention', recovery_stage = CASE "
+                f"WHEN recovery_stage IN {ROUND_STAGE_SQL} THEN NULL ELSE recovery_stage END, "
+                "last_error = ?, updated_at = ? WHERE id = ?",
+                (note, utcnow_iso(), task_id),
+            )
+
+    def finalise_review_round(
+        self,
+        round_id: int,
+        task_id: int,
+        *,
+        cursor_json: str,
+        note: str | None = None,
+        pr_number: int | None = None,
+        pr_url: str | None = None,
+    ) -> None:
+        """Hand a published review round over, in ONE transaction.
+
+        This is the #5 crash invariant, and the reason it is a single method rather
+        than a sequence of calls at the call site. All of the following are only
+        true together:
+
+        * the round is ``published`` and closed;
+        * the task's acknowledged-feedback cursor is advanced to the round's snapshot;
+        * the task's review-publication recovery state is cleared;
+        * the task is ``awaiting_review``.
+
+        Splitting them produced two distinguishable bugs in an earlier design: crash
+        after publishing but before the cursor moved leaves *published but
+        unacknowledged* feedback, so a restart applies it twice; crash after the
+        cursor moved but before the phase moved leaves *acknowledged but not
+        awaiting_review*, so the task is neither reviewable nor dispatchable. Both
+        are impossible here because the statements share one transaction.
+
+        ``pr_number``/``pr_url`` are refreshed (not overwritten with NULL) so an
+        adopted PR keeps its recorded URL.
+        """
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE review_rounds SET state = ?, finished_at = ?, error = NULL, "
+                "recovery_stage = NULL WHERE id = ?",
+                (ROUND_PUBLISHED, now, round_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET review_round = COALESCE((SELECT round FROM review_rounds "
+                "WHERE id = ?), review_round), feedback_cursor = ?, recovery_stage = NULL, "
+                "phase = 'awaiting_review', pr_number = COALESCE(?, pr_number), "
+                "pr_url = COALESCE(?, pr_url), last_error = COALESCE(?, last_error), "
+                "updated_at = ? WHERE id = ?",
+                (round_id, cursor_json, pr_number, pr_url, note, now, task_id),
+            )
+
+    def clear_round_stage(self, round_id: int) -> None:
+        """Forget a round's publication stage once it is no longer unfinished."""
+        self._conn.execute(
+            "UPDATE review_rounds SET recovery_stage = NULL WHERE id = ?", (round_id,)
+        )
+
+    def release_round(self, task_id: int, round_id: int, *, note: str) -> None:
+        """Abandon a parked round so a fresh handoff can be claimed later. One write.
+
+        The **only** way out of ``failed``/``interrupted``, and deliberately an explicit
+        maintainer action rather than something a poll does.
+
+        It has to exist because ``open_round()`` treats both states as unresolved: the
+        review pass will not re-drive them (a turn may already have been paid for, and
+        its commits may be half-written), and :meth:`ReviewLoop.evaluate` requires
+        ``awaiting_review``. Without a release, such a round was unrecoverable without
+        editing SQLite by hand — while the documentation said "fix the cause and
+        re-add the label", which the state machine did not actually allow.
+
+        Releasing does **not** acknowledge the feedback: the cursor is left exactly as
+        it was, so the round's feedback stays *unacknowledged* and the next explicit
+        handoff carries it again. Anything the round committed stays in the worktree and
+        on the branch.
+        """
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE review_rounds SET state = ?, finished_at = ?, error = ? WHERE id = ?",
+                (ROUND_RELEASED, now, note, round_id),
+            )
+            # Back to the one phase a handoff can be claimed from, with no publication
+            # stage, so neither the review pass nor the implementation pass treats this
+            # task as unfinished work.
+            conn.execute(
+                "UPDATE tasks SET phase = 'awaiting_review', recovery_stage = NULL, "
+                "last_error = ?, updated_at = ? WHERE id = ?",
+                (note, now, task_id),
+            )
+
+    def review_round_by_id(self, round_id: int) -> ReviewRound | None:
+        """A round row by primary key, or ``None``.
+
+        Needed because the park decision depends on the round's *current* state — was
+        the model turn completed? — and the caller holding the id may not have a fresh
+        row. Reading it here keeps that decision inside the write that depends on it.
+        """
+        if not self._table_present("review_rounds"):
+            return None
+        row = self._conn.execute("SELECT * FROM review_rounds WHERE id = ?", (round_id,)).fetchone()
+        return _row_to_review_round(row) if row is not None else None
+
+    def reopen_round(self, task_id: int, round_id: int, *, note: str) -> None:
+        """Re-open a parked round for one more attempt, keeping its claimed snapshot.
+
+        The sibling of :meth:`release_round`, for a maintainer who wants the *same*
+        feedback retried rather than a fresh handoff. The snapshot is preserved, so the
+        retried round carries exactly the feedback it was claimed with — nothing that
+        arrived since.
+
+        **The destination depends on whether the model turn already completed**, and
+        that is a correctness rule rather than a convenience:
+
+        * a round whose turn completed cleanly goes back to ``publish_pending``, because
+          the only thing left is committing, pushing and confirming the pull request.
+          Re-entering ``claimed`` here would send the round back through
+          `_execute_review_round` and spawn a second model turn on feedback the first
+          one already answered — the zero-extra-runtime guarantee #5 exists to enforce;
+        * a round that never started, or was interrupted mid-turn, returns to
+          ``claimed`` so the deliberate human choice to spend a turn is honoured.
+
+        Reading the *current* state is what makes this safe to call after any park,
+        rather than requiring each caller to know which kind of park happened.
+        """
+        now = utcnow_iso()
+        current = self.review_round_by_id(round_id)
+        completed = current is not None and current.state in COMPLETED_ROUND_STATES
+        target = ROUND_PUBLISH_PENDING if completed else ROUND_CLAIMED
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE review_rounds SET state = ?, recovery_stage = NULL, error = NULL, "
+                "finished_at = NULL WHERE id = ?",
+                (target, round_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET phase = 'awaiting_review', recovery_stage = NULL, "
+                "last_error = ?, handoff_armed = 0, updated_at = ? WHERE id = ?",
+                (note, now, task_id),
+            )
+
+    def set_feedback_cursor(self, task_id: int, cursor_json: str, note: str | None = None) -> None:
+        """Advance the acknowledged-feedback cursor for a task, on its own.
+
+        Used only by the paths that legitimately acknowledge feedback without a
+        model round — currently none. Round completion goes through
+        :meth:`finalise_review_round` so the cursor can never move separately from the
+        state that justifies moving it.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET feedback_cursor = ?, last_error = COALESCE(?, last_error), "
+            "updated_at = ? WHERE id = ?",
+            (cursor_json, note, utcnow_iso(), task_id),
+        )
+
     # --------------------------------------------------- issue status comment
 
     def status_comment(self, repo: str, issue_number: int) -> StatusComment | None:
@@ -1381,6 +2113,30 @@ def _row_to_task(row: Mapping[str, Any]) -> Task:
         pr_created_at=observed("pr_created_at", None),
         dispatched_at=observed("dispatched_at", None),
         recovery_stage=observed("recovery_stage", None),
+        handoff_armed=observed("handoff_armed", 1),
+    )
+
+
+def _row_to_review_round(row: Mapping[str, Any]) -> ReviewRound:
+    return ReviewRound(
+        id=int(row["id"]),
+        task_id=int(row["task_id"]),
+        round=int(row["round"]),
+        state=str(row["state"]),
+        pr_number=row["pr_number"],
+        branch=row["branch"],
+        worktree_path=row["worktree_path"],
+        session_id=row["session_id"],
+        claimed_at=str(row["claimed_at"]),
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        cursor=row["cursor"],
+        snapshot=row["snapshot"],
+        run_id=row["run_id"],
+        head_sha=row["head_sha"],
+        recovery_stage=row["recovery_stage"],
+        attempts=int(row["attempts"]),
+        error=row["error"],
     )
 
 

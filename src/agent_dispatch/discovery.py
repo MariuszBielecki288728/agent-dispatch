@@ -362,6 +362,23 @@ class Discovery:
                 linked_pr_state=_pr_state(linked_pr),
             )
             verdict = evaluate_issue(issue=issue, trigger_label=trigger, linked_pr=None)
+            # A task that owns a PR STILL needs the label-withdrawn pause released.
+            # Returning here unconditionally was a real bug: removing `take-it`
+            # suspended such a task, and re-adding it could never release the pause,
+            # because this branch — reached on every poll for an owned PR — returned
+            # before the release below. The task was then permanently `paused` with no
+            # automatic way back, which is exactly the guarantee the trigger protocol
+            # promises ("re-adding the label reuses this task").
+            #
+            # Reached from a review round too: a task awaiting review with an unstarted
+            # review round is suspended by the same rule, and re-adding the label has to
+            # bring it back for the review path to continue.
+            if (
+                existing is not None
+                and existing.phase == "paused"
+                and self.store.release_label_withdrawn_pause(existing.id)
+            ):
+                return RecordOutcome(verdict, ACTION_REQUEUED)
             return RecordOutcome(verdict, ACTION_OWN_PR_RECONCILED)
 
         if linked_pr is not None:

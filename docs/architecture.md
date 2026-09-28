@@ -249,12 +249,12 @@ queued → running → awaiting_review → feedback_queued → running → …
 ```
 
 - `queued` — discovered, not yet started.
-- `running` — an agent process is live for this task (at most one globally in the MVP).
+- `running` — an agent process is live for this task (at most one globally in the MVP). A **review round** uses this phase for the duration of its resumed turn, so the global one-active-task rule covers review work too; the round's own row (`review_rounds.state`) is the authority on *which* work is in flight.
 - `awaiting_review` — PR open, no handoff pending.
-- `feedback_queued` — `agent:fix` claimed; one consolidated round pending.
+- `feedback_queued` — reserved: `agent:fix` claimed, one consolidated round pending. The #5 implementation records a claimed round in its own `review_rounds` row and starts it immediately, so the phase is not used as an intermediate; the round row is the durable record, and it distinguishes *claimed but not started* (safe to re-drive) from *turn started* (never auto-repeated).
 - `paused` — maintainer-initiated; no new rounds.
 - `failed` — bounded retries exhausted, or a blocking error.
-- `needs_attention` — ambiguous state requiring a human (e.g. foreign worktree, PR closed externally).
+- `needs_attention` — ambiguous state requiring a human (e.g. foreign worktree, PR closed externally, an unfinished review round).
 - `finished` — PR merged or Issue closed.
 
 ### SQLite sketch
@@ -299,6 +299,57 @@ CREATE TABLE feedback_events (
 );
 ```
 
+### Implemented review-round state (#5)
+
+The sketch above named `feedback_events` as an event log. The implementation uses a
+**round snapshot plus a version cursor** instead, which is simpler and answers the
+only two questions that matter: *what did this round carry* and *what has been
+acknowledged*.
+
+```sql
+CREATE TABLE review_rounds (
+  id             INTEGER PRIMARY KEY,
+  task_id        INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  round          INTEGER NOT NULL,          -- also written to tasks.review_round
+  state          TEXT    NOT NULL,          -- claimed | running | publish_pending
+                                            -- | published | failed | interrupted
+  pr_number      INTEGER,                   -- the PR verified as owned at claim
+  branch         TEXT,
+  worktree_path  TEXT,
+  session_id     TEXT,                      -- the session this round resumed
+  claimed_at     TEXT NOT NULL,
+  started_at     TEXT, finished_at TEXT,
+  cursor         TEXT,                      -- JSON: item id -> version claimed
+  snapshot       TEXT,                      -- JSON: same, for reporting
+  run_id         TEXT,                      -- the round's run row
+  head_sha       TEXT,                      -- local tip the round produced
+  recovery_stage TEXT,                      -- review-specific publication stage
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  error          TEXT,
+  UNIQUE (task_id, round)
+);
+```
+
+`tasks.feedback_cursor` holds the acknowledged id -> version map, and
+`tasks.handoff_armed` records whether a *present* handoff label is still claimable.
+Both are advanced together with the round's completion in one transaction.
+
+The two states a review round must never be left in are prevented structurally:
+
+* **published but unacknowledged** — the round is closed, the cursor advanced, the
+  publication marker cleared and the phase set to `awaiting_review` in **one SQLite
+  transaction** (`Store.finalise_review_round`). A crash inside it rolls back
+  entirely, so the round stays retryable and the feedback stays unacknowledged.
+* **acknowledged but not `awaiting_review`** — impossible for the same reason: the
+  cursor cannot move without the phase moving with it.
+
+The implementation also reuses the #16 publish-only rule rather than re-deriving it:
+the shared push/PR path takes an `on_confirmed` hook, so a review round's
+confirmation is its own atomic handover while an implementation run's stays the
+single `finalise_publication` write. Letting the round use the implementation
+finaliser would set `awaiting_review` while the round stayed open and the cursor
+stayed put — exactly the first forbidden state.
+
 `UNIQUE (repo, issue_number)` guarantees a single **task row** per Issue. It does **not** by itself prevent duplicate *external* side effects — a push or PR can succeed just before a crash, and a label can remain set after a round was queued. Those cases are handled by the intent-before-action rules below, not by the constraint.
 
 ### Intent-before-action recovery
@@ -339,11 +390,15 @@ Log contents are never printed to CI or pasted into GitHub comments. Retention: 
 ### `agent:fix` (explicit review handoff)
 
 - **PR review comments alone never start an agent.** Mere feedback arrival only marks the task as having pending review input.
-- A maintainer adds `agent:fix` to the PR. Exactly one **consolidated** follow-up round then runs, resuming the task's **existing** session on the **existing** worktree/branch. The recorded session must come from a run that completed cleanly — an interrupted run has no transcript and cannot be resumed (§2.3.1), in which case the handoff is refused with a clear error rather than silently starting a new conversation.
-- The label is claimed (and only removed) **after** the round is durably queued, so a crash cannot lose the handoff.
-- Feedback is snapshotted as "everything new since `feedback_cursor`" across top-level comments, inline review comments, and submitted reviews.
+- The label goes on an **open pull request this task owns**. A PR that discovery merely stored in `observed_state.linked_pr_number` is not ours and is never processed.
+- A maintainer adds `agent:fix` to the PR. Exactly one **consolidated** follow-up round then runs, resuming the task's **existing** session on the **existing** worktree/branch. The recorded session must come from a run that completed cleanly — an interrupted run has no transcript and cannot be resumed (§2.3.1), in which case the handoff is **refused** with a clear error rather than silently starting a new conversation.
+- The label is claimed (and only removed) **after** the round and its feedback snapshot are durably recorded, so a crash cannot lose the handoff.
+- Feedback is snapshotted as "everything new since `feedback_cursor`" across top-level comments, inline review comments and submitted reviews. The cursor stores an item's **version** (`updated_at`/`submitted_at`), not only its id, so an edited comment is re-delivered instead of being treated as already handled.
 - One round at most is queued. If feedback arrives mid-run, the next round is deferred, never run concurrently in the same worktree.
-- Re-arming for a later round = remove `agent:fix`, let the round complete, add it again.
+- Re-arming for a later round = remove `agent:fix`, let the round complete, add it again. A label **left in place is not a standing request for more rounds**: `tasks.handoff_armed` drops to 0 on claim and returns to 1 only after the label has been *observed absent*. Without that, every poll would start another round against feedback that was already applied.
+- A handoff that cannot start **yet** (a run in flight, an open round, publication still pending, no new feedback, an unreadable or truncated read) is **deferred with the label left in place** and retried later — nothing is lost and the maintainer does not have to re-add a label they already added.
+- A handoff that cannot start **at all** (a merged/closed PR, a foreign PR, no resumable session, a withdrawn `take-it`, an unowned worktree) is **refused**: the reason is recorded, the handoff is consumed so it is not re-reported every poll, and no fresh conversation is started in place of the review round.
+- Failure handling is evidence-based, matching the #4 publish-only invariant: once the resumed turn has completed cleanly, a later commit/push/PR failure is finished by a later pass with **zero** further model calls, and the round is only marked published once the remote tip equals the completed local tip. A round interrupted *during* its turn is parked for a human instead, because a turn may already have been paid for and its commits may be half-written.
 
 ### Shared-identity safety (critical)
 
@@ -410,6 +465,13 @@ commandcode -p "<consolidated review feedback>" \
 
 `--yolo` and the pinned `--model`/`--effort` appear on **every** invocation (D2/D3). The instruction is passed as a bounded string containing the Issue URL, repository instructions, and explicit scope/non-goals — not the raw Issue body verbatim.
 
+A **review round** (#5) is the same invocation with `--session`, driven by the same
+`CommandCodeDriver`, in the same worktree, on the same branch — only the instruction
+differs. It carries the new feedback, the earlier already-acknowledged feedback as
+context, the observed commit/file state of the branch, and the repository's own
+instructions, and it explicitly asks the agent to push back on comments it disagrees
+with or that are out of scope rather than implementing them blindly.
+
 ### Mandatory post-run validation
 
 A run is accepted **only if all** hold:
@@ -423,6 +485,12 @@ A run is accepted **only if all** hold:
 
 Rules 5 and 6 are the two that a naive implementation gets wrong. Rule 5 exists because the CLI would otherwise report success for a run that wrote nothing. Rule 6 is deliberately *not* "the worktree must be dirty": a clean tree may mean the agent committed correctly, and an uncommitted diff is still legitimate work. Only rule 5 is a hard failure signal on its own; rule 6 records the produced-work outcome for human review.
 
+Rule 6 differs for a **review round**: an implementation run that produces nothing
+must not open an empty PR, whereas a review round that correctly concludes that a
+comment needs no code change is a *valid* outcome and is accepted and recorded as a
+no-op. What is never allowed is claiming changes were made — the round's committed
+diff is what the PR branch actually carries.
+
 ### Retry semantics after an interrupted run
 
 An interrupted run left no transcript, so it cannot be resumed (§2.3.1). The bounded retry therefore:
@@ -430,6 +498,238 @@ An interrupted run left no transcript, so it cannot be resumed (§2.3.1). The bo
 - starts a **fresh** session and re-pins the new session ID,
 - **preserves** any uncommitted edits the interrupted agent left in the owned worktree, and
 - reports clearly that this was a fresh attempt, not a continuation.
+
+The same limitation decides the review loop's refusal rule: a handoff with no cleanly
+completed session is **refused** with an actionable message, because starting a fresh
+conversation and calling it a review round would be a different, unverifiable thing.
+
+### Review-round retry semantics (#5)
+
+A round is *claimed* from its durable snapshot before anything else happens, and the
+claimed/
+started boundary is what decides whether a failure may be retried automatically:
+
+| Round state at crash | Repair |
+|---|---|
+| `claimed` (no turn started) | Re-drive the **same** round — same snapshot, same session. No model turn was paid for, so this costs nothing but a repeated read. |
+| `running` (a turn was in flight) | Park as `interrupted`. A turn may already have been paid for and its commits may be half-written, so **nothing** is auto-repeated; the reason is recorded and the feedback stays unacknowledged. |
+| `publish_pending` (the turn completed cleanly) | Finish the publication on a later pass with **zero** model calls, after verifying the remote tip equals the completed local tip. The round is marked published only once that matches. |
+| `publication_blocked` (the turn completed, but the PR is structurally unusable) | Parked for a human, because no automatic retry can help. **Out of** the automatic path on purpose: a closed PR does not reopen on a poll, so leaving it retryable would push to the branch every pass forever. `--retry-round` finishes the publication with zero model calls. |
+| `failed` (the turn itself failed) | Parked for a human. The snapshot stays unacknowledged, so fixing the cause and re-adding the label retries the *same* feedback rather than losing it. |
+
+A publication failure never overwrites a more specific reason: the recorded stage is
+the evidence that finished work exists, and downgrading it would make the round
+permanently unpublishable after one transient outage (§9's rule, applied to review).
+
+### One parked state is not enough: which side of the model boundary?
+
+`interrupted` and `publication_blocked` both mean "a human must decide", and it is
+tempting to collapse them. They demand **opposite** responses to the same command, so the
+distinction is load-bearing rather than descriptive:
+
+| | `interrupted` | `publication_blocked` |
+|---|---|---|
+| The model turn | never ran, or was cut off | completed cleanly |
+| `--retry-round` must | run the turn (a deliberate choice to spend one) | **push only**, never touch the model |
+| Automatic retry | none | none |
+
+Collapsing them made `--retry-round` spawn a second model turn on feedback the first turn
+had already answered — the exact outcome the zero-extra-runtime rule forbids. The state now
+records which side of the boundary the round reached, so `reopen_round` routes on durable
+evidence instead of each call site having to remember:
+
+- a `publication_blocked` round goes back to `publish_pending`, which
+  `_reconcile_one_round` sends to `_recover_review_publication()` — no spawn;
+- anything else goes back to `claimed`, which reaches `_execute_review_round()`.
+
+`turn_completed` is a **required** argument to `park_round_outside_publication` rather than
+something inferred, because the caller is the only thing that knows: the pre-spawn gate
+parks a round that never ran, while every path inside `_publish_review_round` is reached
+only *after* the turn. Inferring it from state alone would misread the
+`require_pr is None` park, which fires while the round is still `running`.
+
+### Structural vs. transient publication failures (#5)
+
+`publish_pending` is a promise that a later pass can finish the job. That promise only
+holds for failures that *can* be finished, so the two kinds are classified explicitly
+rather than both being left retryable:
+
+| Failure | Kind | Outcome |
+|---|---|---|
+| PR closed, merged, or no longer provably ours | structural | Parked `interrupted` for an explicit `--release` / `--retry-round`. No retry can help: a closed PR does not reopen on the next poll, so an auto-retrying round would push to the branch on **every** pass, forever, while reporting a reason that never changes. |
+| Push failed, remote tip unverifiable, PR lookup errored | transient | Stays `publish_pending` with its stage; the next pass finishes it with zero model calls. |
+
+The classification is the `STRUCTURAL_PR_REASONS` set, and the reason code travels with
+the human-readable detail in one small value type so no call site has to compare prose
+to decide which kind it is holding.
+
+The exact-PR check itself runs **twice** around the push — once before, once after:
+
+- *Before*: a round whose PR is already unusable is rejected without touching the
+  remote branch. This is what makes "nothing was pushed" a fact rather than a
+  best-effort, and it is asserted against the real publication path (with a real
+  unpushed commit present, so the assertion can fail).
+- *After*: the same predicate re-applied, to catch the PR changing state while our own
+  push was in flight. It is the same rule, not a second one.
+
+### Nothing is acknowledged that was not delivered (#5)
+
+The round's purpose is that the model *receives* feedback, and the acknowledgement cursor
+is a promise that it did. Two invariants keep that promise honest, and both were violated
+in the same way — a value asserted about feedback the model never saw:
+
+**The cursor covers feedback only.** `FeedbackSet.cursor()` excludes
+`PROVENANCE_DISPATCHER` items, because this service's own status comment (#17) is
+outbound status, not review text. It is excluded from the model input for that reason, so
+including it in the snapshot would assert something about a comment the model was never
+given. The reachable consequence was concrete: the round's status comment is edited to
+`Applying feedback` immediately after the claim and may be edited again by the heartbeat,
+so a crash mid-round made the dispatcher's own write look like *post-claim feedback* and
+the restart parked as `review_snapshot_unreproducible` although no maintainer feedback had
+changed. One predicate now feeds both the claimed snapshot and the post-publication
+acknowledgement, so the two cannot diverge.
+
+**Delivery is proven before anything is claimed, and the proof covers the required-only
+instruction.** Claiming acknowledges every new item, so anything that cannot be delivered
+must not be claimed at all. Otherwise the model never sees the request while publication
+marks it handled forever — silent feedback loss that a "the section was truncated" note
+does not repair.
+
+The quantity that matters is **not** the feedback block on its own. The required framing —
+the untrusted-text warning, session/repo metadata, the behavioural requirements, the
+closing instruction — is roughly 1.8k characters and can never be dropped, so a block that
+fits its own bound can still leave the required set over it. Admitting that handoff is
+worse than deferring it: the round is *durably claimed* and the builder then refuses to
+build it, so the error escapes after the claim, a restart finds the same claimed round, and
+it fails again — a deterministic crash/re-drive loop for a perfectly valid batch, with no
+model call and no acknowledgement ever produced.
+
+So `required_instruction_overflow()` and `build_review_instruction()` share one
+`required_instruction_sections()` function: the guard measures the text the builder will
+join, and the guard runs *before* the claim. The same sharing was applied to the
+requirements list and the new-feedback block, because a guard that measures text the
+builder never produces is checking the wrong number — which is how both this mismatch and
+the earlier section-versus-instruction mismatch arose.
+
+Sharing the function is necessary but **not sufficient**: the builder must add no further
+*required* text of its own. Anything appended after the shared call is emitted without
+being measured, so it reopens the very window the sharing closed — a second
+`Requirements:` block did exactly that. The builder therefore interleaves only *droppable*
+sections (the diff, the earlier context, `AGENTS.md`) and asserts the shared list's shape
+before doing so: the closing instruction must be last, and the requirements block must be
+the one immediately before it. A change to the shared list then fails loudly at the build
+instead of silently reordering the prompt or emitting a section the guard never counted.
+
+Third, the shared call must be made with the **same inputs**, because one of them is not
+known when the guard runs. Whether the branch diff could be read adds a behavioural
+requirement when it could not, and the diff is loaded later and per round — so the guard
+measures the **longer** variant. It has to prove the handoff fits for every variant the
+builder might produce, not merely the one this round happens to produce. That is an upper
+bound rather than a guess: the unreadable requirement set is a strict superset of the
+readable one (one extra item, ~156 characters), so a single measurement covers both.
+Measuring the readable variant instead under-counts by exactly that requirement and reopens
+the same window on precisely the rounds whose diff read failed — the same crash/re-drive
+loop, reached through the guard's arguments rather than through a duplicated section.
+
+**The whole-prompt bound gives up whole sections; it never slices.** Measuring only the
+new-feedback section is not sufficient on its own, because the assembled instruction is
+bounded too — and a character cut at that bound can land *inside* the new-feedback block,
+dropping items the cursor still acknowledges. This is the same silent-acknowledgement bug
+one level higher, and a reserve for framing cannot close it either: at claim time the exact
+diff and `AGENTS.md` contents are not yet assembled, so any reserve is a guess that a large
+enough diff could defeat. So `fit_instruction()` tags each section as required (the
+framing, the new feedback, the behavioural requirements) or droppable (the diff summary,
+earlier acknowledged context, the repository's `AGENTS.md`), and drops droppable sections
+**whole**, disclosure included, until the join fits. A required-only set that still exceeds
+the bound raises rather than truncating — and that branch is deliberately **not** marked
+`pragma: no cover`, because the guard above is what makes it unreachable and marking it
+unreachable is what hid the previous mismatch.
+
+| What | May be dropped? | Why |
+|---|---|---|
+| A **new** item, whole | Never — the handoff defers instead | It would be acknowledged without being delivered |
+| A new item's **body**, beyond the per-item cap | Yes, and disclosed | The declared representation of a very long comment |
+| An already-acknowledged **context** item | Yes, summarised to a count | It was delivered and acknowledged in an earlier round |
+| The **diff** summary, or `AGENTS.md` | Yes, whole section, disclosed | A hint the agent can re-read from the worktree; `AGENTS.md` describes *how* to work, not *what* was asked |
+
+Deferring rather than refusing is deliberate: the label stays in place, so the round starts
+by itself once the maintainer splits the batch or shortens the longest comments. Nothing
+has been acknowledged in the meantime, so no feedback can be lost by waiting.
+
+### One boundary, one read (#5)
+
+Every PR check reads the pull request exactly once and judges **that** object. The rule
+is a correctness property rather than tidiness: validating response A and then handing
+response B to the model validates nothing, because the PR can change between the two
+reads and the unjudged object is the one quoted to the agent. The pre-spawn gate is
+where it matters most, sitting immediately before the model starts.
+
+The predicate is therefore split in two so a caller cannot accidentally re-read:
+
+- `fetch_round_pull()` performs the read and returns the object **together with** any
+  read failure;
+- `judge_round_pull()` judges an object it is *given*, and never fetches.
+
+Returning the object alongside the problem is what makes the single-read property
+structural instead of a comment. The two publication checks are two deliberate race
+boundaries and so two reads — that is the intent. The fake wrapper counts reads per PR
+number, so the property is asserted rather than described.
+
+An unreadable PR is treated differently at each boundary, and the difference is
+deliberate rather than inconsistent:
+
+| Boundary | Unreadable PR | Why |
+|---|---|---|
+| Pre-spawn (re-drive, `--retry-round`, fresh claim) | **Blocks**; zero model calls, round parked | A model call may only be spent on a PR we could actually read and verify |
+| Pre-push (publication) | **Blocks the push**, but the round stays `publish_pending` | "Transient and retryable" does not require mutating the remote branch while the target is unproven — and an outage can coincide with the PR having been closed |
+| Post-push (publication) | Keeps the round retryable; a later pass re-reads | The push already happened, so the read failure is the only thing left to retry |
+
+Making those an explicit named parameter rather than duplicated code paths is what keeps
+`review_pr_unreadable` out of `STRUCTURAL_PR_REASONS`: the round is never parked for a
+read failure, so a temporary GitHub outage needs no maintainer action.
+
+### Releasing a pause: one restore rule (#5)
+
+`unpause` and re-adding `take-it` both have to answer "where does this task belong
+now?", so they call the same helper (`_restored_phase_sql` in `store.py`) instead of
+each carrying a copy of the rule. The most specific reason wins:
+
+| Condition | Restored phase |
+|---|---|
+| Has a publishable stage (commits not on the remote yet) | `needs_attention` — the work is genuinely incomplete, and it needs *publication*, not another model run. Checked first, because a task can own a PR and still have an unfinished push. |
+| Owns a PR, nothing left to publish | `awaiting_review` — the work is published, so it belongs where the review loop looks. |
+| Neither | `queued`. |
+
+Omitting the middle row is a silent dead end rather than a visible error: implementation
+dispatch refuses a task that owns a PR, and the review loop only inspects
+`awaiting_review`, so `queued + owned PR` is reachable by neither. Removing and
+re-adding `take-it` — the documented way to suspend and resume — was enough to strand a
+finished task there permanently.
+
+Two invariants keep the repair itself safe: a paused task is left alone by every
+automatic pass (so a pause is never silently undone by publishing work the operator
+stopped), and "park the round and retire the stale stage it left on its task" runs in
+**one SQLite transaction** — the connection is in autocommit mode, so two statements in
+one method are still two commits and a crash between them leaves the round already
+`interrupted` (nothing retries its publication) while the task row still looks
+publish-pending. That is the half-applied state this write exists to prevent, and it is
+the same window #16's structural test forbids elsewhere.
+
+Which of those two writes actually enforces what is worth being precise about, since the
+obvious reading is wrong:
+
+- **Parking the round** is the gate. The re-drive is driven by the *round's* state, so
+  leaving it `publish_pending` would push to the branch on every pass forever, against a
+  pull request that can never accept it.
+- **Clearing the task's stage** is hygiene. `Task.has_publishable_stage` recognises only
+  *implementation* stages, so a surviving round stage does not by itself make the task
+  dispatchable or publishable. What it does do is linger as stale evidence, because
+  `_task_round_stage` mirrors the task row's stage back onto a later publication attempt.
+
+The clear is therefore scoped with a `CASE` over *round* stages only. An implementation
+stage is evidence for a different repair — it is what authorises finishing that work
+without a model call — and a round discarding it would silently destroy the other
+feature's recoverability.
 
 ### Concurrency and limits
 
@@ -452,7 +752,10 @@ Bounded, boring recovery — no self-healing machinery.
 | PR created but DB write failed | Discover PR by head branch **and** verify it references the Issue; adopt its real PR identity |
 | Duplicate poll / label event | Single task row per Issue (§6); already-terminal phase → no-op |
 | Handoff queued but crash before ack | Round re-derived from the claimed round + `feedback_cursor`; re-arm `agent:fix` once; never double-applied |
-| PR closed or merged externally | Stop new rounds; move to `finished` |
+| Crash after the round's claim but before the label is removed | The label is still visible but no longer *armed*, so it cannot start a second round; the claimed round is re-driven because no turn was paid for yet |
+| Dispatcher dies during a review round's turn | Round parked as `interrupted`; **no** automatic re-run (a turn may have been paid for); feedback stays unacknowledged |
+| Round's turn completed, then commit/push/PR failed | Finished publish-only with **zero** model calls, after the remote tip is verified against the completed local tip; the round is marked published and the cursor advanced only then |
+| Crash between publishing a round and acknowledging its feedback | Both are one SQLite transaction, so neither can happen without the other |
 | Issue relabelled `take-it` removed | Stop new rounds; keep existing work |
 | Owned worktree with uncommitted edits | **Preserve**; report in `status` as interrupted work |
 | Worktree unknown / not recorded for this task | `needs_attention` — **never** auto-delete |
@@ -559,7 +862,12 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 - Repeated polling, concurrent comments, restart after handoff before ack, and handoff during a run: no lost feedback, no duplicate rounds, no loops.
 - Vague comment, agent's own reply, stale or closed PR, unknown PR → never triggers implementation.
 - **Re-arming test:** after a claimed round completes, removing and re-adding `agent:fix` queues exactly one further round, and repeated polls of an unchanged label queue none.
+- **Publish-only regression for a round:** the resumed turn completes cleanly, the commit/push fails, and a later pass publishes the already-completed changes to the **same PR** with **zero** additional runtime invocations and exact remote/local tip verification — and only then advances the cursor.
+- **Finalisation crash regression:** once the new remote tip is confirmed, a crash at the handoff leaves neither `published-but-unacknowledged` nor `acknowledged-but-not-awaiting_review`. After a restart there is exactly one applied round, the cursor is correct, the task is durably `awaiting_review`, the same PR is retained, and the model is not called again.
+- **Fail-closed tests:** a truncated feedback listing, a missing session, a closed or foreign PR, a paused task, a missing `take-it` and a concurrent handoff all refuse or defer with the feedback neither silently lost nor incorrectly marked complete.
+- The merged #17 one-comment lifecycle is reused: a round heartbeats the **same** comment, publication recovery may edit it later with no live runtime, the final body is `Awaiting review`, and a late `Running` write can never follow terminal publication.
 - No auto-merge, no cross-repo mutation.
+- **Not covered offline, and stated as such:** a live `agent:fix` round against real GitHub and real Command Code (same-session continuity with real concurrent feedback, real pagination on the review endpoints, and a real label deletion). That is the opt-in VM smoke, and it is reported as *not tested* rather than assumed.
 
 **#6 — operational release**
 - Fault/reconciliation matrix exercised: duplicate events, pagination gaps, crash during run, push-ok/timeout, PR created/DB write failed, PR merged or closed externally, provider unavailable, VM downtime, rate limit, edited/deleted comments, branch-base divergence.

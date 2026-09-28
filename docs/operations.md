@@ -1,9 +1,9 @@
-# agent-dispatch — operations (Issues #3–#4, #17)
+# agent-dispatch — operations (Issues #3–#5, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
-SQLite queue, and **one Command Code run per task in a task-owned Git worktree,
-ending in exactly one pull request**. The `agent:fix` review loop is Issue #5 and
-is not implemented here (§11).
+SQLite queue, and **one Command Code session per task** in a task-owned Git
+worktree — finishing in exactly one pull request, and continuing in that same
+session for explicit review rounds (`agent:fix`, §16).
 
 ---
 
@@ -22,16 +22,30 @@ one PR created (or an existing one adopted)  -> phase `awaiting_review`
                                        -> same comment becomes `Awaiting review`
 ```
 
+Then, if you review the PR and want changes:
+
+```
+add the `agent:fix` label to the PR    -> one round is claimed and recorded
+label removed (the round owns it)      -> the SAME session resumes in the SAME worktree
+                                       -> comment becomes `Applying feedback`
+the round's turn completes cleanly     -> comment becomes `Publishing feedback changes`
+changes pushed to the SAME PR          -> comment becomes `Awaiting review`
+                                       -> the feedback is acknowledged, once
+```
+
 Three things a reader should not assume:
 
 * **`--yolo` is a trust choice, not a sandbox.** The agent runs as your user with
   broad file and shell access. A worktree is Git isolation only — see §12.
 * **A `subtype=success` exit is not proof of work.** A run whose tool calls were
   refused still reports success with exit 0. `agent-dispatch` scans for the
-  `tool_hook_blocked` event and fails the run (§9).
+  `tool_hook_blocked` event and fails the run (§9). A blocked *review* round fails
+  the same way, and acknowledges nothing (§16).
 * **An interrupted run is not resumable.** Command Code writes a session
   transcript only on a clean completion, so a retry starts a *fresh* session in the
-  same worktree with the existing edits preserved (§7).
+  same worktree with the existing edits preserved (§7). For the same reason the
+  review loop **refuses** a handoff when there is no cleanly completed session
+  rather than silently starting a new conversation (§16).
 
 ---
 
@@ -392,6 +406,8 @@ agent-dispatch pause   --repo owner/name --issue 12
 agent-dispatch unpause --repo owner/name --issue 12
 agent-dispatch retry   --repo owner/name --issue 12
 agent-dispatch resume-publish --repo owner/name --issue 12
+agent-dispatch review                  # start one review round now (§16)
+agent-dispatch review --dry-run        # what each pending handoff would carry
 agent-dispatch prune-logs [--dry-run]
 ```
 
@@ -421,6 +437,8 @@ orchestrator holding a writable store.
 | `worker --once --no-execute` | — | yes | **yes** | no |
 | `enqueue` / `pause` / `unpause` / `retry` | — | yes (`enqueue` only) | **yes** | no |
 | `resume-publish` | — | yes | **yes** | no |
+| `review --dry-run` | on-disk state (read-only connection) | yes (read-only) | nothing | no |
+| `review` | — | yes | **yes** | **yes** |
 | `worker` | — | yes | **yes** | **yes** |
 | `run` | — | yes | **yes** | **yes** |
 
@@ -500,7 +518,9 @@ unchanged and still recoverable either way; only the report differs.
 ## 7. What `status` means
 
 Phases: `queued`, `running`, `awaiting_review`, `paused`, `failed`,
-`needs_attention`, `finished`. (`feedback_queued` arrives with #5.)
+`needs_attention`, `finished`. (`feedback_queued` is reserved: a claimed review round
+is recorded in `review_rounds` and started immediately, so the phase is not used as an
+intermediate — see §16.)
 
 A task is **dispatchable** only when the Issue is open, it still carries `take-it`,
 no relevant PR already exists for it, this worker does not already own a PR for it,
@@ -735,6 +755,26 @@ could modify work that is already finished. Every path that could do that is clo
 | Re-adding `take-it` after a label-withdrawn pause | Restores it to `needs_attention`, not `queued`. The label restores *dispatch intent*, but this task does not need another implementation run |
 | `resume-publish` | Finishes publication for a paused publish-pending task — the counterpart of `retry`, and it actually publishes. When a live worker holds the lock it re-arms the task and hands off, because that worker finishes publication on its next poll |
 | Any row left `queued` by an older build | The dispatcher **escalates** it and starts no runtime, and the atomic claim additionally refuses it in SQL |
+
+### Releasing a pause: one rule, two ways in
+
+Releasing a pause (`unpause`, or re-adding `take-it`) has to answer "where does this
+task belong now?", and there are three possible answers. Both entry points ask
+`_restored_phase_sql` in `store.py`, so they cannot drift apart — a second copy of the
+rule is how the bug below stayed reachable after the first one was fixed.
+
+The order is the important part: the **most specific** reason wins.
+
+| Condition | Restored phase | Why |
+|---|---|---|
+| Has a publishable `recovery_stage` | `needs_attention` | The model's commits are not on the remote yet, so the work is genuinely incomplete and the publish pass must finish it. Checked first, because a task can own a PR *and* still have an unfinished push — sending that to `awaiting_review` would tell the review loop there is something to review while the push carrying it is still pending |
+| Owns a PR (no publishable stage) | `awaiting_review` | The work is published, so the task belongs where the review loop looks. This is the case that used to fall through to `queued`, where implementation dispatch refuses it (`this worker already owns PR #N`) and the review loop ignores it (`phase != awaiting_review`) — a dead end reachable simply by removing and re-adding `take-it` |
+| Neither | `queued` | Ordinary unfinished work, back to the implementation queue |
+
+A task in a paused state is left alone by every automatic pass, and a paused
+publish-pending task is never published — `recovery_stage` survives a pause *so that*
+releasing it can restore publication, so `is_publish_pending` alone must not be enough
+to act on it.
 
 The normal retry behaviour for a genuinely interrupted or failed runtime (no
 publishable stage) is unchanged, and passing `resume-publish` a task with nothing
@@ -1093,6 +1133,17 @@ a mock. The cases most worth knowing about:
 | `MarkerRecoveryTests` | a crash between comment creation and recording its ID reuses the marked comment, ending with exactly one |
 | `NonFatalDeliveryTests` | an edit timeout / rate limit / denied write leaves the run result correct, logs a warning, and creates no duplicate |
 | `ReadOnlyTests` | `status`/`dry-run` never create or edit a comment and never start a runtime |
+| `OneRoundPerHandoffTests` | the label starts exactly one round in the original session; comments alone start nothing; a label left in place after a claim is inert; remove-and-re-add queues exactly one more round; a handoff with no new feedback is deferred rather than consumed |
+| `FeedbackIngestionTests` | a conversation comment, an inline comment and reply, a submitted review and an edited comment are consolidated into one instruction; the dispatcher's own status comment is never fed back; a shared reviewer/implementer login is never filtered; feedback added during a round belongs to the next one |
+| `FailingClosedTests` | a truncated feedback listing, a missing session, a closed/merged PR, a foreign PR, a withdrawn `take-it`, a paused task and a blocked-tool round all refuse or defer with the feedback neither lost nor acknowledged |
+| `ReviewPublicationTests` | a failed push/PR step is finished on a later pass with the **same PR** and **zero** extra runtime calls, and only then does the cursor advance; a no-op round is accepted; a failed commit parks with its own stage |
+| `ReviewHandoffCrashTests` | a failed label removal cannot start a second round; a claimed-but-unstarted round is re-driven; a round from a dead process is parked with no new model call; a restart after publication leaves exactly one applied round with the same PR and cursor |
+| `FinalisationAtomicityTests` | the handover is one SQLite transaction (asserted on the statement trace), and a failure inside it rolls back every coupled fact |
+| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
+| `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
+| `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
+| `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard measures the longest requirement variant the builder can join, so a batch that fits only while the diff is readable is refused and an admitted handoff builds under either; the unreadable-diff requirement set is a strict superset of the readable one, and the built instruction emits each required section exactly once with the closing instruction last |
+| `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -1118,22 +1169,368 @@ uv lock                                  # refresh it deliberately
 ## 15. Not in this release
 
 Documented so nothing here is mistaken for a working feature. These belong to
-Issues #5/#6 and are **not implemented, not stubbed and not faked**:
+Issue #6 and are **not implemented, not stubbed and not faked**:
 
-- the `agent:fix` review handoff, feedback collection, grouping and cursors (#5);
-- same-session follow-up rounds after review feedback, and re-arming the label (#5);
 - multi-repo concurrency above one (configuration rejects it), distributed leases,
   a broker, webhooks, a dashboard, or a provider-plugin system (#6);
 - automatic merge, automatic approval, Issue closure, or deletion of unknown
-  worktrees — permanently out of scope, not deferred.
+  worktrees — permanently out of scope, not deferred;
+- **automatic review generation.** The review loop *accepts* feedback; it never
+  writes it. There is no reviewer agent, no reviewer fleet, no queue of reviewer
+  jobs. A comment or review that the agent did not receive by an explicit
+  `agent:fix` handoff is never acted on (§16).
 
 Also deliberately absent, because the alternative would be a false claim:
 
 - **No native VS Code Chat session handoff.** Inspect and resume CLI sessions in
   the integrated terminal of a Remote SSH window; that is the supported interface.
+  A review round's session is no different — the dispatcher resumes it headlessly
+  through the CLI, and you inspect it in a terminal.
 - **No container or OS sandbox.** `--yolo` plus a worktree is a trust choice on a
   single-user VM, and §12 says so plainly.
-- **No live end-to-end VM run is claimed by this document.** The offline suite
-  proves the orchestration logic against fakes; an actual Command Code run, real
-  push and real PR are an explicit, opt-in operator action
-  (`agent-dispatch run`) and are only "observed" when someone observes them.
+- **No live review round is claimed by this document.** The offline suite proves
+  the orchestration logic against fakes. A real `agent:fix` round on a real PR is
+  an explicit, opt-in operator action (`agent-dispatch review`, or adding the label
+  for the worker to pick up) and is only "observed" when someone observes it — see
+  §16 for exactly which parts that leaves unverified.
+
+---
+
+## 16. The review loop (`agent:fix`)
+
+One maintainer-triggered feedback loop: you review the PR the dispatcher opened,
+add `agent:fix` to it, and the **same Command Code session in the same task
+worktree** receives one consolidated batch of new feedback, implements what it
+accepts, and pushes to **that same PR**. The task then returns to
+`awaiting_review`.
+
+### The trigger is the label, and only the label
+
+* **Review comments never start an agent.** A comment, a reply or a submitted
+  review with no `agent:fix` label is *observed* and nothing else happens.
+* **The label goes on the pull request**, and only an **open PR this task owns**
+  counts. A PR that discovery merely recorded as an observation is never acted on,
+  and a label is never fetched from the Issue to stand in for the PR.
+* **Role is never inferred from a login.** The reviewer and the implementer may be
+  the same GitHub account on this VM, so no comment is accepted or rejected because
+  of who wrote it, and no comment body is scanned for magic words.
+* **One label, one round.** The round is claimed — durably, with its feedback
+  snapshot — *before* the label is removed, so a crash cannot lose the handoff.
+
+### The one workflow to remember
+
+```
+1. Review PR #N (on GitHub).
+2. Add the `agent:fix` label to PR #N.
+3. Wait for the round. Watch the Issue status comment:
+     Applying feedback  ->  Publishing feedback changes  ->  Awaiting review
+4. Inspect the new commits on PR #N.
+
+For another round: REMOVE the label, let the round finish, then ADD it again.
+```
+
+Step 4's "remove and add again" is not a formality — it is the whole mechanism. A
+label that is simply **left in place is not a standing request for more rounds**. A
+permanently present label is inert after its round is claimed, because the service
+only treats a label as a new handoff once it has *observed the label absent* in
+between. Without that rule every poll would start another round and spend another
+model call on feedback that was already applied.
+
+### When a handoff is deferred instead of started
+
+The label stays where it is, nothing is claimed, and the service retries on a later
+poll. Nothing is lost and you do not have to re-add a label you already added:
+
+| Situation | What happens |
+|---|---|
+| Another run is active for the task | Deferred until the task returns to `awaiting_review`. This is the one documented behaviour for "the label arrived during a run" — there is no concurrent reviewer machinery. |
+| A round is already open | Deferred; the open round owns the handoff. |
+| The previous round's publication is incomplete | Deferred until it is finished. |
+| **No new feedback** since the last round | Deferred. Add your comments and the same still-present label starts the round on the next poll. |
+| The task is **paused**, or `take-it` was removed | Deferred. Both are reversible: `unpause`, or re-add `take-it`, and the kept handoff resumes on the next poll. |
+| The feedback listing was incomplete, or the PR could not be read | Deferred and retried. Claiming from a partial read would acknowledge feedback the model never saw. |
+| The **new feedback does not fit** the bounded instruction | Deferred. Claiming acknowledges every new item, so the ones past the bound would be marked handled without ever reaching the model. Split the batch or shorten the longest comments and the same still-present label starts the round on the next poll — nothing has been acknowledged meanwhile. The check covers the whole *required* instruction, not just the feedback block, so a batch that fits alone but not alongside the fixed framing is deferred too rather than claimed and then failing to build. |
+
+### When a handoff is refused
+
+Refused means waiting will not help, so the reason is recorded and the handoff is
+consumed rather than re-reported on every poll. `status`/`open` show the reason:
+
+| Situation | Why it will not start by waiting |
+|---|---|
+| The PR is merged or closed | There is nothing to push a round to. |
+| No cleanly completed session | An interrupted Command Code run has **no transcript**, so it cannot be resumed. The dispatcher refuses instead of quietly starting a different conversation and calling it a review round. A *first* run interrupted mid-flight is retried fresh by #4's own path; that is a new session, and not a review round. |
+| No recorded worktree, or it is not on the task's branch | A round must resume in the directory the conversation was about. |
+| The PR is not provably this task's | Ownership is re-verified at claim time. Acting on someone else's PR is the one mistake a later poll cannot undo. |
+
+### A round publishes to its own PR, or not at all
+
+The implementation path creates a PR when none exists and adopts one when it does. A
+review round must never do either: it pushes to the **exact PR it was claimed
+against**. Between the claim and the push you can merge or close that PR, and a
+create-or-adopt path would then open a *replacement* PR for the same branch, or
+adopt an unrelated open PR that references the Issue — silently moving review work
+off the pull request you were reading.
+
+So the round's PR number is carried into publication and re-verified there (still
+open, still this repository's head, still linking this Issue, still the same number).
+The check runs **twice**: once *before* the branch is pushed, and again after it, for
+the narrower race where the PR changes state while our own push is in flight.
+
+The order matters and is the reason there are two. A round whose PR is closed is
+rejected **before any push**, so the remote branch is left exactly as it was found —
+a round that pushed first and then discovered its PR was gone would leave commits on
+a branch nobody will merge while reporting that it had done nothing. The post-push
+check is the same predicate applied a second time, not a different rule.
+
+The two phases also classify failure differently, and this is the part that decides
+what happens next:
+
+| Failure | Kind | What the dispatcher does |
+|---|---|---|
+| PR closed, merged, or no longer provably ours | structural | **Parks** the round as `Needs attention`. No retry can help — a closed PR does not reopen — so an auto-retry would push to the branch on every poll, forever. |
+| Push failed, remote tip unverifiable, PR lookup errored | transient | Leaves the round `publish_pending` and finishes it on a later pass with **zero** further model calls. |
+
+An unreadable PR at the **pre-push** boundary is transient but *also* blocks the push,
+which is a deliberate refinement rather than a contradiction. "Transient and retryable"
+does not require mutating the remote branch while the exact PR is unproven: an API
+outage can coincide with the PR having been closed or merged, and pushing then is
+precisely what the pre-push gate exists to prevent. So the branch is left alone, the
+round keeps its publication stage, and the next pass re-reads the PR and finishes the
+step — no human decision, no model call, and no push on an unproven target.
+
+Either way the feedback stays unacknowledged, so nothing is lost, and a **replacement
+PR is never created**. Both are asserted by the tests rather than merely intended —
+including the assertion that the remote tip is unchanged, which is verified by pushing
+a real commit through the publication path so that "the tip did not move" cannot be
+satisfied by a test that simply never pushed.
+
+A structurally parked round is *not* retried automatically. Reopening the PR does not
+bring it back on its own; choose `review --retry-round` after restoring the pull
+request, or `review --release` to drop the round and let the next handoff carry the
+same feedback.
+
+### Retrying a parked round: the model runs only if it never ran
+
+`review --retry-round` re-opens the parked round and preserves its claimed snapshot. What
+it does *next* depends on one question — **had the model turn already completed?** — and
+the round's state records the answer, so the command never has to guess:
+
+| Round state when parked | What the turn did | What `--retry-round` does |
+|---|---|---|
+| `publication_blocked` | Completed cleanly; only the push/PR was blocked | **Publication only.** The committed changes are pushed and the round is finalised, with **zero** further model calls. |
+| `interrupted` | Never started, or was cut off mid-turn | Runs the turn once, which is the maintainer deliberately asking for it. |
+| `failed` | Failed | Runs the turn once. |
+
+The middle column is the part that matters, and it is the reason the two parked states are
+kept apart rather than collapsed into one "needs a human". Once a resumed Command Code turn
+has completed cleanly, a later publication failure must stay publish-only: re-running the
+model would spend a second turn answering feedback the first turn already answered, which
+is precisely the guarantee #5 exists to enforce. Encoding the distinction in the state is
+what makes the rule structural — `reopen_round` routes on it, and the round that comes back
+as `publish_pending` goes straight to publication recovery rather than to a spawn.
+
+This is also why the status comment distinguishes them: a `publish_pending` round heals on
+the next pass, so it says the dispatcher will finish the push, while a blocked round names
+`review --retry-round` and says explicitly that no second model run is involved. A message
+that promised "a later pass" for a blocked round would leave a maintainer waiting forever
+for a poll that was never going to act.
+
+### One boundary, one read
+
+Each PR check reads the pull request exactly once and judges **that** object. This is a
+correctness rule, not tidiness: a gate that validates response A and then hands response
+B to the model has validated nothing, because the PR can change between the two reads and
+the unjudged object is the one quoted to the agent. The pre-spawn gate is where this
+mattered most — it sits immediately before the model is started, which is exactly where
+the window is worth closing.
+
+The two *publication* checks (before and after the push) are two deliberate race
+boundaries and therefore two reads; that is the intent, not an oversight. The fake
+wrapper counts reads per PR so the single-read property is asserted rather than left to
+a comment.
+
+One more consequence worth knowing: because the gate never parks a round on an
+unreadable PR, the round stays recoverable by the ordinary poll. Nothing about a
+temporary GitHub outage requires maintainer action for a review round.
+
+### A restarted round must reproduce its claimed feedback, or it does not run
+
+Only feedback *ids and versions* are persisted — comment bodies stay on GitHub by
+design. So a round that has to be re-driven after a crash (claimed but never started)
+re-reads the feedback and checks it still matches what was claimed. It parks instead
+of running when:
+
+* the read is **incomplete** (a truncated listing, a rate limit);
+* a claimed item is **missing** (deleted, or unreadable);
+* a claimed item was **edited after the claim** — its new text belongs to a *later*
+  handoff, not to the round that claimed it.
+
+All three park with no model call, and the feedback stays unacknowledged either way.
+The message names the reason and the action (`--release`).
+
+The snapshot covers **feedback only**. The dispatcher's own status comment (§13's single
+comment, edited in place) is excluded from the claimed snapshot, because it is outbound
+status rather than review text and is excluded from the model input for the same reason.
+That distinction is load-bearing rather than cosmetic: a round's status comment is
+rewritten to `Applying feedback` right after the claim and may be rewritten again by the
+heartbeat, so if it were part of the snapshot a crash mid-round would make the
+dispatcher's *own* write look like feedback edited after the claim — and the restarted
+round would park as unreproducible although nothing a maintainer wrote had changed.
+
+A re-driven round re-checks its **pull request** as well, immediately before the model
+is spawned. A round can be re-driven hours after it was claimed — a crash restart, or
+an explicit `--retry-round` — and in that window the PR can be merged, closed, or stop
+being provably this task's. The claim is not evidence that the PR is still valid now,
+and an externally closed or merged PR receives no new round. The same applies to
+`--retry-round`: it is the command you reach for *precisely* when something went wrong,
+so it is the one most likely to be aimed at a PR that has since become unusable.
+Failure means **zero runtime calls**, an unacknowledged cursor, and a parked round — the
+`review --retry-round` command then exits non-zero, which is the honest report: you
+asked for the round to be retried and it was not.
+
+### Nothing is acknowledged that was not delivered
+
+A round's acknowledgement cursor is a promise that the model actually received each
+item. Two rules keep that promise, and both matter because a very long comment can
+otherwise become invisible:
+
+* a **new** item is never dropped. If the whole new set does not fit the bounded
+  instruction, the handoff is *deferred* rather than claimed (see the deferral table
+  above), so nothing is acknowledged until everything can be delivered;
+* an **already-acknowledged** item may be summarised away, because it was delivered and
+  acknowledged in an earlier round.
+
+A single very long comment is still capped per item, with the truncation stated in the
+instruction itself: that is the declared representation of one enormous comment, and the
+model is told it is seeing a truncated view. What never happens is a whole comment
+vanishing from the prompt while its version enters the cursor.
+
+The bound applies to the **whole instruction**, not only to the feedback section, and it is
+respected by giving up whole optional sections — the diff summary, earlier acknowledged
+context, and `AGENTS.md` — rather than by cutting the text at a character offset. A
+character cut is what made this rule vacuous once already: it could land inside the
+new-feedback block, so items the cursor acknowledged were never rendered. Losing the diff
+summary costs nothing (the agent can read the worktree) and losing `AGENTS.md` changes
+*how* the agent works, not *what* it was asked; dropping either is disclosed in the
+instruction's notes.
+
+### What the agent is asked to do
+
+One bounded instruction: the new feedback, the earlier already-acknowledged
+feedback as context, the observed commit/file state of the branch, and the
+repository's own `AGENTS.md`. It is explicitly told to verify each request against
+the current code, to **push back** on comments that conflict, are out of scope, or
+that it disagrees with on technical grounds, and to distinguish a question from a
+requested change. A round that correctly produces no code change is a valid
+outcome and is recorded as such.
+
+What the instruction will *not* do: it never presents review text as operator
+instructions. Review bodies, Issue bodies and `AGENTS.md` are fenced and labelled as
+untrusted content, and the prompt states that its permission flags come from your
+configuration rather than from anything in those texts.
+
+### States you will see in the status comment
+
+| State | Meaning |
+|---|---|
+| `Applying feedback` | The resumed session is working through the round's feedback. |
+| `Publishing feedback changes` | The turn completed and the changes are being committed and pushed. No further model run is involved. |
+| `Awaiting review` | The round is published; the feedback it carried is acknowledged. |
+| `Needs attention` | A round is unfinished — either its publication failed and will be retried, or its agent turn failed and a human decision is needed. |
+
+It is deliberately **one** comment, edited in place, exactly as in §13: a review
+round heartbeats the comment the task already owns, and a round never opens a second
+one.
+
+### Recovery: what happens when something fails mid-round
+
+| Failure | What the service does |
+|---|---|
+| The process dies before the round reaches the model | Re-drives the **same** claimed round with the same snapshot and session — but only if the live Issue still carries `take-it` and the feedback still reads back exactly as claimed. If not, it parks instead. No feedback is lost and no second round is minted. |
+| The process dies while the round's turn is running | Parks the round as interrupted and starts **nothing**. A turn may already have been paid for and its commits may be half-written, so a human decides. |
+| The turn completes but the commit/push/PR step fails | Parking reason is preserved and the **next pass finishes the publication with zero further model calls**. The remote tip is checked against the completed local tip first; the round is only marked published once that matches. |
+| The label could not be removed after the claim | The round still runs; the still-present label cannot start a second round, and the warning says to remove it by hand. |
+| Publication finds its PR closed, merged or no longer ours | Parks as `Needs attention` and creates **no replacement**. The commits are on the branch; the feedback stays unacknowledged. |
+
+**Feedback is acknowledged exactly once, and only after its round is durably
+published.** Closing the round, advancing the acknowledged-feedback cursor, clearing
+the publication marker and returning to `awaiting_review` happen in **one SQLite
+transaction**. Splitting them produced two states the design forbids — published but
+unacknowledged (so a restart applies the same feedback twice) and acknowledged but
+not `awaiting_review` (so the task is neither reviewable nor dispatchable).
+
+### Commands and manual recovery
+
+```bash
+agent-dispatch review --dry-run         # what each pending handoff would carry; claims nothing
+agent-dispatch review                   # start one round now (takes the worker lock)
+agent-dispatch review --repo owner/name --issue 12
+```
+
+`review` is optional — the polling worker starts rounds on its own — but it is the
+way to act immediately and the way to see *why* a visible label is not starting
+anything without consuming the handoff. It refreshes discovery first, exactly as `run`
+does, so a `take-it` you re-added a moment ago is already reflected. `--dry-run` opens
+the state database read-only and **writes nothing at all** — not even the
+"label was absent, re-arm the handoff" bookkeeping, which is now a write-path job.
+
+Both `review` and the worker take the single-instance lock: one agent at a time
+remains global, and a review round is an agent run like any other. If the worker
+holds the lock, `review` exits `3` (`busy`) rather than starting a second one.
+
+### Recovering a parked round
+
+A `failed` or `interrupted` round is deliberately left alone by every automatic pass:
+a turn may already have been paid for, and its commits may be half-written. Re-adding
+the label does **not** re-drive it. There is exactly one explicit action, and it makes
+you choose what you mean:
+
+```bash
+agent-dispatch open --repo owner/name --issue 12                     # read the reason first
+agent-dispatch review --release     --repo owner/name --issue 12     # give the round up
+agent-dispatch review --retry-round --repo owner/name --issue 12     # retry the SAME feedback
+```
+
+| Command | Effect |
+|---|---|
+| `--release` | Drops the round and returns the task to `awaiting_review`, so a fresh explicit handoff can be claimed. The feedback is **not** acknowledged, so the next round carries it again. Use this when the round is beyond saving, or when you want to reword your feedback first. |
+| `--retry-round` | Re-opens **that same** round for one more attempt with its claimed snapshot preserved, so it retries exactly the feedback it was claimed with. Use this after fixing whatever broke. |
+
+Neither routes through implementation `retry`: that would start an *implementation*
+run, which is not what you are asking for here.
+
+Manual recovery, in order of what you are likely to want:
+
+```bash
+agent-dispatch open --repo owner/name --issue 12   # branch, worktree, session, PR, runs
+agent-dispatch review --dry-run                    # is a handoff claimable, and why not?
+agent-dispatch review                              # finish a round whose publication failed
+agent-dispatch review --release    --repo ... --issue 12   # a parked round is in your way
+agent-dispatch review --retry-round --repo ... --issue 12  # retry the same feedback
+agent-dispatch run                                 # finish a failed IMPLEMENTATION publication
+```
+
+For a round parked as interrupted or failed, read the recorded reason first
+(`open` prints it), then choose `--release` or `--retry-round`. The worktree keeps
+whatever the round produced, and the feedback stays unacknowledged either way.
+
+### What is not verified for this feature
+
+The offline suite drives this end to end against `tests/fake_wrapper.py` and
+`tests/fake_runtime.py`, including crash and restart windows. It does **not** prove
+anything about a live round against real GitHub and real Command Code:
+
+* **No live `agent:fix` round has been run by this document.** A real round needs a
+  wrapper-authorised disposable repository and model credits, and is an opt-in
+  operator action. Until someone runs one and observes it, "same-session continuity
+  on a real PR" is **not tested live** — the offline suite proves the *argument*
+  passed to `--session`, not that a real runtime honours it with real concurrent
+  feedback.
+* **Real GitHub pagination and rate limits** are modelled, not observed, for the
+  inline-review-comment and submitted-review listings added by this feature.
+* **The handoff label's behaviour on a real PR** (a real `DELETE` on a label that is
+  also used by other tooling) is modelled only.
+
+A CLI session is viewed through the VS Code Remote SSH **terminal**, not native VS
+Code Chat — the same limitation as §15.
