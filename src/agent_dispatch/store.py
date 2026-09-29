@@ -299,9 +299,10 @@ CREATE TABLE IF NOT EXISTS runs (
   timed_out         INTEGER NOT NULL DEFAULT 0,
   -- 1 when the runtime exited non-zero WITHOUT emitting a single stream record: it
   -- refused its own invocation or crashed at startup, so no model turn happened.
-  -- Durable evidence for the one rule that may re-pin a task's runtime identity
-  -- (the operator's explicit `retry` / `review --retry-round`), see
-  -- `last_run_refused`.
+  -- Durable evidence for the one rule that may re-pin a task's runtime identity:
+  -- `retry` may adopt the current configuration only when the task has never
+  -- started a model turn at all (`may_repin_identity`). `review --retry-round`
+  -- never re-pins, because its session was created under the pin.
   refused           INTEGER NOT NULL DEFAULT 0,
   produced_work     INTEGER,
   detail            TEXT,                       -- validated reasons, never a transcript

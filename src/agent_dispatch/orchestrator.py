@@ -2636,13 +2636,23 @@ class Orchestrator:
         after = manager.inspect(before.path, before.branch)
         attempted = round_row.attempts
 
-        if publisher is not None:
-            # The round's turn has stopped. Publish the review-specific intermediate
-            # state BEFORE the terminal flag is raised: `Publishing feedback changes`
-            # says "the model is done and the pull request does not have the changes
-            # yet", which is exactly true here and is what a maintainer needs. Raising
-            # the flag first would suppress this write as a background one.
+        if publisher is not None and result.ok:
+            # The round's turn has stopped CLEANLY. Publish the review-specific
+            # intermediate state BEFORE the terminal flag is raised: `Publishing
+            # feedback changes` says "the model is done and the pull request does not
+            # have the changes yet", which is exactly true here and is what a maintainer
+            # needs. Raising the flag first would suppress this write as a background one.
+            #
+            # Guarded by `result.ok` for the same reason the implementation path guards
+            # its own `Publishing` write: a blocked, timed-out, failed or refused turn
+            # has nothing valid to publish, so claiming it is publishing would be a
+            # false intermediate state — and for a refused start it would announce
+            # progress for a round in which no model turn happened at all. The message
+            # must also stay consistent with the heartbeat's terminal ordering, so a
+            # failed round raises the flag without the publishing write.
             publisher.publishing_review(task, round_number=round_row.round)
+            publisher.begin_terminal()
+        elif publisher is not None:
             publisher.begin_terminal()
 
         if not result.ok:

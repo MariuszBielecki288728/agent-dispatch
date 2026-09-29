@@ -61,6 +61,7 @@ from agent_dispatch.statuscomment import (  # noqa: E402
     STATE_APPLYING_FEEDBACK,
     STATE_AWAITING_REVIEW,
     STATE_NEEDS_ATTENTION,
+    STATE_PUBLISHING_FEEDBACK,
     STATE_RUNNING,
 )
 from agent_dispatch.store import (  # noqa: E402
@@ -1505,6 +1506,11 @@ class ReviewStatusCommentTests(ReviewCase):
             "\n".join(round_states),
             "the round must report 'Applying feedback'",
         )
+        self.assertIn(
+            STATE_PUBLISHING_FEEDBACK,
+            "\n".join(round_states),
+            "a cleanly completed turn must report that its changes are being published",
+        )
         self.assertNotIn(
             STATE_RUNNING + "**",
             round_states[0],
@@ -1548,15 +1554,56 @@ class ReviewStatusCommentTests(ReviewCase):
             self.fail("no terminal review write")
 
     def test_a_failed_round_shows_trouble_rather_than_success(self) -> None:
+        # The final body alone is NOT enough to catch this: the round used to publish
+        # `Publishing feedback changes` before checking whether the turn succeeded, so a
+        # blocked round claimed its changes were being published while nothing valid
+        # existed to publish. The round's whole write log is asserted, because the false
+        # state is an intermediate write that the terminal sync overwrites.
         self.first_run()
+        writes_before = len(self._status_writes())
         self.hand_off()
         self.add_comment("A request.")
         self.review_scenario(events=["tool_hook_blocked"], edits={})
         self.assertEqual(self.run_cli("review").returncode, 1)
 
+        round_writes = "\n".join(entry["body"] for entry in self._status_writes()[writes_before:])
+        self.assertNotIn(
+            STATE_PUBLISHING_FEEDBACK,
+            round_writes,
+            "a blocked round must never claim it is publishing changes",
+        )
+
         body = self.status_body()
         self.assertIn(STATE_NEEDS_ATTENTION, body)
         self.assertEqual(len(self.status_comments()), 1)
+
+    def test_a_refused_round_never_claims_it_is_publishing(self) -> None:
+        # The refused start is the case where the false claim is worst: no model turn
+        # happened at all, so `Publishing feedback changes` would announce progress for
+        # a round that never reached the model.
+        self.first_run()
+        writes_before = len(self._status_writes())
+        self.hand_off()
+        self.add_comment("A request.")
+        self.review_scenario(
+            no_stream=True,
+            exit_code=1,
+            stderr='Unknown effort "medium". Supported: high, max.',
+        )
+        self.assertEqual(self.run_cli("review").returncode, 1)
+
+        round_writes = [entry["body"] for entry in self._status_writes()[writes_before:]]
+        self.assertTrue(round_writes, "a refused round still reports itself")
+        self.assertNotIn(
+            STATE_PUBLISHING_FEEDBACK,
+            "\n".join(round_writes),
+            "a round in which no model turn happened must not report publishing",
+        )
+        self.assertIn(
+            STATE_NEEDS_ATTENTION,
+            round_writes[-1],
+            "the honest terminal state is 'Needs attention'",
+        )
 
 
 # ==============================================================================
