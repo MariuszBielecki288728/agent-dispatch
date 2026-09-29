@@ -396,6 +396,40 @@ class RuntimeValidationTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertFalse(result.checks["spawned"])
 
+    def test_a_refused_start_is_a_configuration_fault_named_from_stderr(self) -> None:
+        # Observed on Command Code v1.64.1 during the #6 pilot: an effort value the
+        # pinned model no longer accepts makes the CLI exit 1 with one stderr line and
+        # NO stream at all. That must be reported as a refused start quoting the
+        # runtime's own message, not as an anonymous "no completed result".
+        result = _result(
+            exit_code=1,
+            subtype=None,
+            session_id=None,
+            events_seen=0,
+            result_lines=0,
+            stderr_tail='Unknown effort "medium". Supported: high, max.',
+        )
+        self.assertTrue(result.runtime_refused)
+        validation = validate_run(result, expected_session=None)
+        self.assertFalse(validation.ok)
+        self.assertFalse(validation.checks["runtime_started"])
+        self.assertIn('Unknown effort "medium"', validation.summary())
+        self.assertIn("configuration fault", validation.summary())
+
+    def test_a_run_that_actually_started_is_never_a_refusal(self) -> None:
+        # The negative controls: any one of these makes the failure a task failure
+        # that keeps its normal meaning, so the refusal classification stays narrow.
+        decisions = {
+            "one event emitted": _result(exit_code=1, subtype=None, events_seen=1),
+            "timed out": _result(exit_code=1, timed_out=True),
+            "clean exit": _result(exit_code=0, events_seen=0),
+            "spawn error": _result(exit_code=1, spawn_error="boom", events_seen=0),
+        }
+        for label, candidate in decisions.items():
+            with self.subTest(label):
+                self.assertFalse(candidate.runtime_refused)
+        self.assertTrue(validate_run(_result(), expected_session=None).checks["runtime_started"])
+
 
 class BlockedEventDetectionTests(unittest.TestCase):
     def test_nested_event_shape_is_detected(self) -> None:
@@ -944,6 +978,86 @@ class BlockedRunTests(ExecutionCase):
         # And `open` must say so plainly rather than promising a resume.
         opened = self.run_cli("open", "--repo", self.slug, "--issue", "1")
         self.assertIn("resumable      : no", opened.stdout)
+
+
+class RuntimeRefusalTests(ExecutionCase):
+    """The #6 pilot's real failure: the CLI refused its invocation outright.
+
+    Command Code v1.64.1 exited 1 with ``Unknown effort "medium". Supported: high,
+    max.`` and an empty stream after the runtime auto-updated. Nothing reached the
+    model, so this is a configuration fault: it must quote the runtime's own message
+    in the task state and leave the attempt budget untouched, instead of parking a
+    healthy task as ``failed`` after three no-op attempts.
+    """
+
+    REFUSAL = 'Unknown effort "medium". Supported: high, max.'
+
+    def _remote_branches(self) -> list[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    def test_a_refused_runtime_parks_with_attention_and_spends_no_attempt(self) -> None:
+        self.write_scenario(runs=[{"no_stream": True, "exit_code": 1, "stderr": self.REFUSAL}])
+        self.set_issues(issue(1, "Refused", labels=[TRIGGER]))
+
+        result = self.run_cli("run")
+        # Non-zero is the honest exit code: the task was not implemented. The state
+        # and the note, not the code, are what tell the operator what to do.
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "needs_attention")
+        self.assertEqual(task.attempts, 0, "a refused start must not consume the budget")
+        self.assertIn("runtime refused to start", task.last_error or "")
+        self.assertIn(self.REFUSAL, task.last_error or "")
+
+        # The failed run is still recorded with the runtime's own message, and
+        # nothing was published: no PR, no branch on the remote, no session.
+        runs = store.run_history(task.id)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].outcome, "failed")
+        self.assertIn(self.REFUSAL, runs[0].detail or "")
+        self.assertIsNone(task.pr_number)
+        self.assertIsNone(task.session_id)
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+        self.assertNotIn(task.branch, self._remote_branches())
+
+    def test_fixing_the_configuration_then_retrying_completes_the_task(self) -> None:
+        # The operator path the note names: fix the configuration, `retry`, and the
+        # SAME task completes on the next run with a normal attempt count.
+        self.write_scenario(
+            runs=[
+                {"no_stream": True, "exit_code": 1, "stderr": self.REFUSAL},
+                {"session_id": "sess-fixed", "subtype": "success", "edits": {"impl.txt": "ok\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Refused then fixed", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 1)
+        self.assertEqual(self.run_cli("retry", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "awaiting_review")
+        self.assertEqual(task.attempts, 1, "only the run that reached the model counts")
+        self.assertEqual(len(self.recorded_argv()), 2, "one refusal, then one real run")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+        self.assertIn(task.branch, self._remote_branches())
 
 
 class SessionIdentityTests(ExecutionCase):

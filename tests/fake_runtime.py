@@ -31,11 +31,18 @@ Scenario shape::
           "stream_seconds": 0,               # seconds to stay in flight AFTER run_start
           "stream_tick": 0.1,                # interval between streamed events
           "hang": false,                     # never finish (for timeout tests)
+          "no_stream": false,                # refuse to start: no events, stderr only
           "result_session_id": null          # override the id in the result line
         }
       ],
       "record_argv": "path"                  # append the argv to this file
     }
+
+``no_stream`` models the real v1.64.1 shape observed during the Issue #6 pilot: the
+CLI rejects its own invocation (for example an ``--effort`` value the pinned model
+no longer accepts), prints one line to stderr and exits non-zero **without emitting
+any NDJSON**. The driver must classify that as a configuration fault, quote the
+stderr in the failure message, and leave the task's attempt budget untouched.
 
 ``stream_seconds`` is what makes a status-heartbeat test meaningful: the process is
 really alive and really emitting for that long, so a heartbeat that only fires from
@@ -172,6 +179,13 @@ def main(argv: list[str]) -> int:
     # scenario still gets a deterministic, inspectable result rather than an
     # unexplained crash.
     run = runs[index] if index < len(runs) else runs[-1]
+
+    if run.get("no_stream"):
+        # A runtime that refuses the invocation or crashes before emitting anything:
+        # one stderr line and a non-zero exit, with an empty stdout. Real shape seen on
+        # Command Code v1.64.1: `Unknown effort "medium". Supported: high, max.`
+        print(str(run.get("stderr") or "fake runtime refused to start"), file=sys.stderr)
+        return int(run.get("exit_code", 1))
 
     session_id = run.get("session_id") or f"sess-{uuid.uuid4().hex[:8]}"
     requested = _flag_value(argv, "--session")

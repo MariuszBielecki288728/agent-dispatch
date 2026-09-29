@@ -204,8 +204,15 @@ driver = "commandcode"
 # Verified available on this VM (v1.64.0: 80 models listed).
 model = "deepseek/deepseek-v4-flash"
 
-# Reasoning effort (low | medium | high — model dependent).
-effort = "medium"
+# Reasoning effort. MODEL DEPENDENT — the model's own accepted set is authoritative.
+#
+# OBSERVED ON VM (v1.64.1, 2026-09-29, Issue #6 pilot): `deepseek/deepseek-v4-flash`
+# accepts `high` or `max` ONLY now. `medium` (valid on v1.64.0 the day before) makes
+# the CLI exit 1 with `Unknown effort "medium". Supported: high, max.` and an EMPTY
+# stream. The dispatcher reports that as a refused start — no model work, no attempt
+# consumed, task parked as needs_attention with the runtime's own message — instead
+# of failing the task. Re-check after any runtime upgrade.
+effort = "high"
 
 # ------------------------------------------------------------------------------
 # Permission mode — read this before changing.
@@ -248,7 +255,7 @@ max_turns = 40
 # [repos."MariuszBielecki288728/disposable-test-repo".runtime]
 # driver = "commandcode"
 # model = "deepseek/deepseek-v4-flash"
-# effort = "low"
+# effort = "high"
 # permission_mode = "allow-all"
 # permission_flag = "--yolo"
 # max_turns = 40

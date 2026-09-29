@@ -1022,6 +1022,11 @@ class Orchestrator:
                 produced_work=after.produced_work,
                 detail=detail,
             )
+            # A runtime that never emitted a record never started a conversation: no
+            # model work was attempted or paid for, so it is a configuration fault and
+            # must not be charged to the attempt budget.
+            if result.runtime_refused:
+                return self._record_runtime_refusal(task, result, detail)
             return self._record_failure(task, result, after, attempted, detail)
 
         # A registered worktree that is no longer on the branch this task owns can
@@ -1205,6 +1210,41 @@ class Orchestrator:
             run=result,
             attempts=attempted,
             notes=notes,
+        )
+
+    def _record_runtime_refusal(
+        self, task: Task, result: RunResult, detail: str
+    ) -> DispatchOutcome:
+        """Park a task whose runtime refused to start, without spending an attempt.
+
+        A process that exits non-zero without emitting a single stream record never
+        started a conversation: the CLI rejected its own invocation (observed on
+        Command Code v1.64.1: ``Unknown effort "medium". Supported: high, max.``) or
+        crashed at startup. Nothing was sent to the model and nothing was paid for,
+        so this is a **configuration fault** — the same class as a missing runtime
+        binary — rather than a task failure. Charging it to the attempt budget is what
+        parked a healthy task as ``failed`` after three no-op attempts during the #6
+        pilot; instead the attempt count is left untouched and the task waits in
+        ``needs_attention`` with the runtime's own message. Fix the configuration,
+        then ``agent-dispatch retry``.
+        """
+        note = detail
+        # The claim charged one attempt before the refusal was knowable; no model work
+        # happened, so it is given back and the retry budget stays whole.
+        self.store.refund_attempt(task.id)
+        self.store.mark_needs_attention(task.id, note)
+        return DispatchOutcome(
+            action=OUTCOME_NEEDS_ATTENTION,
+            task_ref=task.ref,
+            reason="runtime_refused",
+            session_id=result.session_id,
+            run=result,
+            attempts=task.attempts,
+            notes=[
+                note,
+                "no model work was attempted, so no attempt was consumed; fix the "
+                "configuration (for example the pinned effort) and run `agent-dispatch retry`",
+            ],
         )
 
     def _publish(

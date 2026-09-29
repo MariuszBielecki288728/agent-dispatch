@@ -194,8 +194,8 @@
         },
         "effort": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
-          "description": "Reasoning effort (model dependent)."
+          "enum": ["low", "medium", "high", "max"],
+          "description": "Reasoning effort. Model dependent, and the model's own accepted set is authoritative: observed on Command Code v1.64.1 (2026-09-29), 'deepseek/deepseek-v4-flash' accepts only high|max and exits 1 with 'Unknown effort' plus an EMPTY stream for anything else. That refusal is reported as a configuration fault (the runtime's message, no model work, no attempt consumed) rather than a task failure. Re-check the accepted values after any runtime upgrade."
         },
         "permission_mode": {
           "type": "string",

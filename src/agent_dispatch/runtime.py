@@ -69,6 +69,11 @@ EXIT_TURN_CAP = 8
 #: success, so it fails the run.
 TOOL_HOOK_BLOCKED_EVENT = "tool_hook_blocked"
 
+#: How much of the runtime's stderr is quoted when a run refuses to start. The
+#: sidecar file keeps the whole text; the task message keeps only enough to name the
+#: cause (a usage error is one line, a traceback's last lines carry the reason).
+STDERR_TAIL_LIMIT = 400
+
 
 class RuntimeSpawnError(Exception):
     """The runtime could not be started at all (missing binary, spawn failure)."""
@@ -145,6 +150,11 @@ class RunResult:
     finished_at: str
     timed_out: bool = False
     spawn_error: str | None = None
+    #: Last few non-empty stderr lines, set only when the runtime exited non-zero
+    #: without emitting a single stream record (a refused invocation or a startup
+    #: crash). Quoting the runtime's own message is what makes the failure
+    #: actionable instead of "no completed result".
+    stderr_tail: str | None = None
     #: Set when an ``on_session`` callback raised. The run outcome is unaffected —
     #: the agent's work is still valid — but the caller is told, so it can report
     #: that the session ID was not persisted rather than leaving it unexplained.
@@ -160,6 +170,26 @@ class RunResult:
     def fresh_session_started(self) -> bool:
         """True when this run began a new session rather than continuing one."""
         return self.resumed_from is None
+
+    @property
+    def runtime_refused(self) -> bool:
+        """True when the runtime exited non-zero without emitting any stream record.
+
+        The signature of the CLI rejecting its own invocation (observed on v1.64.1:
+        ``Unknown effort "medium". Supported: high, max.``) or crashing at startup:
+        no conversation started, so nothing was sent to the model and nothing was
+        paid for. That makes it a **configuration fault** rather than a task
+        failure, and it must not consume the attempt budget (see
+        :func:`validate_run` and the orchestrator's refusal path).
+        """
+        return (
+            self.spawn_error is None
+            and not self.timed_out
+            and self.events_seen == 0
+            and self.result_lines == 0
+            and self.exit_code is not None
+            and self.exit_code != 0
+        )
 
     def summary_fields(self) -> dict[str, Any]:
         """Compact, log-safe description. Never includes transcript contents."""
@@ -427,6 +457,14 @@ class CommandCodeDriver:
             events_seen=state.events_seen,
             result_lines=state.result_lines,
         )
+        # A process that exits non-zero without emitting a single stream record never
+        # started a conversation: the CLI rejected its own invocation or crashed at
+        # startup. Its stderr is the only evidence of *why*, so it is read only for that
+        # shape — a successful run must not pay for it. `runtime_refused` is the single
+        # rule for the shape; this does not re-derive it.
+        result.validation = RunValidation(ok=False)
+        if result.runtime_refused:
+            result.stderr_tail = _read_stderr_tail(stderr_path)
         result.validation = validate_run(result, expected_session=session_id)
         return result
 
@@ -529,7 +567,9 @@ def validate_run(result: RunResult, *, expected_session: str | None) -> RunValid
 
     The checks mirror §8's mandatory post-run validation. Rule 5
     (``tool_hook_blocked``) is the false-success guard and fails the run *even
-    when* the process exited 0 and reported ``subtype=success``.
+    when* the process exited 0 and reported ``subtype=success``. A runtime that
+    never started (``runtime_refused``) is reported first and separately: nothing
+    reached the model, so it is a configuration fault rather than a task failure.
     """
     problems: list[str] = []
     checks: dict[str, bool] = {}
@@ -547,6 +587,22 @@ def validate_run(result: RunResult, *, expected_session: str | None) -> RunValid
         )
     else:
         checks["completed_in_time"] = True
+
+    # A runtime that never emitted a record is classified separately from a task that
+    # ran and failed: nothing reached the model, so the cause is configuration (for
+    # example an `--effort` value the pinned model no longer accepts) and the runtime's
+    # own message is quoted. Checked BEFORE the exit/subtype/session rules so the
+    # summary leads with the cause instead of three symptoms of it (`status`/`open`
+    # show only this text).
+    refused = result.runtime_refused
+    checks["runtime_started"] = not refused
+    if refused:
+        problems.append(
+            f"the runtime refused to start (it exited {result.exit_code} without emitting a "
+            "single stream record): "
+            + (result.stderr_tail or "no stderr output")
+            + " — no model work was attempted; this is a configuration fault, not a task failure"
+        )
 
     exit_ok = result.exit_code == 0
     checks["exit_code_zero"] = exit_ok
@@ -594,6 +650,21 @@ def validate_run(result: RunResult, *, expected_session: str | None) -> RunValid
         )
 
     return RunValidation(ok=not problems, problems=problems, checks=checks)
+
+
+def _read_stderr_tail(stderr_path: Path, limit: int = STDERR_TAIL_LIMIT) -> str | None:
+    """The last few non-empty stderr lines, bounded and single-lined, or ``None``."""
+    try:
+        text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    tail = " | ".join(lines[-3:])
+    if len(tail) > limit:
+        tail = "…" + tail[-limit:]
+    return tail
 
 
 def _safe_callback(callback: Callable[[], None] | None) -> None:

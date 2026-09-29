@@ -1143,6 +1143,22 @@ class Store:
             (task_id, int(trigger_present), issue_state, linked_pr_number, linked_pr_state, now),
         )
 
+    def refund_attempt(self, task_id: int) -> None:
+        """Give back the attempt charged when this run was claimed.
+
+        Used only for a runtime that refused to start (it exited non-zero without
+        emitting a single stream record): the claim had already charged an attempt
+        before the refusal was knowable, and no model work was attempted or paid
+        for. Charging the bounded-retry budget for a configuration fault is what
+        parked a healthy task as `failed` after three no-op attempts during the #6
+        pilot. Guarded so a double refund cannot mint budget.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, "
+            "updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task_id),
+        )
+
     def mark_needs_attention(self, task_id: int, note: str) -> None:
         self._conn.execute(
             "UPDATE tasks SET phase = 'needs_attention', last_error = ?, updated_at = ? WHERE id = ?",
