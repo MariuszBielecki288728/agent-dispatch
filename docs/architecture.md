@@ -45,6 +45,14 @@ Issue #1 left an open decision: production unattended file mutation was **not de
 - **D2 — `--yolo` must be re-passed on every invocation, including every resume.** Permission grants do not persist inside a resumed session (probe D). The runtime adapter therefore never treats permission state as sticky session metadata.
 - **D3 — Model/effort are likewise re-passed explicitly on every resume.** `--model` persistence across resume was **not** verified. Re-passing the pinned values is a deliberate design choice: it makes "config change silently moves an existing session onto another model" structurally impossible, satisfying the pinning requirement in Issue #2.
 
+**Re-verified on v1.64.1 (2026-09-29, during the Issue #6 pilot).** The mutation
+unlocks above are unchanged, but the accepted `--effort` set is **model dependent and
+can change under a runtime upgrade**: `deepseek/deepseek-v4-flash` now accepts only
+`high|max`, and `medium` (valid on v1.64.0 the day before) makes the CLI exit 1 with
+`Unknown effort "medium". Supported: high, max.` and an **empty stream**. That is why
+a refused start is classified as a configuration fault rather than a task failure —
+see §8.
+
 ### 2.2 Silent false-success hazard (highest-risk finding)
 
 A run whose tool calls were **all blocked** still reported:
@@ -69,7 +77,7 @@ In a successful `--yolo` run this event is **absent** (tool events progress `too
 ### 2.3 Session, stream, and resume facts
 
 - `--output-format json` emits NDJSON: `run_start` carries `sessionId` on the **first line**; the final `result` line carries `subtype`, `sessionId`, `finalText`, `stopReason`, `usage{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}`, `durationMs`.
-- After a **cleanly completed** run, resume via `--session <id>` keeps the same `sessionId` and retains prior-turn context (verified by asking the agent to recall a filename it created in an earlier turn). Resume also works from a different working directory.
+- After a **cleanly completed** run, resume via `--session <id>` keeps the same `sessionId` and retains prior-turn context (verified by asking the agent to recall a filename it created in an earlier turn). Resume also works from a different working directory. **Re-verified live on v1.64.1 (2026-09-29, Issue #6 pilot):** the review round resumed the implementation session and implemented a follow-up request touching the file the first turn had created.
 - A turn-cap hit exits with **code 8** (per `--help`), distinct from a normal failure exit 1.
 - Confirmed relevant flags: `-p/--print`, `--output-format`, `--session`, `-m/--model`, `--effort`, `--yolo` / `--dangerously-skip-permissions`, `--max-turns`, `-t/--trust`, `--skip-onboarding`, `--no-auto-update`, `--no-skills`, `--list-models`, `-w/--worktree`, `-r/--resume`. 80 models listed; default `deepseek/deepseek-v4-flash`.
 - `commandcode status` / `whoami` expose authentication state without printing credentials.
@@ -450,7 +458,7 @@ First turn (note: no redirect inside the worktree — logs live outside, §6):
 ```bash
 cd <worktree>
 commandcode -p "<bounded instruction>" \
-  --model deepseek/deepseek-v4-flash --effort medium \
+  --model deepseek/deepseek-v4-flash --effort high \
   --yolo \
   --output-format json --max-turns 40 \
   --skip-onboarding --no-auto-update \
@@ -463,7 +471,7 @@ Follow-up round (identical except `--session`):
 cd <worktree>
 commandcode -p "<consolidated review feedback>" \
   --session <pinned-session-id> \
-  --model deepseek/deepseek-v4-flash --effort medium \
+  --model deepseek/deepseek-v4-flash --effort high \
   --yolo \
   --output-format json --max-turns 40 \
   --skip-onboarding --no-auto-update \
@@ -497,6 +505,18 @@ must not open an empty PR, whereas a review round that correctly concludes that 
 comment needs no code change is a *valid* outcome and is accepted and recorded as a
 no-op. What is never allowed is claiming changes were made — the round's committed
 diff is what the PR branch actually carries.
+
+### A runtime that refuses to start is a configuration fault
+
+A process that exits non-zero **without emitting a single stream record** never began
+a conversation: the CLI rejected its own invocation (the observed v1.64.1 case was an
+`--effort` value the pinned model no longer accepts) or crashed at startup. The driver
+reads the stderr sidecar for exactly that shape and quotes it into the failure, the
+orchestrator parks the task as `needs_attention`, and the claim's attempt is
+**refunded** — no model work was attempted and nothing was paid for, so charging the
+bounded-retry budget would park a healthy task for a configuration fault. Any stream
+record at all makes the classification impossible, so a run that actually started
+keeps its normal meaning and its normal cost.
 
 ### Retry semantics after an interrupted run
 
@@ -874,7 +894,7 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 - **Fail-closed tests:** a truncated feedback listing, a missing session, a closed or foreign PR, a paused task, a missing `take-it` and a concurrent handoff all refuse or defer with the feedback neither silently lost nor incorrectly marked complete.
 - The merged #17 one-comment lifecycle is reused: a round heartbeats the **same** comment, publication recovery may edit it later with no live runtime, the final body is `Awaiting review`, and a late `Running` write can never follow terminal publication.
 - No auto-merge, no cross-repo mutation.
-- **Not covered offline, and stated as such:** a live `agent:fix` round against real GitHub and real Command Code (same-session continuity with real concurrent feedback, real pagination on the review endpoints, and a real label deletion). That is the opt-in VM smoke, and it is reported as *not tested* rather than assumed.
+- **Not covered offline, and stated as such:** a live `agent:fix` round against real GitHub and real Command Code (same-session continuity with real concurrent feedback, real pagination on the review endpoints, and a real label deletion). **Live-verified once on the pilot repository (2026-09-29)** — the round resumed the same session ID on the real PR, applied a fresh review request, was acknowledged after publication, and survived a worker restart with no duplicate invocation; the paused/withdrawn states and the legacy crash-signature repair were observed too. Still **not** live-tested: concurrent feedback arriving mid-round, real pagination/rate limits on the review endpoints, and crash windows inside a round.
 
 **#6 — operational release**
 - Fault/reconciliation matrix exercised: duplicate events, pagination gaps, crash during run, push-ok/timeout, PR created/DB write failed, PR merged or closed externally, provider unavailable, VM downtime, rate limit, edited/deleted comments, branch-base divergence.
@@ -889,5 +909,5 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 1. **`--yolo` is the configured mode and no re-approval is requested.** The maintainer has approved the broad grant and the Command Code choice; no Docker/sandbox requirement is added. Recorded here only because it is the single verified mutation unlock (§2.1) and because `--permission-mode yolo` / `--tools-all` are *not* working substitutes if the flag is ever revisited.
 2. **Label creation — resolved.** `setup-labels` creates `take-it` and `agent:fix` explicitly and idempotently; both exist in the allowlisted repositories.
 3. **Disposable test repository — resolved.** `MariuszBielecki288728/agent-dispatch-pilot` is the dedicated live-test repository. Reads are verifiable with `doctor`; **writes** (branch push, PR, labels, status comment) additionally require the wrapper's credential to hold Contents/Issues/Pull-requests write access there.
-4. **Effort default — settled in configuration.** The shipped config uses `--effort medium`; the setting is per-repository (#6), so a cheaper repository can run `low` without touching any other.
+4. **Effort — per-repository and model dependent.** The shipped config uses `--effort high` because that is what the pinned model accepts on v1.64.1 (`high|max`; `medium` is now rejected outright). The value is per-repository (#6), so a cheaper repository can override it, and an accepted value is only authoritative for the runtime version that accepted it — a refused start is reported and costs no attempt (§8).
 5. **Worktree-local Git config — implemented as opt-in.** The inherited `GIT_CONFIG_*` pairs always cover orchestrator Git *and* the agent subprocess; writing the same reset-then-wrapper sequence into the source clone's repo-local config is `worker.write_repo_local_credentials`, **off by default** because a worktree shares that configuration with every other worktree of the clone.

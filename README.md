@@ -28,6 +28,11 @@ Code in a task-owned Git worktree, validated, committed, pushed, and opened as
 exactly one PR owned by that task. Adding the `agent:fix` label to that PR resumes
 the **same session** for one consolidated batch of feedback.
 
+The whole loop has been exercised **live** on the disposable pilot repository
+(`Issue #1 → PR #4 → one agent:fix round`, plus pause/withdraw/restart and
+crash-signature recovery checks) — see [`docs/operations.md` §17](docs/operations.md)
+for what was observed on the VM and what is still only modelled offline.
+
 ```
 poll -> queue -> claim (conditional SQL) -> worktree + branch
      -> Command Code run (pinned model/effort/--yolo, bounded turns, wall-clock cap)
@@ -212,7 +217,7 @@ A blocked run still reports `subtype: "success"` with exit code 0 and no error f
       -c credential.https://github.com.helper="!<wrapper> auth git-credential" <command>
   ```
 
-  A per-invocation `-c` covers only that process, so the orchestrator also exports this reset-then-wrapper pair through Git's inherited `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` environment variables for the agent subprocess, and optionally writes it into the source clone's **repo-local** config (`worker.write_repo_local_credentials`, off by default). On this VM the inherited order is the unapproved raw `gh` helper first and the wrapper second, and — **measured 2026-09-25** — the raw helper currently *does* return a real credential for `github.com`. The reset entry is therefore load-bearing, not defensive; see [`docs/operations.md` §12](docs/operations.md).
+  A per-invocation `-c` covers only that process, so the orchestrator also exports this reset-then-wrapper pair through Git's inherited `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` environment variables for the agent subprocess, and optionally writes it into the source clone's **repo-local** config (`worker.write_repo_local_credentials`, off by default). On this VM the inherited order is the unapproved raw `gh` helper first and the wrapper second, and — **measured 2026-09-25** — the raw helper currently *does* return a real credential for `github.com`. The reset entry is therefore load-bearing, not defensive; re-verified on 2026-09-29 with a credential-free sentinel that the file-scope helper is never tried. See [`docs/operations.md` §12](docs/operations.md).
 - **Operational guardrails:** repository allowlist only, no automatic merge, no Issue closure, no reviewer approval, no touching unrelated repositories, one task at a time, bounded run timeout and retries, no token or raw-log dumping.
 - **State and logs live outside every target repository**, enforced by configuration validation rather than convention: a log written inside a worktree could be swept into a commit by `git add -A`. `test-offline.sh` asserts the checkout is left untouched.
 - **Failed GitHub access is reported honestly.** An inaccessible repository, a missing wrapper, an auth failure, a rate limit or a network error is surfaced with its cause; it can never mark an Issue as completed, and the service never retries with another identity or model.
