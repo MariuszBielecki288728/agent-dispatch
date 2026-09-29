@@ -1,4 +1,4 @@
-# agent-dispatch — operations (Issues #3–#5, #17)
+# agent-dispatch — operations (Issues #3–#6, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
 SQLite queue, and **one Command Code session per task** in a task-owned Git
@@ -1085,7 +1085,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 280 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # the full offline suite (no network, no credits)
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -1144,6 +1144,7 @@ a mock. The cases most worth knowing about:
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
 | `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard measures the longest requirement variant the builder can join, so a batch that fits only while the diff is readable is refused and an admitted handoff builds under either; the unreadable-diff requirement set is a strict superset of the readable one, and the built instruction emits each required section exactly once with the closing instruction last |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
+| `MultiRepoExecutionTests` | two allowlisted repositories carrying the same Issue number *and title* stay separate in task rows, branches, worktrees, run logs and PRs, and only one task runs at a time across both |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -1168,11 +1169,12 @@ uv lock                                  # refresh it deliberately
 
 ## 15. Not in this release
 
-Documented so nothing here is mistaken for a working feature. These belong to
-Issue #6 and are **not implemented, not stubbed and not faked**:
+Documented so nothing here is mistaken for a working feature:
 
-- multi-repo concurrency above one (configuration rejects it), distributed leases,
-  a broker, webhooks, a dashboard, or a provider-plugin system (#6);
+- **more than one active task.** Multi-repo *configuration* is supported (§17), but
+  `max_concurrent_tasks` must stay `1` and configuration rejects anything higher.
+  Distributed leases, a broker, webhooks, a dashboard and a provider-plugin system
+  remain out of scope;
 - automatic merge, automatic approval, Issue closure, or deletion of unknown
   worktrees — permanently out of scope, not deferred;
 - **automatic review generation.** The review loop *accepts* feedback; it never
@@ -1534,3 +1536,150 @@ anything about a live round against real GitHub and real Command Code:
 
 A CLI session is viewed through the VS Code Remote SSH **terminal**, not native VS
 Code Chat — the same limitation as §15.
+
+---
+
+## 17. The operational pilot (#6): multi-repo and the first safe trial
+
+Issue #6 was the operational release: prove the installed service, keep the accepted
+permission model, and exercise the whole workflow on a disposable repository. This
+section is the durable operator-facing part — how to add a repository, what the
+wrapper must be allowed to do, the first safe trial, and how to upgrade or roll back
+without touching the queue.
+
+### Add a repository to the allowlist
+
+Every repository the worker may touch must be listed; anything unlisted is refused
+with a clear error and never polled. Per-repo runtime settings exist so a small test
+repository can run a cheaper effort than a production one:
+
+```toml
+[repos."owner/name"]
+path = "/home/craftlypse/code/owner-name"   # a source clone, never your working copy
+base_branch = "main"
+
+[repos."owner/name".runtime]
+driver = "commandcode"
+model = "deepseek/deepseek-v4-flash"
+effort = "low"
+permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = 40
+```
+
+The config is read once at startup, so restart the unit afterwards:
+
+```bash
+systemctl --user restart agent-dispatch.service
+agent-dispatch doctor      # each repo: readable? labels present?
+agent-dispatch dry-run     # one read-only poll across every repo, persisting nothing
+```
+
+What multi-repo does — and does not — mean here:
+
+- every configured repository is polled, and tasks are keyed by `(repo, Issue)`, so
+  the same Issue number in two repositories is two independent tasks;
+- branches live in each repository's own source clone, worktrees under
+  `<worktree_root>/<owner>__<name>/issue-<N>/`, and run logs under the same per-repo
+  path, so no artifact is shared between repositories;
+- **one task runs at a time across all repositories** (`max_concurrent_tasks = 1`),
+  enforced by the single-instance lock plus the conditional SQL claim. Queue, logs
+  and worktrees stay on the VM under `worker.state_db` and `worker.worktree_root`,
+  never in your normal checkout — configuration validation enforces the placements.
+
+If only one repository is authorized for a live test, cover the second with the
+offline fixtures ([`tests/fake_wrapper.py`](../tests/fake_wrapper.py)); do not widen
+credentials to make a test pass.
+
+### Wrapper write permission is a prerequisite, and it fails visibly
+
+All GitHub writes — branch push, PR create/adopt/label, Issue status comment and
+label changes — go through the configured wrapper and **its** credential. Read
+access is not enough, and the refusal is explicit rather than silent:
+
+```
+remote: Permission to <owner>/<repo>.git denied to <user>
+fatal: unable to access '<url>': The requested URL returned error: 403
+```
+
+For a fine-grained token, add the repository under *Repository access → Selected
+repositories* with **Contents: Read and write**, **Issues: Read and write** and
+**Pull requests: Read and write**. `doctor` can verify *readability* per repository;
+token scopes are not observable through the wrapper, so the write capability is
+proven by the first write. That is exactly why the first trial arms **one**
+disposable Issue before the tool is opened up to another repository.
+
+### The first safe trial (copy-pastable)
+
+```bash
+# 0. Stop new dispatch while you prepare.
+systemctl --user stop agent-dispatch.service   # nothing dispatches until an Issue is armed
+#    To hold ONE existing task instead (sticky, explicit):
+agent-dispatch pause --repo owner/name --issue N
+
+# 1. Confirm the prerequisites (wrapper, allowlist, labels, state placement).
+agent-dispatch doctor
+agent-dispatch dry-run
+
+# 2. Create the trigger labels deliberately, once.
+agent-dispatch setup-labels --repo owner/name --yes
+
+# 3. Arm ONE bounded Issue and watch its single status comment on GitHub:
+#      Queued -> Starting -> Running -> Publishing -> Awaiting review
+#    Locally: journalctl --user -u agent-dispatch -f
+#    Do not arm a second Issue yet — the one-task limit is global.
+
+# 4. Review the PR. To ask for changes: add a review comment AND the `agent:fix`
+#    label. The round resumes the SAME session in the SAME worktree, pushes to the
+#    SAME PR, and returns to `Awaiting review`.
+#    For another round: REMOVE the label, let the round finish, then ADD it again.
+
+# Inspect anything, any time (all read-only):
+agent-dispatch status
+agent-dispatch open --repo owner/name --issue N
+agent-dispatch review --dry-run        # why a visible agent:fix is not starting yet
+```
+
+Before pointing the worker at another repository: `pause` it, or stop the unit, and
+confirm `status` shows nothing active. An in-flight task delays the new repository's
+first dispatch rather than running beside it.
+
+### Upgrade, rollback and uninstall
+
+The state is never the casualty of an install step:
+
+```bash
+./scripts/install-service.sh --uninstall   # stop + disable + remove the unit ONLY
+./scripts/install-service.sh --install     # reinstall the same unit
+./scripts/install-service.sh --status
+```
+
+`--uninstall` removes the **unit only**. The queue (`worker.state_db`), run logs, the
+lock and every owned worktree are deliberately left where they are: the SQLite file
+is the durable record of what was and was not done, and deleting it would discard
+exactly the evidence a recovery needs. No install/uninstall path deletes anything
+under `~/.local/state/agent-dispatch/` or `worker.worktree_root`.
+
+Upgrading code is the documented uv procedure (§1): fetch through the wrapper-backed
+Git path, `uv sync --locked`, relink `~/.local/bin/agent-dispatch` if the interpreter
+moved, then `systemctl --user restart agent-dispatch.service`. An existing database
+is migrated forward in place on first write (new tables/columns only), and
+`state.db` rows, logs and worktrees survive the restart.
+
+Rolling back is a **code** operation:
+
+```bash
+cd ~/code/agent-dispatch
+git -c credential.https://github.com.helper= \
+    -c credential.https://github.com.helper='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential' \
+    fetch --all
+git switch --detach <last-known-good-sha>
+uv sync --locked
+systemctl --user restart agent-dispatch.service
+```
+
+If you intend to run a much older build against a database a newer build has already
+migrated, take a consistent copy first (the SQLite backup API works while the worker
+is running) and keep the copy beside the state file rather than downgrading around
+it. Queue ownership does not change: a task remains owned by whoever recorded the
+branch, worktree and PR, whichever build is running.

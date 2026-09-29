@@ -18,7 +18,7 @@ Built for a single trusted personal development VM. Deliberately small: **simpli
 | Developer tooling: uv, Ruff, pre-commit | #14 | ✅ Implemented — see [`docs/operations.md` §2](docs/operations.md) |
 | MVP execution: worktree, session, PR | [#4](https://github.com/MariuszBielecki288728/agent-dispatch/issues/4) | ✅ Implemented — see [`docs/operations.md` §0–§12](docs/operations.md) |
 | Review loop: feedback collection, handoff | [#5](https://github.com/MariuszBielecki288728/agent-dispatch/issues/5) | ✅ Implemented — see [`docs/operations.md` §16](docs/operations.md) |
-| Operational release and pilot | #6 | Planned |
+| Operational release and pilot | [#6](https://github.com/MariuszBielecki288728/agent-dispatch/issues/6) | ✅ Implemented — see [`docs/operations.md` §17](docs/operations.md) |
 
 **Implemented today: the full one-task loop, Issue → PR → review rounds.**
 One installable Python package, one CLI entry point, one polling loop, one SQLite
@@ -170,10 +170,12 @@ protocol is inert by construction — a safe default, not a bug.
 
 **Command Code CLI is the initial implementation, not a permanent provider lock-in.** It is the default because the maintainer currently subscribes to it. Switching runtime later is configuration plus one small adapter; selecting a different supported model *within* Command Code is normally just a config change. Existing tasks stay pinned to the runtime, model, and session recorded at start, and a config change never silently migrates a running or resumable session.
 
-The current release does **not** invoke the runtime. The pinned
-`runtime.driver`/`model`/`effort`/`permission_mode` are validated and stored on each
-task row at discovery time, so that #4 inherits an explicit, auditable contract
-rather than an implied one. An unsupported driver is a startup error.
+`worker` and `run` **do invoke the runtime**, in the task's owned worktree, with the
+pinned `runtime.driver`/`model`/`effort`/`permission_mode` recorded on that task row at
+discovery time — an explicit, auditable per-repo contract rather than an implied one.
+An unsupported driver is a startup error; a missing runtime binary is reported once as
+`dispatch_unavailable` and **claims no task**, so a queued Issue is not consumed by a
+configuration fault. Selecting a different supported model affects **new** tasks only.
 
 ---
 
@@ -210,7 +212,7 @@ A blocked run still reports `subtype: "success"` with exit code 0 and no error f
       -c credential.https://github.com.helper="!<wrapper> auth git-credential" <command>
   ```
 
-  A per-invocation `-c` covers only that process, so managed worktrees also get this reset-then-wrapper sequence written into their **repo-local** config, which agent-issued Git inherits. On this VM the inherited order is the unapproved raw `gh` helper first and the wrapper second; the raw helper currently returns nothing, so the chain happens to fall through — that is incidental, not guaranteed.
+  A per-invocation `-c` covers only that process, so the orchestrator also exports this reset-then-wrapper pair through Git's inherited `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` environment variables for the agent subprocess, and optionally writes it into the source clone's **repo-local** config (`worker.write_repo_local_credentials`, off by default). On this VM the inherited order is the unapproved raw `gh` helper first and the wrapper second, and — **measured 2026-09-25** — the raw helper currently *does* return a real credential for `github.com`. The reset entry is therefore load-bearing, not defensive; see [`docs/operations.md` §12](docs/operations.md).
 - **Operational guardrails:** repository allowlist only, no automatic merge, no Issue closure, no reviewer approval, no touching unrelated repositories, one task at a time, bounded run timeout and retries, no token or raw-log dumping.
 - **State and logs live outside every target repository**, enforced by configuration validation rather than convention: a log written inside a worktree could be swept into a commit by `git add -A`. `test-offline.sh` asserts the checkout is left untouched.
 - **Failed GitHub access is reported honestly.** An inaccessible repository, a missing wrapper, an auth failure, a rate limit or a network error is surfaced with its cause; it can never mark an Issue as completed, and the service never retries with another identity or model.

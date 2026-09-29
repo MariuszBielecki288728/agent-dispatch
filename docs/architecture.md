@@ -1,10 +1,13 @@
 # agent-dispatch — Architecture and Task State Contract
 
-**Issue:** #2 (design-only)
-**Status:** Proposed for maintainer review
+**Issue:** #2 (design-only at the time; now implemented)
+**Status:** **Implemented** — Issues #3–#6 and #17 are merged. The current code and
+[`operations.md`](./operations.md) are authoritative for behaviour; this document is
+the design contract and the observed ground truth that shaped it. Where the two
+disagree, the code wins and the document is the bug.
 **Inputs:** [#1 / PR #7](https://github.com/MariuszBielecki288728/agent-dispatch/pull/7) — [`docs/feasibility.md`](./feasibility.md)
 **Target environment:** `craftlypse-agent` (Ubuntu 24.04.5, user `craftlypse`, `systemd --user` with `Linger=yes`)
-**Implementation plan:** Issues #3 → #6. This document does **not** implement the service.
+**Implementation plan:** Issues #3 → #6.
 
 ---
 
@@ -89,7 +92,7 @@ On this VM the effective order for `github.com` is:
 1. `/usr/bin/gh auth git-credential` — the **unapproved** raw helper, from `~/.gitconfig`
 2. `gh-craftlypse auth git-credential` — the approved wrapper, from `.git/config`
 
-Today the raw helper happens to return **no** credentials, so the chain falls through to the wrapper. That is **incidental, not guaranteed** — it depends on ambient file ordering and on whether a raw `gh` credential ever exists. A single `-c` override alone therefore does **not** ensure the wrapper is used.
+**Measured again on 2026-09-25: the raw helper currently *does* return a real credential for `github.com`.** The reset entry is therefore **load-bearing, not defensive** — without it the unapproved helper answers first and stops the chain. (The earlier #2 observation that it returned nothing was accurate when taken; ambient helper state can change without any change here.) A single `-c` override alone does **not** ensure the wrapper is used.
 
 > **Requirement:** clear the inherited list, then set the wrapper — in that order:
 > ```bash
@@ -109,7 +112,11 @@ This remains an **operational guardrail on a personal VM, not hard isolation**: 
 
 ### 2.5 Labels
 
-`take-it` and `agent:fix` **do not exist** in this repository yet (only GitHub's 10 default labels). Issue #3 must create them (or the maintainer must). Until then the trigger protocol is inert by construction — a safe default.
+`take-it` and `agent:fix` are created **deliberately** by
+`agent-dispatch setup-labels --repo owner/name --yes`, never as a side effect of
+polling, and both must exist before their protocol does anything: with no label
+present, discovery finds nothing at all — a safe default rather than a bug. `doctor`
+reports a missing label together with that exact command.
 
 ### 2.6 Explicitly unknown / not tested
 
@@ -880,7 +887,7 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 ## 13. Open items for maintainer confirmation
 
 1. **`--yolo` is the configured mode and no re-approval is requested.** The maintainer has approved the broad grant and the Command Code choice; no Docker/sandbox requirement is added. Recorded here only because it is the single verified mutation unlock (§2.1) and because `--permission-mode yolo` / `--tools-all` are *not* working substitutes if the flag is ever revisited.
-2. **Label creation.** `take-it` and `agent:fix` do not exist yet; confirm who creates them.
-3. **Disposable test repository.** Confirm which repo is allowlisted for the #4/#6 end-to-end runs, and confirm `agent-dispatch` itself is within the credential's permitted set.
-4. **Effort default.** `--effort medium` is proposed; adjust if the default model behaves better at another level.
-5. **Worktree-local Git config is written by the orchestrator.** Provisioning will set the reset-then-wrapper credential sequence in each managed worktree's repo-local config (§2.4). Flagging because it modifies Git config state that the maintainer may want to inspect; it does not touch the user's normal checkout.
+2. **Label creation — resolved.** `setup-labels` creates `take-it` and `agent:fix` explicitly and idempotently; both exist in the allowlisted repositories.
+3. **Disposable test repository — resolved.** `MariuszBielecki288728/agent-dispatch-pilot` is the dedicated live-test repository. Reads are verifiable with `doctor`; **writes** (branch push, PR, labels, status comment) additionally require the wrapper's credential to hold Contents/Issues/Pull-requests write access there.
+4. **Effort default — settled in configuration.** The shipped config uses `--effort medium`; the setting is per-repository (#6), so a cheaper repository can run `low` without touching any other.
+5. **Worktree-local Git config — implemented as opt-in.** The inherited `GIT_CONFIG_*` pairs always cover orchestrator Git *and* the agent subprocess; writing the same reset-then-wrapper sequence into the source clone's repo-local config is `worker.write_repo_local_credentials`, **off by default** because a worktree shares that configuration with every other worktree of the clone.
