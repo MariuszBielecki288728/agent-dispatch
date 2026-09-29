@@ -43,7 +43,12 @@ from typing import Callable
 from .config import Config, RepoConfig, RuntimeConfig
 from .gitcmd import Git, GitError
 from .github import ErrorKind, GitHubClient, GitHubError, Issue
-from .instruction import build_instruction
+from .instruction import (
+    build_instruction,
+    complete_body_path,
+    issue_body_excerpt,
+    write_complete_issue_body,
+)
 from .logging_setup import Logger
 from .review import (
     FeedbackSet,
@@ -77,6 +82,7 @@ from .statuscomment import (
     sync_all_status,
 )
 from .store import (
+    DISPATCH_FAULT_PREFIX,
     INTERRUPTED_RUN_MARKER,
     PUBLISH_RECONCILE_PHASES,
     RECOVERY_COMMIT_FAILED,
@@ -111,6 +117,10 @@ BLOCKED_ELIGIBILITY_RACE = "eligibility_race"
 BLOCKED_ACTIVE_TASK = "active_task"
 BLOCKED_WORKTREE = "worktree_unowned"
 BLOCKED_RUNTIME_MISSING = "runtime_missing"
+#: The instruction cannot be delivered whole and its complete-copy escape hatch could
+#: not be written. A configuration fault (an unwritable state directory, a full disk),
+#: never a task failure — see `Orchestrator._prepare_instruction`.
+BLOCKED_INSTRUCTION_INCOMPLETE = "instruction_incomplete"
 
 #: Outcomes an attempt can report.
 OUTCOME_PR_READY = "awaiting_review"
@@ -613,6 +623,23 @@ class Orchestrator:
                 attempts=task.attempts,
             )
 
+        # The complete Issue body (#22), prepared BEFORE the claim. An instruction
+        # that cannot carry the body whole must name a readable copy of it, so when
+        # the copy cannot be written the dispatch is refused here — no claim, no run
+        # row, no attempt consumed, and the task stays queued for the next poll. That
+        # is deliberately the `dispatch_unavailable` class (a configuration fault, not
+        # a task failure): nothing about the task is wrong, so parking it behind an
+        # operator command would be a lie, and `retry` would additionally reset the
+        # attempt budget of a task that may have real history.
+        complete_body_file, refusal = self._prepare_instruction(task, repo, issue)
+        if refusal is not None:
+            return refusal
+        # The dispatcher can proceed, so a note from an earlier refusal is stale — and
+        # it must not reach the model as a "previous attempt" error, because no attempt
+        # ever started. Only the prefixed fault note is cleared; a recorded run failure
+        # keeps describing what actually happened.
+        self.store.clear_dispatch_fault(task.id)
+
         # Record the owned paths even if the claim then loses the race, so the row
         # always answers "which branch/worktree belongs to this task".
         self.store.set_owned_worktree(
@@ -675,6 +702,7 @@ class Orchestrator:
             agents_file=repo.agents_file,
             is_retry=provision.state.dirty or provision.state.has_commits,
             previous_error=pinned.last_error,
+            complete_body_path=complete_body_file,
         )
         for note in instruction.notes:
             self.log.info("instruction_note", repo=repo.slug, issue=task.issue_number, note=note)
@@ -714,6 +742,55 @@ class Orchestrator:
             issue=issue,
             publisher=publisher,
             run_started_at=self._run_started_at,
+        )
+
+    def _prepare_instruction(
+        self, task: Task, repo: RepoConfig, issue: Issue
+    ) -> tuple[Path | None, DispatchOutcome | None]:
+        """Write the complete Issue body when the instruction cannot carry it whole.
+
+        Returns ``(path, refusal)`` — at most one is set. The decision to write comes
+        from the same :func:`issue_body_excerpt` the instruction builder renders from,
+        so "is a copy needed" is answered once rather than twice.
+
+        No copy is written when the body fits: the common path stays byte-identical to
+        what it was before #22, and no file exists that nothing points at. When a
+        needed copy cannot be written, the dispatch is refused rather than run against
+        a silently truncated document.
+        """
+        excerpt = issue_body_excerpt(issue.body or "")
+        if not excerpt.truncated:
+            return None, None
+
+        target = complete_body_path(self.config.worker.run_log_dir, repo.slug, task.issue_number)
+        problem = write_complete_issue_body(target, excerpt.document)
+        if problem is None:
+            return target, None
+
+        note = (
+            f"{DISPATCH_FAULT_PREFIX} the Issue body does not fit the instruction "
+            f"({len(excerpt.text)} of {excerpt.total} characters are readable in it) and the "
+            f"complete copy could not be written — {problem}"
+        )
+        # Recorded WITHOUT a phase change: the task stays queued, so the next poll
+        # retries by itself once the fault clears and no attempt is consumed.
+        self.store.record_dispatch_fault(task.id, note)
+        self.log.error(
+            "dispatch_refused",
+            repo=repo.slug,
+            issue=task.issue_number,
+            reason=BLOCKED_INSTRUCTION_INCOMPLETE,
+            detail=note,
+        )
+        return None, DispatchOutcome(
+            action=OUTCOME_BLOCKED,
+            task_ref=task.ref,
+            reason=BLOCKED_INSTRUCTION_INCOMPLETE,
+            notes=[
+                note,
+                "no agent was started and no attempt was consumed; the task stays queued and "
+                "the next poll retries once the state directory is writable again",
+            ],
         )
 
     def _effective_runtime(self, task: Task, repo: RepoConfig) -> RuntimeConfig:

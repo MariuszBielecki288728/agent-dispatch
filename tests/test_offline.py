@@ -235,6 +235,7 @@ def issue(
     labels: list[str] | None = None,
     state: str = "open",
     is_pr: bool = False,
+    body: str = "",
 ) -> dict:
     payload = {
         "number": number,
@@ -242,6 +243,11 @@ def issue(
         "state": state,
         "html_url": f"https://github.com/example/repo/issues/{number}",
         "labels": [{"name": name} for name in (labels or [])],
+        # GitHub always returns a `body` field (null for an empty description).
+        # #22's instruction-bound tests need real, oversized descriptions; every
+        # other fixture can keep omitting it and get the same empty default the
+        # service treats a missing body as.
+        "body": body,
     }
     if is_pr:
         payload["pull_request"] = {

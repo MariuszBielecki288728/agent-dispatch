@@ -78,6 +78,15 @@ RECOVERY_INTERRUPTED = "interrupted"
 #: depend on re-reading a note that only existed during one call.
 INTERRUPTED_RUN_MARKER = "interrupted: the worker process ended while this run was in flight"
 
+#: Detail prefix of a **pre-claim dispatch refusal** (#22): the dispatcher could not
+#: assemble a whole instruction, so it never started a run at all. A stable prefix
+#: rather than free prose because :meth:`Store.clear_dispatch_fault` matches on it,
+#: and that match is what keeps the clear from ever discarding a recorded *run*
+#: failure instead. Clearing matters because `tasks.last_error` is fed back into the
+#: next instruction as "the previous attempt was rejected because ...": a fault that
+#: started no attempt must not be presented to the model as one.
+DISPATCH_FAULT_PREFIX = "refused dispatch:"
+
 #: Stages whose preserved local work is finished work and may be published without a
 #: model call. Deliberately excludes `interrupted`.
 #:
@@ -1337,6 +1346,41 @@ class Store:
         self._conn.execute(
             "UPDATE tasks SET phase = 'needs_attention', last_error = ?, updated_at = ? WHERE id = ?",
             (note, utcnow_iso(), task_id),
+        )
+
+    def record_dispatch_fault(self, task_id: int, note: str) -> None:
+        """Record why a dispatch was refused **without** changing the task's phase.
+
+        Used by the pre-claim refusals (#22): the fault (an unwritable state
+        directory, a full disk) is in the dispatcher's environment, not in the task,
+        so the row must stay exactly as it was — still queued, no attempt consumed —
+        and the next poll retries once the fault clears. Parked in ``needs_attention``
+        instead, the task would need an operator command to recover from a condition
+        the dispatcher can simply retry, and that command (``retry``) would also reset
+        the attempt budget of a task that may have real history.
+
+        The note is the recorded reason: ``status`` and ``open`` both print
+        ``tasks.last_error``, which is what makes the refusal visible.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET last_error = ?, updated_at = ? WHERE id = ?",
+            (note, utcnow_iso(), task_id),
+        )
+
+    def clear_dispatch_fault(self, task_id: int) -> None:
+        """Forget a recorded pre-claim refusal once the dispatcher can proceed again.
+
+        Only a note written by :meth:`record_dispatch_fault` is cleared — matched by
+        its fixed prefix — because ``last_error`` is also where run failures live, and
+        those must survive until a real run replaces them. The narrowness is the point:
+        ``build_instruction(previous_error=...)`` turns this field into "the previous
+        attempt was rejected because ...", and a fault that never started an attempt
+        must not be handed to the model as one. A stale *run* failure, by contrast,
+        still describes something that happened.
+        """
+        self._conn.execute(
+            "UPDATE tasks SET last_error = NULL, updated_at = ? WHERE id = ? AND last_error LIKE ?",
+            (utcnow_iso(), task_id, f"{DISPATCH_FAULT_PREFIX}%"),
         )
 
     def park_for_recovery(self, task_id: int, *, stage: str, note: str) -> None:
