@@ -40,7 +40,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .config import Config, RepoConfig
+from .config import Config, RepoConfig, RuntimeConfig
 from .gitcmd import Git, GitError
 from .github import ErrorKind, GitHubClient, GitHubError, Issue
 from .instruction import build_instruction
@@ -642,20 +642,21 @@ class Orchestrator:
                 ],
             )
 
-        self.store.record_runtime_identity(
-            task.id,
-            driver=repo.runtime.driver,
-            model=repo.runtime.model,
-            effort=repo.runtime.effort,
-            permission_mode=repo.runtime.permission_mode,
-        )
+        # The identity this task is pinned to — NOT the current repo config. Repo
+        # configuration supplied the default when the row was created, and it must not
+        # silently replace the pin here: an ordinary retry has to invoke the
+        # model/effort the task started with. Only the explicit operator recovery paths
+        # (`retry`, `review --retry-round`) may re-pin, and only after a recorded
+        # startup refusal (`Store.last_run_refused`). A legacy row with no recorded
+        # identity is backfilled once, here, before anything renders it.
+        self._effective_runtime(task, repo)
 
         # Re-read the row so the run and its status comment are driven by the identity
-        # just PINNED, not by the snapshot taken before the claim. `task` was loaded
-        # during discovery, so a config change in between would otherwise let the
-        # driver invoke the new model while the comment rendered the old one — the
-        # comment claiming a model that never ran this task, which is exactly what the
-        # pinned identity exists to prevent.
+        # the task is PINNED to, not by the snapshot taken before the claim. `task` was
+        # loaded during discovery, so a config change in between would otherwise let
+        # the comment render a different model than the one the task is pinned to —
+        # the comment claiming a model that never ran this task, which is exactly what
+        # the pinned identity exists to prevent.
         pinned = self.store.get_task(task.repo, task.issue_number) or task
 
         # ONE publisher for the whole run lifecycle (Starting -> Running heartbeats ->
@@ -715,6 +716,55 @@ class Orchestrator:
             run_started_at=self._run_started_at,
         )
 
+    def _effective_runtime(self, task: Task, repo: RepoConfig) -> RuntimeConfig:
+        """The runtime identity a run for this task must use: the row's pinned one.
+
+        Repo configuration supplies the defaults for a **new** task (recorded when the
+        row is created) and is backfilled once here for a legacy row that has no
+        identity. It must never silently replace an existing task's pin: an ordinary
+        retry, or a review round resuming the same session, has to invoke the
+        model/effort that task started with, or the row, the status comment and the
+        provider's actual cost disagree about what ran.
+
+        The two explicit operator recovery paths (``retry`` and
+        ``review --retry-round``) may deliberately re-pin after a recorded startup
+        refusal — no model turn happened, so there is no conversation whose identity
+        must be preserved — and they write the row themselves (see
+        ``Store.last_run_refused``).
+
+        ``permission_flag`` and ``max_turns`` stay operational configuration rather
+        than part of the pin: the pin answers "which model/effort produced this
+        conversation", while the flag and the turn cap describe how the current build
+        is allowed to invoke any model at all.
+        """
+        if task.runtime_driver and task.runtime_model and task.permission_mode:
+            return RuntimeConfig(
+                driver=task.runtime_driver,
+                model=task.runtime_model,
+                effort=task.runtime_effort,
+                permission_mode=task.permission_mode,
+                permission_flag=repo.runtime.permission_flag,
+                max_turns=repo.runtime.max_turns,
+            )
+        # Legacy row with no recorded identity: adopt the configured defaults once and
+        # record them, so from here on the task has a pin like any other.
+        runtime = repo.runtime
+        self.store.record_runtime_identity(
+            task.id,
+            driver=runtime.driver,
+            model=runtime.model,
+            effort=runtime.effort,
+            permission_mode=runtime.permission_mode,
+        )
+        self.log.info(
+            "runtime_identity_backfilled",
+            repo=repo.slug,
+            issue=task.issue_number,
+            model=runtime.model,
+            effort=runtime.effort,
+        )
+        return runtime
+
     def _run_once(
         self,
         *,
@@ -767,8 +817,9 @@ class Orchestrator:
             # second, duplicate thread created for no reason.
             publisher.begin(task, attempt=attempt, run_started_at=self._run_started_at)
 
+        runtime = self._effective_runtime(task, repo)
         driver = CommandCodeDriver(
-            repo.runtime,
+            runtime,
             run_log_dir=self.config.worker.run_log_dir,
             repo=repo.slug,
             issue_number=task.issue_number,
@@ -807,10 +858,14 @@ class Orchestrator:
             run_id=run_id,
             kind=kind,
             resumed_from=session_id,
-            model=repo.runtime.model,
-            effort=repo.runtime.effort,
-            permission_flag=repo.runtime.permission_flag,
-            max_turns=repo.runtime.max_turns,
+            # The EFFECTIVE identity (the task's pin), not the current repo config:
+            # the journal must agree with the argv that actually runs and with the
+            # status comment's "Runtime:" line, or the log is a second source of truth
+            # that can disagree.
+            model=runtime.model,
+            effort=runtime.effort,
+            permission_flag=runtime.permission_flag,
+            max_turns=runtime.max_turns,
             timeout_seconds=self.config.worker.run_timeout_seconds,
             worktree=str(worktree),
             argv=" ".join(redact_argv(driver.build_argv(instruction, session_id=session_id))),
@@ -1021,6 +1076,7 @@ class Orchestrator:
                 timed_out=result.timed_out,
                 produced_work=after.produced_work,
                 detail=detail,
+                refused=result.runtime_refused,
             )
             # A runtime that never emitted a record never started a conversation: no
             # model work was attempted or paid for, so it is a configuration fault and
@@ -2598,7 +2654,22 @@ class Orchestrator:
                 timed_out=result.timed_out,
                 produced_work=after.produced_work,
                 detail=detail,
+                refused=result.runtime_refused,
             )
+            # A refused start attempted no model work (non-zero exit, zero stream
+            # records), so the review turn it was charged must be given back — the
+            # round is still parked for an explicit `review --retry-round`, but
+            # `review_round_attempts` is documented as *model turns spent* and this
+            # was not one. The implementation path does the same (Store.refund_attempt).
+            if result.runtime_refused:
+                self.store.refund_round_attempt(round_row.id)
+                self.log.info(
+                    "review_round_attempt_refunded",
+                    repo=task.repo,
+                    issue=task.issue_number,
+                    round=round_row.round,
+                    detail="the runtime refused to start; no model turn was spent",
+                )
             # A failed turn is NEVER auto-repeated. The feedback snapshot stays
             # unacknowledged, so nothing is lost: the maintainer can fix the cause and
             # re-add the label, and the round will carry the same feedback again.

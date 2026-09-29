@@ -164,6 +164,38 @@ class ExecutionCase(BaseCase):
         overrides.update(extra)
         return overrides
 
+    def write_repo_runtime(
+        self,
+        *,
+        model: str,
+        effort: str | None = None,
+        max_turns: int = 40,
+        **overrides: object,
+    ) -> None:
+        """Rewrite the config with a specific per-repo runtime identity.
+
+        Used by the pinning tests (#6): the per-repo `[repos."...".runtime]` block is
+        the "defaults for NEW tasks" knob, and the tests change it *between* runs to
+        prove that an existing task keeps its pin.
+        """
+        effort_line = "" if effort is None else f'effort = "{effort}"\n'
+        repos = f'''
+[repos."{self.slug}"]
+path = "{self.source}"
+base_branch = "main"
+agents_file = "AGENTS.md"
+
+[repos."{self.slug}".runtime]
+driver = "commandcode"
+model = "{model}"
+{effort_line}permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = {max_turns}
+'''
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(**overrides), repos_block=repos
+        )
+
     def write_scenario(self, runs: list[dict], **extra: object) -> None:
         scenario: dict[str, object] = {"runs": runs, "record_argv": str(self.argv_log)}
         scenario.update(extra)
@@ -978,6 +1010,113 @@ class BlockedRunTests(ExecutionCase):
         # And `open` must say so plainly rather than promising a resume.
         opened = self.run_cli("open", "--repo", self.slug, "--issue", "1")
         self.assertIn("resumable      : no", opened.stdout)
+
+
+class RuntimePinningTests(ExecutionCase):
+    """An existing task keeps the model/effort it started with (#6's pinning contract).
+
+    Repo configuration supplies the defaults for a **new** task; it must never
+    silently replace an existing task's identity. The recorded argv is the evidence,
+    because it is what the runtime was actually invoked with — a row or a status
+    comment claiming one model while another ran is precisely the bug this rules out.
+    """
+
+    def runtime_config(self, *, model: str, effort: str | None, **overrides: object) -> None:
+        """Rewrite the test config with a specific per-repo runtime identity."""
+        self.write_repo_runtime(model=model, effort=effort, **overrides)
+
+    def test_a_retry_after_a_real_failure_keeps_the_pinned_identity(self) -> None:
+        # Run 1 starts (it emits records) and then fails, so this is a task failure
+        # that spends its budget — the ordinary retry case. `max_attempts=1` parks it
+        # as `failed`, which is the only phase `retry` applies to.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "error",
+                    "exit_code": 1,
+                    "events": ["tool_completed"],
+                    "edits": {"partial.txt": "half\n"},
+                },
+                {"session_id": "sess-2", "subtype": "success", "edits": {"done.txt": "ok\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Pinned", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="high", max_turns=7, max_attempts=1)
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "failed")
+
+        # The operator changes the model, the effort AND the turn cap before retrying.
+        # The pin covers the model/effort; the turn cap is operational configuration
+        # and deliberately follows the current config, so the retry must show BOTH:
+        # pinned identity, current turn cap.
+        self.runtime_config(model="model-b", effort="max", max_turns=3, max_attempts=1)
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertNotIn("re-pinned", retried.stdout, "a started run must keep its pin")
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()
+        self.assertEqual(len(argv), 2)
+        self.assertIn("model-a", argv[1], "the retry must invoke the pinned model")
+        self.assertNotIn("model-b", argv[1])
+        self.assertIn("--effort", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--effort") + 1], "high")
+        self.assertNotIn("max", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--max-turns") + 1], "3")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-a", "the row keeps advertising the pin")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
+
+    def test_a_retry_after_a_refused_start_adopts_the_fixed_configuration(self) -> None:
+        # The one sanctioned exception: a refused start (non-zero exit, ZERO stream
+        # records) attempted no model work, so there is no started conversation whose
+        # identity must be preserved. The operator fixed the configuration and the
+        # explicit retry picks it up — and says so.
+        #
+        # `medium` is schema-VALID on purpose: the live refusal came from a value the
+        # config accepted and the *runtime* later stopped accepting (the v1.64.1
+        # auto-update), which is exactly the case config validation cannot catch.
+        self.write_scenario(
+            runs=[
+                {
+                    "no_stream": True,
+                    "exit_code": 1,
+                    "stderr": 'Unknown effort "medium". Supported: high, max.',
+                },
+                {"session_id": "sess-fixed", "subtype": "success", "edits": {"ok.txt": "1\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Refused then fixed", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="medium")
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        refused = store.get_task(self.slug, 1)
+        self.assertEqual(refused.phase, "needs_attention")
+        self.assertTrue(store.last_run_refused(refused.id))
+
+        self.runtime_config(model="model-b", effort="high")
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn("re-pinned", retried.stdout, "the change must not be silent")
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()
+        self.assertEqual(len(argv), 2)
+        self.assertIn("model-b", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--effort") + 1], "high")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-b")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
 
 
 class RuntimeRefusalTests(ExecutionCase):

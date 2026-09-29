@@ -4215,6 +4215,108 @@ class ParkedRoundRecoveryTests(ReviewCase):
         self.assertEqual(self.run_cli("review", "--release").returncode, 2)
 
 
+class ReviewRuntimePinningTests(ReviewCase):
+    """A resume must use the task's pinned model/effort, not the current config (#6).
+
+    The status comment and the task row advertise the pinned identity, so a round
+    that invoked a *different* model would make the comment a lie. And the pinned
+    identity is what the original session actually ran on, which is the whole point
+    of resuming it.
+    """
+
+    def test_a_review_round_invokes_the_pinned_identity_after_a_config_change(self) -> None:
+        self.first_run()
+        pinned = self.task_row()
+        session = pinned.session_id
+        self.assertIsNotNone(session)
+
+        # The operator changes the repository's defaults AFTER the task started.
+        self.write_repo_runtime(model="model-b", effort="max")
+
+        self.hand_off()
+        self.add_comment("Please rename this function.")
+        self.review_scenario()
+        self.assertEqual(self.run_cli("review").returncode, 0)
+
+        argv = self.recorded_argv()[-1]
+        self.assertEqual(argv[argv.index("--session") + 1], session)
+        self.assertEqual(
+            argv[argv.index("--model") + 1],
+            pinned.runtime_model,
+            "the round must invoke the model the task is pinned to",
+        )
+        self.assertEqual(argv[argv.index("--effort") + 1], pinned.runtime_effort)
+        self.assertNotIn("model-b", argv)
+        self.assertNotIn("max", argv)
+
+        # The status comment keeps advertising the identity that actually ran.
+        self.assertIn(f"`{pinned.runtime_model}`", self.status_body())
+        self.assertEqual(self.task_row().runtime_model, pinned.runtime_model)
+
+    def test_a_refused_review_start_refunds_the_turn_and_leaves_the_round_parked(self) -> None:
+        """Zero stream records means no model turn: `review_round_attempts` must not count it.
+
+        The feedback stays unacknowledged and the round stays parked (no automatic
+        re-drive), so the accounting matches the documented meaning of the counter:
+        *model turns this task has spent on review rounds*.
+        """
+        self.first_run()
+        session = self.task_row().session_id
+        self.hand_off()
+        comment = self.add_comment("Please rename this function.")
+        before = self.task_row().feedback_cursor
+        # The resumed turn never starts: non-zero exit, no stream at all.
+        self.review_scenario(
+            no_stream=True,
+            exit_code=1,
+            stderr='Unknown effort "medium". Supported: high, max.',
+        )
+
+        result = self.run_cli("review")
+        self.assertEqual(result.returncode, 1, "a refused round is not a completed round")
+
+        store = self.store()
+        task = self.task_row()
+        self.assertEqual(task.phase, "needs_attention")
+        self.assertEqual(
+            store.review_round_attempts(task.id),
+            0,
+            "a refused start attempted no model turn and must not be charged as one",
+        )
+        self.assertEqual(task.feedback_cursor, before, "the feedback stays unacknowledged")
+        round_row = self.rounds()[0]
+        self.assertEqual(round_row.state, ROUND_FAILED)
+
+        # No automatic re-drive, however many polls happen.
+        calls = self.runtime_calls()
+        for _ in range(2):
+            self.run_cli("review")
+        self.assertEqual(self.runtime_calls(), calls, "a parked round is never auto-retried")
+
+        # Fix the configuration, then the documented explicit retry: the SAME session
+        # is resumed, with the now-fixed identity, and exactly one real turn is charged.
+        self.write_repo_runtime(model="model-b", effort="high")
+        self.review_scenario(
+            session_id=session,
+            subtype="success",
+            edits={"impl.txt": "reviewed\n"},
+        )
+        retried = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertIn("re-pinned", retried.stdout, "the re-pin must be reported")
+
+        argv = self.recorded_argv()[-1]
+        self.assertEqual(argv[argv.index("--session") + 1], session)
+        self.assertEqual(argv[argv.index("--model") + 1], "model-b")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+        task = self.task_row()
+        self.assertEqual(task.phase, "awaiting_review", task.last_error)
+        self.assertEqual(store.review_round_attempts(task.id), 1, "exactly one real turn")
+        self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
+        self.assertIn(f"conversation:{comment}", parse_cursor(task.feedback_cursor or "{}"))
+
+
 class PinnedSessionTests(ReviewCase):
     """A mismatched resume must not overwrite the task's pinned session (#5)."""
 

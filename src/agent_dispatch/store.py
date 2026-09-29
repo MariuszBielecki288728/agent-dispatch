@@ -297,6 +297,12 @@ CREATE TABLE IF NOT EXISTS runs (
   subtype           TEXT,
   tool_hook_blocked INTEGER NOT NULL DEFAULT 0,
   timed_out         INTEGER NOT NULL DEFAULT 0,
+  -- 1 when the runtime exited non-zero WITHOUT emitting a single stream record: it
+  -- refused its own invocation or crashed at startup, so no model turn happened.
+  -- Durable evidence for the one rule that may re-pin a task's runtime identity
+  -- (the operator's explicit `retry` / `review --retry-round`), see
+  -- `last_run_refused`.
+  refused           INTEGER NOT NULL DEFAULT 0,
   produced_work     INTEGER,
   detail            TEXT,                       -- validated reasons, never a transcript
   log_path          TEXT,
@@ -760,6 +766,11 @@ class Store:
         # claimable", which is the honest reading of a row written before the review
         # loop existed: no round was ever claimed for it.
         ("tasks", "handoff_armed", "INTEGER NOT NULL DEFAULT 1"),
+        # Issue #6 review. A refused start (non-zero exit, zero stream records) is the
+        # only case that may re-pin a task's runtime identity, and that decision needs
+        # durable evidence rather than a string match on a message. Older rows default
+        # to 0 ("no refusal was recorded"), which keeps the pin authoritative for them.
+        ("runs", "refused", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     def _add_missing_columns(self) -> None:
@@ -1159,6 +1170,38 @@ class Store:
             (utcnow_iso(), task_id),
         )
 
+    def refund_round_attempt(self, round_id: int) -> None:
+        """Give back the review turn charged when the round was started.
+
+        The review counterpart of :meth:`refund_attempt`, and the same rule: a
+        refusal (non-zero exit, zero stream records) attempted no model work, so
+        ``review_round_attempts`` — documented as *model turns spent* — must not
+        count it. The round itself stays parked for an explicit
+        ``review --retry-round``; only the accounting is corrected.
+        """
+        self._conn.execute(
+            "UPDATE review_rounds SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 "
+            "END WHERE id = ?",
+            (round_id,),
+        )
+
+    def last_run_refused(self, task_id: int) -> bool:
+        """Whether the newest recorded run refused to start.
+
+        ``True`` only for a run that exited non-zero without emitting a single
+        stream record — no session, no model turn, no provider cost. This is the
+        durable evidence behind the one exception to runtime-identity pinning: the
+        operator's explicit ``retry`` / ``review --retry-round`` may adopt the
+        current configuration, because there is no started conversation whose
+        identity must be preserved.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(refused, 0) AS refused FROM runs WHERE task_id = ? ORDER BY id DESC "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return bool(row["refused"]) if row is not None else False
+
     def mark_needs_attention(self, task_id: int, note: str) -> None:
         self._conn.execute(
             "UPDATE tasks SET phase = 'needs_attention', last_error = ?, updated_at = ? WHERE id = ?",
@@ -1300,12 +1343,18 @@ class Store:
     def record_runtime_identity(
         self, task_id: int, *, driver: str, model: str, effort: str | None, permission_mode: str
     ) -> None:
-        """Pin the runtime identity that a run actually used.
+        """Record the runtime identity a task is pinned to.
 
-        Written at claim time so a config change between the poll and the run
-        cannot leave the row describing a different model than the one invoked, and
-        so a later resume re-passes the values recorded here rather than whatever
-        the config happens to say at that moment.
+        Called when a task row is created (repo config supplies the defaults for
+        **new** tasks), for a one-off backfill of a legacy row that has no
+        recorded identity, and by the two **explicit** operator recovery paths that
+        may deliberately adopt the current configuration after a recorded startup
+        refusal (see :meth:`last_run_refused`).
+
+        It must NOT be called on every claim: an existing task keeps the
+        model/effort it started with, so a config change cannot silently move a
+        retry or a review resume to a different model while the row, the status
+        comment and the recorded session still describe the old one.
         """
         self._conn.execute(
             "UPDATE tasks SET runtime_driver = ?, runtime_model = ?, runtime_effort = ?, "
@@ -1387,17 +1436,22 @@ class Store:
         timed_out: bool,
         produced_work: bool | None,
         detail: str | None,
+        refused: bool = False,
     ) -> None:
         """Close a ``runs`` row with the validated outcome.
 
         ``produced_work`` stays ``None`` when the run never got far enough to
         evaluate it; that is a different fact from ``False`` ("evaluated, and the
         worktree was empty"), and collapsing them would hide an interrupted run.
+
+        ``refused`` records the one shape :meth:`last_run_refused` acts on: a
+        non-zero exit with no stream at all. Defaults to ``False`` so every other
+        failure keeps its normal meaning.
         """
         self._conn.execute(
             "UPDATE runs SET outcome = ?, session_id = COALESCE(?, session_id), exit_code = ?, "
-            "subtype = ?, tool_hook_blocked = ?, timed_out = ?, produced_work = ?, detail = ?, "
-            "finished_at = ? WHERE id = ?",
+            "subtype = ?, tool_hook_blocked = ?, timed_out = ?, refused = ?, produced_work = ?, "
+            "detail = ?, finished_at = ? WHERE id = ?",
             (
                 outcome,
                 session_id,
@@ -1405,6 +1459,7 @@ class Store:
                 subtype,
                 int(tool_hook_blocked),
                 int(timed_out),
+                int(refused),
                 None if produced_work is None else int(produced_work),
                 detail,
                 utcnow_iso(),

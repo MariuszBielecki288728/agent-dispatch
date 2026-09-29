@@ -2003,7 +2003,7 @@ class HeartbeatThreadTests(unittest.TestCase):
         self.assertIn(STATE_AWAITING_REVIEW, client.writes[-1])
 
 
-class StaleIdentityTests(StatusCommentCase):
+class PinnedIdentityTests(StatusCommentCase):
     def _repos_block(self, model: str, effort: str) -> str:
         return f"""
 [repos."{self.slug}"]
@@ -2020,20 +2020,21 @@ permission_flag = "--yolo"
 max_turns = 40
 """
 
-    def test_the_comment_shows_the_model_actually_invoked_after_a_config_change(self) -> None:
-        # The review's finding 3. `task` is loaded during discovery; the claim then
-        # pins the CURRENT runtime identity into SQLite and the driver invokes it. If
-        # the status were rendered from the pre-claim snapshot, a config change between
-        # discovery and dispatch would make the comment name a model that never ran —
-        # exactly what the pinned identity exists to prevent.
+    def test_the_comment_names_the_pinned_model_when_the_config_changed_first(self) -> None:
+        # Issue #6, review round 1 (the pinning BLOCKER). The row is pinned when the
+        # task is DISCOVERED — repo config supplies the defaults for a new task — and a
+        # later config change must not silently replace that identity. So the comment,
+        # the durable row and the argv that runs all name the discovery-time model: a
+        # comment naming a model that never ran this task is exactly what the pin
+        # exists to prevent.
         #
-        # Asserting only the FINAL body would not catch this: the terminal sync
+        # Asserting only the FINAL body would not catch a regression: the terminal sync
         # re-reads the durable row and is correct either way. The vulnerable renders
         # are the LIVE ones (`Starting`, `Running`) written during the run, so the
         # whole write history is checked.
         self.set_issues(issue(1, "Identity change", labels=[TRIGGER]))
 
-        # Discovery happens at the OLD identity...
+        # Discovery pins the identity from the config as it stands at that moment.
         self.world.write_config(
             worker_overrides=self.execution_overrides(),
             repos_block=self._repos_block("model-at-discovery", "low"),
@@ -2064,23 +2065,27 @@ max_turns = 40
         for entry in writes:
             with self.subTest(kind=entry["kind"]):
                 self.assertNotIn(
-                    "model-at-discovery",
+                    "model-at-dispatch",
                     entry["body"],
-                    "no write may name a model that never ran this task",
+                    "no write may name the post-change config model: it never ran",
                 )
-                self.assertIn("model-at-dispatch", entry["body"])
+                self.assertIn("model-at-discovery", entry["body"])
 
         body = self.status_comment_body()
-        self.assertIn("model-at-dispatch", body, "the comment must name the invoked model")
-        self.assertIn("high", body)
+        self.assertIn("model-at-discovery", body, "the comment must name the pinned model")
+        self.assertIn("low", body)
 
-        # The durable row agrees with the comment, so a later sync cannot flip it.
+        # The durable row keeps the pin, so no later sync can flip it, and the argv the
+        # runtime was actually invoked with is the pinned identity.
         from agent_dispatch.config import load_config
 
         store = self.store_rows(load_config(self.world.config_path))
         task = store.get_task(self.slug, 1)
-        self.assertEqual(task.runtime_model, "model-at-dispatch")
-        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.runtime_model, "model-at-discovery")
+        self.assertEqual(task.runtime_effort, "low")
+        argv = self.recorded_argv()[-1]
+        self.assertEqual(argv[argv.index("--model") + 1], "model-at-discovery")
+        self.assertEqual(argv[argv.index("--effort") + 1], "low")
 
     def test_a_spawn_failure_reports_failure_not_the_pre_claim_state(self) -> None:
         # The review's finding 4a. When the runtime preflight passes but the spawn then

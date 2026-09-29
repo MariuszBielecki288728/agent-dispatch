@@ -200,7 +200,14 @@ agents_file = "AGENTS.md"
 driver = "commandcode"
 
 # Pinned model. Changing this affects NEW tasks only; existing tasks keep the
-# runtime/model/session recorded at start and are never silently migrated.
+# runtime/model/session recorded at start and are never silently migrated — a retry
+# and a review resume both invoke the model/effort the task started with, and the
+# row/status comment keep naming it.
+#
+# The one exception is a *refused start* (the runtime exits non-zero without emitting
+# a single stream record): no model turn happened, so `agent-dispatch retry` and
+# `review --retry-round` adopt the current configuration and report that they did.
+# Applied to every invocation, including each resume.
 # Verified available on this VM (v1.64.0: 80 models listed).
 model = "deepseek/deepseek-v4-flash"
 
