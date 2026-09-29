@@ -26,6 +26,9 @@ Coverage maps to the Issue #4 acceptance list:
 * duplicate polls, restarts and crash windows neither duplicate work nor adopt a
   foreign PR;
 * the credential ordering is verifiable in the environment the agent inherits;
+* two allowlisted repositories (Issue #6): identical Issue numbers and titles do
+  not collide in rows, branches, worktrees, run logs or PRs, and only one task
+  runs at a time across both;
 * ``status`` stays read-only and no run log is ever written inside the worktree.
 """
 
@@ -66,6 +69,7 @@ from agent_dispatch.runtime import (  # noqa: E402
 from agent_dispatch.store import Store  # noqa: E402
 from test_offline import (  # noqa: E402
     FAKE_WRAPPER,
+    HANDOFF,
     TRIGGER,
     BaseCase,
     issue,
@@ -94,16 +98,26 @@ class ExecutionCase(BaseCase):
     # ------------------------------------------------------------------ setup
 
     def _make_source_clone(self) -> None:
+        """The default source clone, exposed as ``self.source``/``self.remote``."""
+        self.source, self.remote = self._create_source_clone("source-clone")
+        # The previous test's config pointed at a different checkout; point it here.
+        self.world.repo_path = self.source
+
+    def _create_source_clone(self, name: str) -> tuple[Path, Path]:
         """A real, bare-ish source clone with a commit on ``main``.
 
         A genuine repository is required: the worktree tests assert on real
         ``git worktree add``/``status``/``log`` output, and the credential test
         asserts the environment a real Git child would inherit.
+
+        Returns ``(clone_path, bare_remote_path)``. ``name`` keeps a multi-repo
+        test from sharing one checkout, which is the collision it exists to rule
+        out (Issue #6).
         """
         import subprocess
 
-        self.source = self.tmp / "source-clone"
-        self.source.mkdir()
+        clone = self.tmp / name
+        clone.mkdir()
         env = {
             **os.environ,
             "GIT_AUTHOR_NAME": "T",
@@ -114,7 +128,7 @@ class ExecutionCase(BaseCase):
 
         def git(*args: str) -> None:
             subprocess.run(
-                ["git", "-C", str(self.source), *args],
+                ["git", "-C", str(clone), *args],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -122,24 +136,23 @@ class ExecutionCase(BaseCase):
             )
 
         git("init", "-q", "-b", "main")
-        (self.source / "README.md").write_text("# fixture\n", encoding="utf-8")
+        (clone / "README.md").write_text("# fixture\n", encoding="utf-8")
         git("add", "-A")
         git("commit", "-q", "-m", "initial")
         # `origin` points at the clone itself so fetch/push/ls-remote succeed
         # offline against a real Git remote rather than a mocked one.
-        self.remote = self.tmp / "remote.git"
+        remote = self.tmp / f"{name}-remote.git"
         subprocess.run(
-            ["git", "init", "-q", "--bare", str(self.remote)],
+            ["git", "init", "-q", "--bare", str(remote)],
             check=True,
             capture_output=True,
             text=True,
             env=env,
         )
-        git("remote", "add", "origin", str(self.remote))
+        git("remote", "add", "origin", str(remote))
         git("push", "-q", "-u", "origin", "main")
         git("fetch", "-q", "origin")
-        # The previous test's config pointed at a different checkout; point it here.
-        self.world.repo_path = self.source
+        return clone, remote
 
     def execution_overrides(self, **extra: object) -> dict[str, object]:
         overrides: dict[str, object] = {
@@ -150,6 +163,38 @@ class ExecutionCase(BaseCase):
         }
         overrides.update(extra)
         return overrides
+
+    def write_repo_runtime(
+        self,
+        *,
+        model: str,
+        effort: str | None = None,
+        max_turns: int = 40,
+        **overrides: object,
+    ) -> None:
+        """Rewrite the config with a specific per-repo runtime identity.
+
+        Used by the pinning tests (#6): the per-repo `[repos."...".runtime]` block is
+        the "defaults for NEW tasks" knob, and the tests change it *between* runs to
+        prove that an existing task keeps its pin.
+        """
+        effort_line = "" if effort is None else f'effort = "{effort}"\n'
+        repos = f'''
+[repos."{self.slug}"]
+path = "{self.source}"
+base_branch = "main"
+agents_file = "AGENTS.md"
+
+[repos."{self.slug}".runtime]
+driver = "commandcode"
+model = "{model}"
+{effort_line}permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = {max_turns}
+'''
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(**overrides), repos_block=repos
+        )
 
     def write_scenario(self, runs: list[dict], **extra: object) -> None:
         scenario: dict[str, object] = {"runs": runs, "record_argv": str(self.argv_log)}
@@ -382,6 +427,40 @@ class RuntimeValidationTests(unittest.TestCase):
         result = validate_run(_result(spawn_error="not installed"), expected_session=None)
         self.assertFalse(result.ok)
         self.assertFalse(result.checks["spawned"])
+
+    def test_a_refused_start_is_a_configuration_fault_named_from_stderr(self) -> None:
+        # Observed on Command Code v1.64.1 during the #6 pilot: an effort value the
+        # pinned model no longer accepts makes the CLI exit 1 with one stderr line and
+        # NO stream at all. That must be reported as a refused start quoting the
+        # runtime's own message, not as an anonymous "no completed result".
+        result = _result(
+            exit_code=1,
+            subtype=None,
+            session_id=None,
+            events_seen=0,
+            result_lines=0,
+            stderr_tail='Unknown effort "medium". Supported: high, max.',
+        )
+        self.assertTrue(result.runtime_refused)
+        validation = validate_run(result, expected_session=None)
+        self.assertFalse(validation.ok)
+        self.assertFalse(validation.checks["runtime_started"])
+        self.assertIn('Unknown effort "medium"', validation.summary())
+        self.assertIn("configuration fault", validation.summary())
+
+    def test_a_run_that_actually_started_is_never_a_refusal(self) -> None:
+        # The negative controls: any one of these makes the failure a task failure
+        # that keeps its normal meaning, so the refusal classification stays narrow.
+        decisions = {
+            "one event emitted": _result(exit_code=1, subtype=None, events_seen=1),
+            "timed out": _result(exit_code=1, timed_out=True),
+            "clean exit": _result(exit_code=0, events_seen=0),
+            "spawn error": _result(exit_code=1, spawn_error="boom", events_seen=0),
+        }
+        for label, candidate in decisions.items():
+            with self.subTest(label):
+                self.assertFalse(candidate.runtime_refused)
+        self.assertTrue(validate_run(_result(), expected_session=None).checks["runtime_started"])
 
 
 class BlockedEventDetectionTests(unittest.TestCase):
@@ -931,6 +1010,374 @@ class BlockedRunTests(ExecutionCase):
         # And `open` must say so plainly rather than promising a resume.
         opened = self.run_cli("open", "--repo", self.slug, "--issue", "1")
         self.assertIn("resumable      : no", opened.stdout)
+
+
+class RuntimePinningTests(ExecutionCase):
+    """An existing task keeps the model/effort it started with (#6's pinning contract).
+
+    Repo configuration supplies the defaults for a **new** task; it must never
+    silently replace an existing task's identity. The recorded argv is the evidence,
+    because it is what the runtime was actually invoked with — a row or a status
+    comment claiming one model while another ran is precisely the bug this rules out.
+    """
+
+    def runtime_config(self, *, model: str, effort: str | None, **overrides: object) -> None:
+        """Rewrite the test config with a specific per-repo runtime identity."""
+        self.write_repo_runtime(model=model, effort=effort, **overrides)
+
+    def test_a_retry_after_a_real_failure_keeps_the_pinned_identity(self) -> None:
+        # Run 1 starts (it emits records) and then fails, so this is a task failure
+        # that spends its budget — the ordinary retry case. `max_attempts=1` parks it
+        # as `failed`, which is the only phase `retry` applies to.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "error",
+                    "exit_code": 1,
+                    "events": ["tool_completed"],
+                    "edits": {"partial.txt": "half\n"},
+                },
+                {"session_id": "sess-2", "subtype": "success", "edits": {"done.txt": "ok\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Pinned", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="high", max_turns=7, max_attempts=1)
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "failed")
+
+        # The operator changes the model, the effort AND the turn cap before retrying.
+        # The pin covers the model/effort; the turn cap is operational configuration
+        # and deliberately follows the current config, so the retry must show BOTH:
+        # pinned identity, current turn cap.
+        self.runtime_config(model="model-b", effort="max", max_turns=3, max_attempts=1)
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertNotIn("re-pinned", retried.stdout, "a started run must keep its pin")
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()
+        self.assertEqual(len(argv), 2)
+        self.assertIn("model-a", argv[1], "the retry must invoke the pinned model")
+        self.assertNotIn("model-b", argv[1])
+        self.assertIn("--effort", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--effort") + 1], "high")
+        self.assertNotIn("max", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--max-turns") + 1], "3")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-a", "the row keeps advertising the pin")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
+
+    def test_a_retry_after_a_refused_start_adopts_the_fixed_configuration(self) -> None:
+        # The one sanctioned exception: a refused start (non-zero exit, ZERO stream
+        # records) attempted no model work, so there is no started conversation whose
+        # identity must be preserved. The operator fixed the configuration and the
+        # explicit retry picks it up — and says so.
+        #
+        # `medium` is schema-VALID on purpose: the live refusal came from a value the
+        # config accepted and the *runtime* later stopped accepting (the v1.64.1
+        # auto-update), which is exactly the case config validation cannot catch.
+        self.write_scenario(
+            runs=[
+                {
+                    "no_stream": True,
+                    "exit_code": 1,
+                    "stderr": 'Unknown effort "medium". Supported: high, max.',
+                },
+                {"session_id": "sess-fixed", "subtype": "success", "edits": {"ok.txt": "1\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Refused then fixed", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="medium")
+        self.assertEqual(self.run_cli("run").returncode, 1)
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        refused = store.get_task(self.slug, 1)
+        self.assertEqual(refused.phase, "needs_attention")
+        self.assertTrue(store.last_run_refused(refused.id))
+
+        self.runtime_config(model="model-b", effort="high")
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn("re-pinned", retried.stdout, "the change must not be silent")
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()
+        self.assertEqual(len(argv), 2)
+        self.assertIn("model-b", argv[1])
+        self.assertEqual(argv[1][argv[1].index("--effort") + 1], "high")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-b")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
+
+    def test_a_later_refusal_does_not_repin_a_task_that_already_started(self) -> None:
+        # The negative control the review asked for: "the newest run was refused" is
+        # NOT sufficient evidence that no conversation exists. Run 1 really starts on
+        # A (it emits records and fails), so the task has model history; a later attempt
+        # then refuses at startup, and the config says B. The pin must survive, because
+        # re-pinning would rewrite the identity of a task that has already talked to a
+        # provider.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "error",
+                    "exit_code": 1,
+                    "events": ["tool_completed"],
+                    "edits": {"partial.txt": "half\n"},
+                },
+                {
+                    "no_stream": True,
+                    "exit_code": 1,
+                    "stderr": 'Unknown effort "high". Supported: low, max.',
+                },
+                {"session_id": "sess-3", "subtype": "success", "edits": {"done.txt": "1\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Started then refused", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="high", max_attempts=1)
+
+        # Run 1: really starts, then fails. Budget spent, so the task is `failed`.
+        self.assertEqual(self.run_cli("run").returncode, 1)
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "failed")
+
+        # Explicit retry: permitted (the phase allows it), but it must NOT re-pin — a
+        # started run exists.
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertNotIn("re-pinned", retried.stdout)
+
+        # Run 2 refuses at startup: parked, attempt refunded, refusal recorded.
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 1)
+        refused = store.get_task(self.slug, 1)
+        self.assertEqual(refused.phase, "needs_attention")
+        self.assertEqual(refused.attempts, 0)
+        self.assertTrue(store.last_run_refused(refused.id))
+        self.assertFalse(
+            store.may_repin_identity(refused.id),
+            "a task with a started run must never be allowed to re-pin",
+        )
+
+        # The config changes, and the operator retries again. The refusal is the newest
+        # run, but the task already started on A, so the pin stands.
+        self.runtime_config(model="model-b", effort="max", max_attempts=1)
+        retried_again = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried_again.returncode, 0, retried_again.stderr)
+        self.assertNotIn(
+            "re-pinned",
+            retried_again.stdout,
+            "an earlier started run must block the re-pin even when the newest run refused",
+        )
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()[-1]
+        self.assertIn("model-a", argv, "the pinned model still runs")
+        self.assertNotIn("model-b", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-a")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
+
+
+class RuntimeRefusalTests(ExecutionCase):
+    """The #6 pilot's real failure: the CLI refused its invocation outright.
+
+    Command Code v1.64.1 exited 1 with ``Unknown effort "medium". Supported: high,
+    max.`` and an empty stream after the runtime auto-updated. Nothing reached the
+    model, so this is a configuration fault: it must quote the runtime's own message
+    in the task state and leave the attempt budget untouched, instead of parking a
+    healthy task as ``failed`` after three no-op attempts.
+    """
+
+    REFUSAL = 'Unknown effort "medium". Supported: high, max.'
+
+    def _remote_branches(self) -> list[str]:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "-C", str(self.remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+    def test_a_refused_runtime_parks_with_attention_and_spends_no_attempt(self) -> None:
+        self.write_scenario(runs=[{"no_stream": True, "exit_code": 1, "stderr": self.REFUSAL}])
+        self.set_issues(issue(1, "Refused", labels=[TRIGGER]))
+
+        result = self.run_cli("run")
+        # Non-zero is the honest exit code: the task was not implemented. The state
+        # and the note, not the code, are what tell the operator what to do.
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "needs_attention")
+        self.assertEqual(task.attempts, 0, "a refused start must not consume the budget")
+        self.assertIn("runtime refused to start", task.last_error or "")
+        self.assertIn(self.REFUSAL, task.last_error or "")
+
+        # The failed run is still recorded with the runtime's own message, and
+        # nothing was published: no PR, no branch on the remote, no session.
+        runs = store.run_history(task.id)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].outcome, "failed")
+        self.assertIn(self.REFUSAL, runs[0].detail or "")
+        self.assertIsNone(task.pr_number)
+        self.assertIsNone(task.session_id)
+        self.assertEqual(self.world.read_world()["repos"][self.slug]["pulls"], [])
+        self.assertNotIn(task.branch, self._remote_branches())
+
+    def test_fixing_the_configuration_then_retrying_completes_the_task(self) -> None:
+        # The operator path the note names: fix the configuration, `retry`, and the
+        # SAME task completes on the next run with a normal attempt count.
+        self.write_scenario(
+            runs=[
+                {"no_stream": True, "exit_code": 1, "stderr": self.REFUSAL},
+                {"session_id": "sess-fixed", "subtype": "success", "edits": {"impl.txt": "ok\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Refused then fixed", labels=[TRIGGER]))
+        self.assertEqual(self.run_cli("run").returncode, 1)
+        self.assertEqual(self.run_cli("retry", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.phase, "awaiting_review")
+        self.assertEqual(task.attempts, 1, "only the run that reached the model counts")
+        self.assertEqual(len(self.recorded_argv()), 2, "one refusal, then one real run")
+        self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
+        self.assertIn(task.branch, self._remote_branches())
+
+    def test_the_refused_start_finalisation_is_one_transaction(self) -> None:
+        # Review round 2 (blocker 2): closing the run, refunding the attempt and parking
+        # the task are only true together. Autocommitted separately, a crash between
+        # them left the task `running` with a charged attempt while its newest run
+        # already said the invocation never started — which reconciliation can only
+        # read as an interrupted run, i.e. a configuration fault queued to repeat.
+        import sqlite3  # noqa: PLC0415 - local to keep the module header small
+
+        from agent_dispatch.store import Store
+
+        self.set_issues(issue(1, "Refused atomic", labels=[TRIGGER]))
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="m",
+            runtime_effort="high",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        task = store.get_task(self.slug, 1)
+        store.set_owned_worktree(
+            task.id, branch="dispatch/issue-1-x", worktree_path=str(self.tmp), base_branch="main"
+        )
+        assert store.claim_for_run(
+            task.id, branch="dispatch/issue-1-x", worktree_path=str(self.tmp), base_branch="main"
+        )
+        run_row = store.start_run(
+            task.id,
+            run_id="20260929T000000000000-implementation-refused1",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "refused.ndjson"),
+        )
+        self.assertEqual(store.get_task(self.slug, 1).attempts, 1, "the claim charged one")
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            store.finalise_refused_start(
+                run_row,
+                task.id,
+                detail=self.REFUSAL,
+                session_id=None,
+                exit_code=1,
+                subtype=None,
+                produced_work=None,
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+
+        begins = [s for s in statements if s.strip().upper().startswith("BEGIN")]
+        commits = [s for s in statements if s.strip().upper().startswith("COMMIT")]
+        self.assertEqual(len(begins), 1, f"one transaction expected: {statements}")
+        self.assertEqual(len(commits), 1, f"one commit expected: {statements}")
+
+        fresh = store.get_task(self.slug, 1)
+        self.assertEqual(fresh.phase, "needs_attention")
+        self.assertEqual(fresh.attempts, 0, "the refund lands with the park")
+        self.assertTrue(store.last_run_refused(task.id), "the run is closed as refused")
+
+        # And it must roll back as a unit: fail inside the transaction on the LAST
+        # table it writes and assert that nothing landed. `start_run` charges a fresh
+        # attempt, so "nothing happened" is distinguishable from "it succeeded".
+        second_run = store.start_run(
+            task.id,
+            run_id="20260929T000000000001-implementation-refused2",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "refused2.ndjson"),
+        )
+        self.assertEqual(store.get_task(self.slug, 1).attempts, 1, "the new run is charged")
+        store._conn.executescript(
+            "CREATE TRIGGER fail_refused BEFORE UPDATE ON tasks "
+            "WHEN NEW.phase = 'needs_attention' "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure mid-refusal'); END;"
+        )
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                store.finalise_refused_start(
+                    second_run,
+                    task.id,
+                    detail="boom",
+                    session_id=None,
+                    exit_code=1,
+                    subtype=None,
+                    produced_work=None,
+                )
+        finally:
+            store._conn.executescript("DROP TRIGGER fail_refused")
+
+        rolled_back = store.get_task(self.slug, 1)
+        self.assertEqual(
+            rolled_back.attempts, 1, "the rejected finalisation must not refund the attempt"
+        )
+        self.assertEqual(rolled_back.phase, "needs_attention", "and must not re-park the task")
+        self.assertEqual(
+            store.run_history(task.id)[-1].outcome,
+            "running",
+            "the run row must stay open when the transaction rolls back",
+        )
 
 
 class SessionIdentityTests(ExecutionCase):
@@ -1628,6 +2075,226 @@ class ConcurrencyTests(ExecutionCase):
         self.assertEqual(len(self.recorded_argv()), 1, "exactly one agent run happened")
 
 
+class MultiRepoExecutionTests(ExecutionCase):
+    """ "Two allowlisted repositories, one active task" — Issue #6's acceptance case.
+
+    Both repositories carry an Issue with the **same number and the same title**, so
+    even the derived branch name is identical. Nothing may be shared between them:
+    task rows are keyed by ``(repo, issue_number)``, and branches, worktrees, run
+    logs and PRs all have to stay with their own repository. Each repository gets
+    its own source clone and bare remote here, because one shared clone would hide
+    exactly the collision this class exists to rule out.
+    """
+
+    TITLE = "Same title"
+    SECOND_SLUG = "example/other"
+
+    def setUp(self) -> None:
+        super().setUp()
+        world = self.world.read_world()
+        world["repos"][self.SECOND_SLUG] = {
+            "labels": [TRIGGER, HANDOFF],
+            "issues": [],
+            "pulls": [],
+            "accessible": True,
+        }
+        self.world.world = world
+        self.world.write_world()
+        self.second_source, self.second_remote = self._create_source_clone("source-clone-other")
+        # Each repo points at its own clone; the default block would point both at
+        # `self.source`, which is the sharing this test must not rely on.
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(),
+            repos_block=self._two_repo_block(),
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _two_repo_block(self) -> str:
+        blocks = []
+        for slug, path in ((self.slug, self.source), (self.SECOND_SLUG, self.second_source)):
+            blocks.append(
+                f"""
+[repos."{slug}"]
+path = "{path}"
+base_branch = "main"
+agents_file = "AGENTS.md"
+
+[repos."{slug}".runtime]
+driver = "commandcode"
+model = "deepseek/deepseek-v4-flash"
+effort = "medium"
+permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = 40
+"""
+            )
+        return "\n".join(blocks)
+
+    def set_other_issues(self, *issues: dict) -> None:
+        # Same read-modify-write as BaseCase.set_issues, and for the same reason:
+        # the fake wrapper rewrites the world file as it serves requests.
+        world = self.world.read_world()
+        world["repos"][self.SECOND_SLUG]["issues"] = list(issues)
+        self.world.world = world
+        self.world.write_world()
+
+    def open_store(self):
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        return store
+
+    def remote_branches(self, remote: Path) -> list[str]:
+        import subprocess
+
+        return subprocess.run(
+            ["git", "-C", str(remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+
+    def tree_files(self, remote: Path, branch: str) -> set[str]:
+        import subprocess
+
+        listing = subprocess.run(
+            ["git", "-C", str(remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return set(listing.split())
+
+    # ------------------------------------------------------------------- tests
+
+    def test_two_allowlisted_repos_queue_independent_tasks(self) -> None:
+        # Identical Issue numbers in two repositories: one row per (repo, Issue).
+        self.set_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        self.set_other_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+
+        worker, store, _ = self.worker()
+        outcome = worker.poll_once()
+        self.assertTrue(outcome.ok, outcome.error)
+
+        first = store.get_task(self.slug, 1)
+        second = store.get_task(self.SECOND_SLUG, 1)
+        self.assertIsNotNone(first, "the first repo's Issue must have its own row")
+        self.assertIsNotNone(
+            second, "the same Issue number in another repository is a different task"
+        )
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(store.list_tasks()), 2, "one row per (repo, issue), not per number")
+        self.assertEqual(
+            {repo.slug for repo in outcome.result.repos}, {self.slug, self.SECOND_SLUG}
+        )
+        # Discovery queues; it never starts anything.
+        self.assertEqual(store.active_task_count(), 0)
+
+    def test_the_two_repos_run_one_at_a_time_with_fully_separate_artifacts(self) -> None:
+        self.set_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        self.set_other_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        # One scripted run per task, each distinguishable in its remote branch.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-one",
+                    "subtype": "success",
+                    "edits": {"one.txt": "one\n"},
+                },
+                {
+                    "session_id": "sess-two",
+                    "subtype": "success",
+                    "edits": {"two.txt": "two\n"},
+                },
+            ]
+        )
+
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        after_first = self.open_store()
+        self.assertEqual(
+            sorted(task.phase for task in after_first.list_tasks()),
+            ["awaiting_review", "queued"],
+            "one task runs and the other waits its turn — one active task globally",
+        )
+        self.assertEqual(len(self.recorded_argv()), 1, "exactly one agent run so far")
+
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        self.assertEqual(len(self.recorded_argv()), 2, "the queued repo runs on the next pass")
+
+        store = self.open_store()
+        tasks = {slug: store.get_task(slug, 1) for slug in (self.slug, self.SECOND_SLUG)}
+        world = self.world.read_world()
+        for slug, task in tasks.items():
+            self.assertEqual(task.phase, "awaiting_review")
+            pulls = world["repos"][slug]["pulls"]
+            self.assertEqual(len(pulls), 1, f"{slug} must end with exactly one PR")
+            self.assertEqual(pulls[0]["number"], task.pr_number)
+            self.assertEqual(pulls[0]["head"]["ref"], task.branch)
+
+        first, second = tasks[self.slug], tasks[self.SECOND_SLUG]
+        # The collision pressure is real: same Issue number and even the same branch
+        # name, yet every artifact belongs to exactly one repository.
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.branch, second.branch, "both repos derive the identical branch name")
+        self.assertNotEqual(first.worktree_path, second.worktree_path)
+        self.assertIn("example__repo", first.worktree_path)
+        self.assertIn("example__other", second.worktree_path)
+        # PR numbers are per-repository, so both being #1 is fine; what would collide
+        # is a PR recorded under the wrong repo, which the per-repo checks above rule
+        # out (`world["repos"][slug]["pulls"]` holds exactly the task's own PR).
+        self.assertEqual(
+            {first.session_id, second.session_id},
+            {"sess-one", "sess-two"},
+            "each task pins the session its own run reported",
+        )
+
+        # Each worktree is a worktree of its own clone, pushes to its own remote,
+        # and holds no orchestrator artifact.
+        for slug, task, remote in (
+            (self.slug, first, self.remote),
+            (self.SECOND_SLUG, second, self.second_remote),
+        ):
+            import subprocess
+
+            origin = subprocess.run(
+                ["git", "-C", task.worktree_path, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            self.assertEqual(origin, str(remote), f"{slug}'s worktree belongs to its own clone")
+            self.assertIn(task.branch, self.remote_branches(remote))
+            self.assert_worktree_clean_of_orchestrator_files(Path(task.worktree_path))
+
+        # The two runs produced different work under the identical branch name in
+        # different repositories: no cross-repo contamination.
+        produced = {"one.txt", "two.txt"}
+        first_work = self.tree_files(self.remote, first.branch) & produced
+        second_work = self.tree_files(self.second_remote, second.branch) & produced
+        self.assertEqual(len(first_work), 1, f"unexpected work in {self.slug}: {first_work}")
+        self.assertEqual(
+            len(second_work), 1, f"unexpected work in {self.SECOND_SLUG}: {second_work}"
+        )
+        self.assertNotEqual(first_work, second_work, "each repo's branch carries its own work")
+
+        # Run logs are per-repo and each run log carries its own task's session.
+        logs: dict[str, set[Path]] = {}
+        for slug, task in tasks.items():
+            runs = store.run_history(task.id)
+            self.assertEqual(len(runs), 1)
+            paths = {Path(run.log_path) for run in runs if run.log_path}
+            self.assertEqual(len(paths), 1)
+            log_path = paths.pop()
+            self.assertTrue(log_path.is_file())
+            self.assertIn(task.session_id, log_path.read_text(encoding="utf-8"))
+            logs[slug] = {log_path}
+        self.assertFalse(
+            logs[self.slug] & logs[self.SECOND_SLUG], "run logs must never be shared across repos"
+        )
+
+
 class StatusReadOnlyTests(ExecutionCase):
     def test_status_and_open_never_start_an_agent(self) -> None:
         self.set_issues(issue(1, "Observe only", labels=[TRIGGER]))
@@ -1649,6 +2316,7 @@ class StatusReadOnlyTests(ExecutionCase):
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertIn("phase          : awaiting_review", opened.stdout)
         self.assertIn("dispatch/issue-1-inspect-me", opened.stdout)
+        self.assertIn(f"https://github.com/{self.slug}/issues/1", opened.stdout)
         self.assertIn("commandcode --session", opened.stdout)
 
     def test_open_is_read_only(self) -> None:

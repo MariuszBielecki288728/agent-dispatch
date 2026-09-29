@@ -1,4 +1,4 @@
-# agent-dispatch — operations (Issues #3–#5, #17)
+# agent-dispatch — operations (Issues #3–#6, #17)
 
 Operator guide for the MVP loop: an installable CLI, one polling worker, one
 SQLite queue, and **one Command Code session per task** in a task-owned Git
@@ -617,6 +617,7 @@ A run is accepted **only if every one** of these holds:
 | A non-empty `session_id` was captured | without it the task cannot be pinned or later resumed |
 | On a resume, the returned ID **equals** the pinned one | otherwise the task's conversation is not the one that ran |
 | **Zero `tool_hook_blocked` events** | the false-success guard — see below |
+| The runtime actually started (at least one stream record) | a CLI that rejects its own invocation exits non-zero with **no** output at all; that is a configuration fault rather than a task failure — see *A runtime that refuses to start* below |
 | The run finished inside the wall-clock timeout | the watchdog kills the process group at the deadline |
 | The worktree is still on the branch this task owns | a switched worktree looks owned while holding someone else's work |
 | Any uncommitted changes **can be committed** | `git push` cannot carry them, so a failed commit must stop before publishing rather than open a PR that omits the run's work |
@@ -660,6 +661,7 @@ result: owner/name#12: failed — run_failed
   check session_id_captured: pass
   check session_id_matches: pass
   check no_blocked_tool_events: FAIL
+  check runtime_started: pass
   run log: ~/.local/state/agent-dispatch/runs/owner__name/issue-12/<run-id>.ndjson
 ```
 
@@ -673,6 +675,64 @@ A retry **preserves** whatever the previous attempt wrote and starts a **fresh**
 session in the same owned worktree. It is never presented as continuing the
 interrupted conversation, because an interrupted first run has no transcript to
 continue. The new session ID is pinned to the task.
+
+### A runtime that refuses to start spends no attempt
+
+A process that exits non-zero **without emitting a single stream record** never
+started a conversation: the CLI rejected its own invocation, or crashed at startup.
+Observed on Command Code v1.64.1 (2026-09-29, during the Issue #6 pilot) after the
+runtime auto-updated:
+
+```
+Unknown effort "medium". Supported: high, max.
+```
+
+The accepted `--effort` values are **model dependent**, so a runtime upgrade can
+invalidate a pinned value without any config change here. The dispatcher:
+
+* quotes the runtime's own stderr into the task message (`status` / `open` show it),
+  so the cause is visible instead of an anonymous "no completed result";
+* parks the task as `needs_attention` — there is nothing to retry until the
+  configuration is fixed, and an automatic re-dispatch loop would only repeat it;
+* gives back the attempt the claim had already charged, because no model work was
+  attempted and nothing was paid for. This is the same class as a missing runtime
+  binary, not a task failure.
+
+Fix the configuration (the pinned `effort` is the usual culprit — check the runtime's
+`--help` and the model's own `/effort` list), then `agent-dispatch retry`. Any run that
+emitted even one record has started, so a later failure keeps its normal meaning and
+its normal cost against `worker.max_attempts`.
+
+**A refused start is also the one case that may re-pin a task's runtime identity — and
+only for a task that has never started a model turn at all.** An existing task keeps
+the model/effort it started with: a retry and a review resume invoke the pinned
+identity, and the row and status comment keep naming it, even if the repository's
+defaults changed since (§17). The exception exists because a refusal attempted no
+model work, so there is no conversation whose identity must be preserved — but being
+refused is **not** proof that no conversation exists, so `agent-dispatch retry` adopts
+the current configuration only when the task has no session, no run that actually
+started, and no review round (`Store.may_repin_identity`). The re-pin and the re-queue
+are one SQL statement, so a live worker can never claim the task in between and invoke
+the identity the operator just replaced, and the change is logged and printed
+(`runtime_identity_repinned`) rather than silent.
+
+**`review --retry-round` never re-pins.** A review round exists only because the task
+has a clean resumable session, and that conversation was created under the pinned
+model/effort; resuming it with a different model would silently redefine what "the same
+session" means. If a runtime upgrade makes the pinned value impossible to invoke, the
+honest state is `Needs attention` until the compatible runtime or settings are restored
+— never a silent migration of an existing conversation.
+
+The same classification covers a **review round**: a refused start parks the round
+(`failed`, feedback unacknowledged, reason recorded) and returns the task to
+`Needs attention`, and the documented `review --retry-round` re-runs it once the
+configuration is fixed — no round is silently consumed and no second round is minted.
+The refused turn's attempt is **refunded** as well (`review_round_attempts` counts
+*model turns spent*, and a refused start spent none), so the retried round records
+exactly one real turn. The run row, the refund and the park are written in **one
+transaction** on both paths (`finalise_refused_start` / `finalise_refused_round`), so a
+crash cannot leave a task or round `running` with a charged attempt that the reconcile
+passes would then read as an interrupted, paid-for run.
 
 ---
 
@@ -1085,7 +1145,7 @@ uv run --no-sync ruff check .          # lint
 uv run --no-sync ruff format --check . # formatting
 uv run --no-sync pre-commit run --all-files
 
-PYTHON=.venv/bin/python ./scripts/test-offline.sh   # 280 tests, no network, no credits
+PYTHON=.venv/bin/python ./scripts/test-offline.sh   # the full offline suite (no network, no credits)
 PYTHON=.venv/bin/python ./scripts/smoke-runtime.sh --mock
 
 agent-dispatch doctor          # live capability report for this VM
@@ -1104,6 +1164,11 @@ a mock. The cases most worth knowing about:
 | Test | Proves |
 |---|---|
 | `BlockedRunTests` | a `tool_hook_blocked` stream with `subtype=success` and exit 0 **fails** the task and opens no PR |
+| `RuntimeRefusalTests` | the #6 pilot's real failure: a CLI that exits non-zero with **no** stream is reported from its own stderr, parks as `needs_attention`, and refunds the attempt — and fixing the configuration then retrying completes the same task |
+| `RuntimePinningTests` | an existing task keeps the pinned model/effort on a retry even after the repo defaults changed (asserted on the recorded argv), while the **turn cap** follows the current config; a retry after a *refused* start adopts the fixed configuration and reports it — and a task that already started can never re-pin, even when its newest run was refused |
+| `PinnedIdentityTests` (`test_status_comment`) | the status comment — on every live write, not just the final one — names the pinned model when the config changed after discovery, and the argv agrees with it |
+| `ReviewRuntimePinningTests` | a review round resumes the pinned identity after a repo-default change, and a *refused* review start charges no review turn, stays unacknowledged and parked, and `review --retry-round` then resumes the same session **on the pinned identity** and charges exactly one real turn; the refused-review finalisation is asserted to be one transaction, and a failure inside it leaves nothing half-written |
+| `RuntimeRefusalTests.test_the_refused_start_finalisation_is_one_transaction` | the implementation refused-start finaliser writes the run row, the refund and the park in one transaction, and rolls back as a unit |
 | `TimeoutTests` | a hung run is killed at the deadline, recorded as a timeout, and leaves no live process |
 | `RetryTests` | an interrupted run's edits are preserved and the retry starts a **fresh** session |
 | `IdempotencyTests` | restart adopts the existing PR/branch instead of duplicating work |
@@ -1139,11 +1204,12 @@ a mock. The cases most worth knowing about:
 | `ReviewPublicationTests` | a failed push/PR step is finished on a later pass with the **same PR** and **zero** extra runtime calls, and only then does the cursor advance; a no-op round is accepted; a failed commit parks with its own stage |
 | `ReviewHandoffCrashTests` | a failed label removal cannot start a second round; a claimed-but-unstarted round is re-driven; a round from a dead process is parked with no new model call; a restart after publication leaves exactly one applied round with the same PR and cursor |
 | `FinalisationAtomicityTests` | the handover is one SQLite transaction (asserted on the statement trace), and a failure inside it rolls back every coupled fact |
-| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
+| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Publishing feedback changes` → `Awaiting review`, and opens no second comment; a blocked or refused round **never** writes `Publishing feedback changes` (asserted on the round's whole write log, not just the final body) |
 | `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
 | `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard measures the longest requirement variant the builder can join, so a batch that fits only while the diff is readable is refused and an admitted handoff builds under either; the unreadable-diff requirement set is a strict superset of the readable one, and the built instruction emits each required section exactly once with the closing instruction last |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
+| `MultiRepoExecutionTests` | two allowlisted repositories carrying the same Issue number *and title* stay separate in task rows, branches, worktrees, run logs and PRs, and only one task runs at a time across both |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts
@@ -1168,11 +1234,12 @@ uv lock                                  # refresh it deliberately
 
 ## 15. Not in this release
 
-Documented so nothing here is mistaken for a working feature. These belong to
-Issue #6 and are **not implemented, not stubbed and not faked**:
+Documented so nothing here is mistaken for a working feature:
 
-- multi-repo concurrency above one (configuration rejects it), distributed leases,
-  a broker, webhooks, a dashboard, or a provider-plugin system (#6);
+- **more than one active task.** Multi-repo *configuration* is supported (§17), but
+  `max_concurrent_tasks` must stay `1` and configuration rejects anything higher.
+  Distributed leases, a broker, webhooks, a dashboard and a provider-plugin system
+  remain out of scope;
 - automatic merge, automatic approval, Issue closure, or deletion of unknown
   worktrees — permanently out of scope, not deferred;
 - **automatic review generation.** The review loop *accepts* feedback; it never
@@ -1188,11 +1255,11 @@ Also deliberately absent, because the alternative would be a false claim:
   through the CLI, and you inspect it in a terminal.
 - **No container or OS sandbox.** `--yolo` plus a worktree is a trust choice on a
   single-user VM, and §12 says so plainly.
-- **No live review round is claimed by this document.** The offline suite proves
-  the orchestration logic against fakes. A real `agent:fix` round on a real PR is
-  an explicit, opt-in operator action (`agent-dispatch review`, or adding the label
-  for the worker to pick up) and is only "observed" when someone observes it — see
-  §16 for exactly which parts that leaves unverified.
+- **The live review round is a single observation, not a guarantee.** One
+  `agent:fix` round was run and observed on the pilot repository (§17): the same
+  session was resumed, the same PR received the commit, and the round survived a
+  restart. That is one observation under one set of conditions; the offline suite
+  remains the systematic evidence, and §16 lists what is still only modelled.
 
 ---
 
@@ -1435,9 +1502,15 @@ configuration rather than from anything in those texts.
 | State | Meaning |
 |---|---|
 | `Applying feedback` | The resumed session is working through the round's feedback. |
-| `Publishing feedback changes` | The turn completed and the changes are being committed and pushed. No further model run is involved. |
+| `Publishing feedback changes` | The turn **completed cleanly** and its changes are being committed and pushed. No further model run is involved. |
 | `Awaiting review` | The round is published; the feedback it carried is acknowledged. |
 | `Needs attention` | A round is unfinished — either its publication failed and will be retried, or its agent turn failed and a human decision is needed. |
+
+`Publishing feedback changes` is written **only** for a turn that succeeded. A blocked,
+timed-out, failed or refused turn has nothing valid to publish, so it goes straight to
+`Needs attention` — exactly as the implementation path withholds `Publishing` on a
+failed run. A refused start in particular must never announce progress, because no
+model turn happened at all.
 
 It is deliberately **one** comment, edited in place, exactly as in §13: a review
 round heartbeats the comment the task already owns, and a round never opens a second
@@ -1515,22 +1588,236 @@ For a round parked as interrupted or failed, read the recorded reason first
 (`open` prints it), then choose `--release` or `--retry-round`. The worktree keeps
 whatever the round produced, and the feedback stays unacknowledged either way.
 
-### What is not verified for this feature
+### What is verified, and what is still only modelled
 
-The offline suite drives this end to end against `tests/fake_wrapper.py` and
-`tests/fake_runtime.py`, including crash and restart windows. It does **not** prove
-anything about a live round against real GitHub and real Command Code:
+A live `agent:fix` round **has** now been run and observed on the pilot repository
+(§17): the label was claimed once, the round resumed the *same* session ID on the same
+PR, applied a fresh review request, was acknowledged after publication, and survived
+a worker restart with no duplicate model invocation. `Pilot B` exercised the same
+command path again after a refused start was fixed.
 
-* **No live `agent:fix` round has been run by this document.** A real round needs a
-  wrapper-authorised disposable repository and model credits, and is an opt-in
-  operator action. Until someone runs one and observes it, "same-session continuity
-  on a real PR" is **not tested live** — the offline suite proves the *argument*
-  passed to `--session`, not that a real runtime honours it with real concurrent
-  feedback.
-* **Real GitHub pagination and rate limits** are modelled, not observed, for the
-  inline-review-comment and submitted-review listings added by this feature.
-* **The handoff label's behaviour on a real PR** (a real `DELETE` on a label that is
-  also used by other tooling) is modelled only.
+Still modelled rather than observed, and not claimed as verified:
+
+* **Real GitHub pagination and rate limits** for the inline-review-comment and
+  submitted-review listings — the live pilot carried a single conversation comment.
+* **Feedback arriving *while* a round runs** — the deferral rules are covered
+  offline; the live round's comment was added before the label.
+* **A real `DELETE` on a label that is also used by other tooling** — removal worked
+  live, but this VM has no other label consumer to collide with.
+* **Crash windows inside a round** (process death mid-turn, a failed label removal,
+  a failed publication) — offline only.
 
 A CLI session is viewed through the VS Code Remote SSH **terminal**, not native VS
 Code Chat — the same limitation as §15.
+
+---
+
+## 17. The operational pilot (#6): multi-repo and the first safe trial
+
+Issue #6 was the operational release: prove the installed service, keep the accepted
+permission model, and exercise the whole workflow on a disposable repository. This
+section is the durable operator-facing part — how to add a repository, what the
+wrapper must be allowed to do, the first safe trial, and how to upgrade or roll back
+without touching the queue.
+
+### Add a repository to the allowlist
+
+Every repository the worker may touch must be listed; anything unlisted is refused
+with a clear error and never polled. Per-repo runtime settings exist so a small test
+repository can run a cheaper effort than a production one:
+
+```toml
+[repos."owner/name"]
+path = "/home/craftlypse/code/owner-name"   # a source clone, never your working copy
+base_branch = "main"
+
+[repos."owner/name".runtime]
+driver = "commandcode"
+model = "deepseek/deepseek-v4-flash"
+effort = "high"          # model dependent; see the runtime-upgrade note below
+permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = 40
+```
+
+The config is read once at startup, so restart the unit afterwards:
+
+```bash
+systemctl --user restart agent-dispatch.service
+agent-dispatch doctor      # each repo: readable? labels present?
+agent-dispatch dry-run     # one read-only poll across every repo, persisting nothing
+```
+
+What multi-repo does — and does not — mean here:
+
+- every configured repository is polled, and tasks are keyed by `(repo, Issue)`, so
+  the same Issue number in two repositories is two independent tasks;
+- branches live in each repository's own source clone, worktrees under
+  `<worktree_root>/<owner>__<name>/issue-<N>/`, and run logs under the same per-repo
+  path, so no artifact is shared between repositories;
+- **one task runs at a time across all repositories** (`max_concurrent_tasks = 1`),
+  enforced by the single-instance lock plus the conditional SQL claim. Queue, logs
+  and worktrees stay on the VM under `worker.state_db` and `worker.worktree_root`,
+  never in your normal checkout — configuration validation enforces the placements.
+
+If only one repository is authorized for a live test, cover the second with the
+offline fixtures ([`tests/fake_wrapper.py`](../tests/fake_wrapper.py)); do not widen
+credentials to make a test pass.
+
+### Runtime upgrades can invalidate pinned flags
+
+The runtime can update itself (it did on this VM: v1.64.0 → v1.64.1 in one day), and
+some flags are **model dependent**. The real case: the pinned
+`effort = "medium"` became invalid, and every run then exited 1 with
+`Unknown effort "medium". Supported: high, max.` and an empty stream.
+
+The dispatcher reports that honestly and safely: the task's message quotes the
+runtime's stderr, the task parks as `Needs attention`, and **no attempt is consumed**
+because no model work happened (§9). Fix the pinned value and `retry`: when the task
+has never started a model turn, that explicit command adopts the fixed configuration for
+the task (in the same statement that re-queues it) and reports the re-pin — an existing
+task otherwise keeps the model/effort it started with, and a **review round always
+keeps it**. To avoid the surprise, after upgrading the runtime check
+`commandcode --help` and the model's own `/effort` list, and run
+`agent-dispatch doctor`.
+
+### Wrapper write permission is a prerequisite, and it fails visibly
+
+All GitHub writes — branch push, PR create/adopt/label, Issue status comment and
+label changes — go through the configured wrapper and **its** credential. Read
+access is not enough, and the refusal is explicit rather than silent:
+
+```
+remote: Permission to <owner>/<repo>.git denied to <user>
+fatal: unable to access '<url>': The requested URL returned error: 403
+```
+
+For a fine-grained token, add the repository under *Repository access → Selected
+repositories* with **Contents: Read and write**, **Issues: Read and write** and
+**Pull requests: Read and write**. `doctor` can verify *readability* per repository;
+token scopes are not observable through the wrapper, so the write capability is
+proven by the first write. That is exactly why the first trial arms **one**
+disposable Issue before the tool is opened up to another repository.
+
+### The first safe trial (copy-pastable)
+
+```bash
+# 0. Stop new dispatch while you prepare.
+systemctl --user stop agent-dispatch.service   # nothing dispatches until an Issue is armed
+#    To hold ONE existing task instead (sticky, explicit):
+agent-dispatch pause --repo owner/name --issue N
+
+# 1. Confirm the prerequisites (wrapper, allowlist, labels, state placement).
+agent-dispatch doctor
+agent-dispatch dry-run
+
+# 2. Create the trigger labels deliberately, once.
+agent-dispatch setup-labels --repo owner/name --yes
+
+# 3. Arm ONE bounded Issue and watch its single status comment on GitHub:
+#      Queued -> Starting -> Running -> Publishing -> Awaiting review
+#    Locally: journalctl --user -u agent-dispatch -f
+#    Do not arm a second Issue yet — the one-task limit is global.
+
+# 4. Review the PR. To ask for changes: add a review comment AND the `agent:fix`
+#    label. The round resumes the SAME session in the SAME worktree, pushes to the
+#    SAME PR, and returns to `Awaiting review`.
+#    For another round: REMOVE the label, let the round finish, then ADD it again.
+
+# Inspect anything, any time (all read-only):
+agent-dispatch status
+agent-dispatch open --repo owner/name --issue N
+agent-dispatch review --dry-run        # why a visible agent:fix is not starting yet
+```
+
+Before pointing the worker at another repository: `pause` it, or stop the unit, and
+confirm `status` shows nothing active. An in-flight task delays the new repository's
+first dispatch rather than running beside it.
+
+### Upgrade, rollback and uninstall
+
+The state is never the casualty of an install step:
+
+```bash
+./scripts/install-service.sh --uninstall   # stop + disable + remove the unit ONLY
+./scripts/install-service.sh --install     # reinstall the same unit
+./scripts/install-service.sh --status
+```
+
+`--uninstall` removes the **unit only**. The queue (`worker.state_db`), run logs, the
+lock and every owned worktree are deliberately left where they are: the SQLite file
+is the durable record of what was and was not done, and deleting it would discard
+exactly the evidence a recovery needs. No install/uninstall path deletes anything
+under `~/.local/state/agent-dispatch/` or `worker.worktree_root`.
+
+Upgrading code is the documented uv procedure (§1): fetch through the wrapper-backed
+Git path, `uv sync --locked`, relink `~/.local/bin/agent-dispatch` if the interpreter
+moved, then `systemctl --user restart agent-dispatch.service`. An existing database
+is migrated forward in place on first write (new tables/columns only), and
+`state.db` rows, logs and worktrees survive the restart.
+
+Rolling back is a **code** operation:
+
+```bash
+cd ~/code/agent-dispatch
+git -c credential.https://github.com.helper= \
+    -c credential.https://github.com.helper='!/home/craftlypse/.local/bin/gh-craftlypse auth git-credential' \
+    fetch --all
+git switch --detach <last-known-good-sha>
+uv sync --locked
+systemctl --user restart agent-dispatch.service
+```
+
+If you intend to run a much older build against a database a newer build has already
+migrated, take a consistent copy first (the SQLite backup API works while the worker
+is running) and keep the copy beside the state file rather than downgrading around
+it. Queue ownership does not change: a task remains owned by whoever recorded the
+branch, worktree and PR, whichever build is running.
+
+### What the operational pilot observed on this VM (2026-09-29)
+
+The controlled end-to-end run used `MariuszBielecki288728/agent-dispatch-pilot`
+(`Pilot A` / `Pilot B`). Recorded here because these are the claims the release
+rests on; the dated evidence lives in the pull request that closed Issue #6.
+
+**Observed on the VM**
+
+| Check | Result |
+|---|---|
+| Upgrade with no state loss | the unit moved from the pre-uv virtualenv to the uv environment; the existing `state.db` was migrated in place (new tables only) with its rows preserved, the lock was released cleanly on SIGTERM and re-acquired, `Linger=yes`, no VS Code window |
+| Two-repo discovery | `worker_started repos=2`; `dry-run` reports per-repo outcomes for both allowlisted repositories with `failed_repos=0` and persists nothing |
+| Credential order | credential-free sentinel: with the `GIT_CONFIG_*` reset-then-wrapper pair the file-scope helper is **never tried** (re-verifies §12) |
+| Issue → PR | pilot Issue #1 → branch/worktree → real Command Code run (48 s, 690 events, `subtype=success`, no blocked tools) → exactly one PR (#4), `Awaiting review`, one status comment, model/effort pinned |
+| `agent:fix` round | one review comment + the label → the round resumed session `4dc17c57-…` (the *same* ID in `resumed_from`), pushed to the same PR (#4), acknowledged the feedback, and returned to `Awaiting review`. The PR gained exactly the requested change commit |
+| Round survives a restart | after a worker restart and further polls the round stayed `published`, the cursor was unchanged, the phase stayed `Awaiting review`, and no second model invocation occurred |
+| Pause / resume | explicit `pause` → `Paused` and not dispatchable; `unpause` → `Awaiting review` (a task that owns a PR is not sent back to implementation) |
+| `take-it` withdrawn | the poll paused it with `label_withdrawn` and dispatch refused it; re-adding restored `Awaiting review` — not `queued`, i.e. no second implementation run |
+| Legacy crash signature | a `needs_attention` row with an owned PR **and** a publishable stage was normalised on the next start to `owned PR + recovery_stage=NULL + awaiting_review` with no model call |
+| Runtime refused to start (the pilot's real bug) | after the runtime auto-updated to v1.64.1 the pinned `effort` became invalid; the run exited 1 with an empty stream. The task parked as `Needs attention` quoting `Unknown effort "medium". Supported: high, max.` and **consumed no attempt**; fixing the value and `retry` completed the task on its first real run (attempt 1 of 3, PR #5) |
+| `tool_hook_blocked` guard | `smoke-runtime.sh --live` produced a real blocked stream (`exit=0`, `subtype=success`) and the production validator rejected it |
+
+**Automated offline:** 426 tests (`test-offline.sh`), `ruff check` /
+`ruff format --check` / pre-commit hooks, and `smoke-runtime.sh --mock` — all green;
+the runner needs no network, no model credits and no GitHub mutation.
+
+**Round-1 review of this release.** The maintainer's review found that the pinning
+contract was not actually enforced (every claim re-pinned from the current repo
+config, so a retry or a review resume could invoke a different model than the row and
+status comment advertised) and that a refused *review* start still charged a review
+turn. Both are fixed, with argv-level regressions: the task's recorded identity is now
+the effective identity for every invocation; `retry` may re-pin **only** a task that
+has never started a model turn, in the same statement that re-queues it, and reports
+it; and a refused review start refunds its turn.
+
+**Round-2 review.** Narrowed that further and made it crash-safe: `review
+--retry-round` never re-pins (its session was created under the pin, so resuming it on
+another model would redefine "the same session"), `retry` refuses to re-pin a task with
+any started run even when the newest run was refused, and the refused-start
+finalisation — run row, refund and park — is one transaction on both the implementation
+and review paths.
+
+**Not live-tested (offline coverage only):** an interrupted run's fresh-session retry
+and preserved edits, push/PR API timeouts, a foreign PR, and a closed or merged PR.
+Their logic is asserted against `tests/fake_wrapper.py` + `tests/fake_runtime.py`
+(§14); reproducing them live would require deliberately corrupting a live task.
+`Pilot C` remains prepared-but-unarmed for a later scenario.

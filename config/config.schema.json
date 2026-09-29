@@ -190,12 +190,12 @@
         "model": {
           "type": "string",
           "minLength": 1,
-          "description": "Pinned model id, e.g. 'deepseek/deepseek-v4-flash'. Unsupported ids are a startup error; the worker never silently substitutes another paid model. Changing this affects new tasks only."
+          "description": "Pinned model id, e.g. 'deepseek/deepseek-v4-flash'. Unsupported ids are a startup error; the worker never silently substitutes another paid model. Changing this affects new tasks only: an existing task keeps the model recorded at start, so a retry and a review resume invoke that model and the status comment keeps naming it. The one exception is a first-start refusal (non-zero exit, zero stream records, on a task that had never started a model turn), where the explicit `retry` adopts the current configuration in the same statement that re-queues the task and reports it; a review round always keeps its pin."
         },
         "effort": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
-          "description": "Reasoning effort (model dependent)."
+          "enum": ["low", "medium", "high", "max"],
+          "description": "Reasoning effort. Model dependent, and the model's own accepted set is authoritative: observed on Command Code v1.64.1 (2026-09-29), 'deepseek/deepseek-v4-flash' accepts only high|max and exits 1 with 'Unknown effort' plus an EMPTY stream for anything else. That refusal is reported as a configuration fault (the runtime's message, no model work, no attempt consumed) rather than a task failure. Re-check the accepted values after any runtime upgrade."
         },
         "permission_mode": {
           "type": "string",

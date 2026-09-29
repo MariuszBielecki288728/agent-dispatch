@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Operator surface for Issues #3–#4:
+Operator surface for Issues #3–#6 (plus #17):
 
 | Command | Purpose |
 |---|---|
@@ -414,8 +414,8 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print()
         print("  own#N = a PR this worker created; obs#N = a PR that merely references the Issue.")
         print(
-            "  In this release an eligible task is executed, pushed and opened as one PR; "
-            "the review loop is Issue #5."
+            "  An eligible task is executed, pushed and opened as one PR; a review round "
+            "starts only from an explicit `agent:fix` handoff on that PR."
         )
         print(
             "  Each claimed task has ONE status comment on its Issue, edited in place while it "
@@ -675,6 +675,7 @@ def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print(f"  branch         : {task.branch or '-'}")
         print(f"  worktree       : {task.worktree_path or '-'}")
         print(f"  base           : {task.base_branch or '-'}")
+        print(f"  issue          : https://github.com/{task.repo}/issues/{task.issue_number}")
         print(
             "  owned PR       : "
             + (f"#{task.pr_number} {task.pr_url or ''}" if task.pr_number else "-")
@@ -1083,6 +1084,11 @@ def _cmd_review_parked(args: argparse.Namespace, config: Config, log: Logger) ->
         except Exception as exc:  # noqa: BLE001 - reported, never silently swallowed
             log.error("review_parked_action_failed", action=action, error=f"{exc}")
             return EXIT_FAILURE
+        # Deliberately no re-pin here. A review round only exists because the task has a
+        # resumable session, and that conversation was created under the task's pinned
+        # model/effort — resuming it with a different one would silently redefine what
+        # "the same session" means. If the pinned value can no longer be invoked, the
+        # honest state is `needs_attention` (which is where the refused round parked).
         log.info(
             "review_parked_action",
             action=action,
@@ -1290,12 +1296,72 @@ def _resume_publish_result(
     return EXIT_FAILURE
 
 
+def _repin_after_refusal(config: Config, store: Store, task) -> dict[str, str | None] | None:
+    """The configuration to adopt after a **first-start** refusal, or ``None``.
+
+    The one sanctioned exception to runtime-identity pinning, and deliberately much
+    narrower than "the newest run was refused": see
+    :meth:`agent_dispatch.store.Store.may_repin_identity`. It applies only to a task
+    that has never started a model turn at all — no session, no run that actually
+    started, no review round — which is practically the initial implementation
+    startup refusal an operator fixes and retries before anything reached a provider.
+
+    It does **not** apply to a review round: a round only exists because the task has a
+    clean resumable session, and that conversation was created under the pinned
+    model/effort. Resuming it with a different model would silently redefine what "the
+    same session" means, so `review --retry-round` keeps the pin (and a pinned value
+    the runtime no longer accepts is an honest `needs_attention`, not a migration).
+
+    The caller passes the returned identity into ``Store.retry`` so the re-pin and the
+    re-queue are one statement — a mutation command does not hold the worker lock, and
+    a second write would let a live worker claim the task in between and invoke the
+    old pin. Never silent: the caller reports it.
+    """
+    if task is None or not store.may_repin_identity(task.id):
+        return None
+    try:
+        runtime = config.repo(task.repo).runtime
+    except ConfigError:  # pragma: no cover - a task's repo is allowlisted by construction
+        return None
+    return {
+        "driver": runtime.driver,
+        "model": runtime.model,
+        "effort": runtime.effort,
+        "permission_mode": runtime.permission_mode,
+    }
+
+
+def _repin_note(repin: dict[str, str | None]) -> str:
+    return (
+        "runtime identity re-pinned from the current configuration after a refused "
+        f"start (this task had never started a model turn): {repin['driver']}/"
+        f"{repin['model']}/{repin['effort'] or '-'}"
+    )
+
+
 def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) -> int:
     config.repo(args.repo)
     store = Store(config.worker.state_db)
     try:
         try:
-            task = getattr(store, action)(args.repo, args.issue)
+            if action == "retry":
+                # The permitted first-start re-pin is applied BY `retry`, in the same
+                # statement that re-queues the task: a mutation command holds no worker
+                # lock, so a separate write could let a live worker claim the task in
+                # between and invoke the identity the operator just replaced.
+                pending = store.get_task(args.repo, args.issue)
+                repin = _repin_after_refusal(config, store, pending)
+                task = store.retry(
+                    args.repo,
+                    args.issue,
+                    repin_driver=(repin or {}).get("driver"),
+                    repin_model=(repin or {}).get("model"),
+                    repin_effort=(repin or {}).get("effort"),
+                    repin_permission_mode=(repin or {}).get("permission_mode"),
+                )
+            else:
+                repin = None
+                task = getattr(store, action)(args.repo, args.issue)
         except ValueError as exc:
             log.error(
                 "action_rejected", action=action, repo=args.repo, issue=args.issue, error=str(exc)
@@ -1308,10 +1374,20 @@ def _mutate(args: argparse.Namespace, config: Config, log: Logger, action: str) 
             issue=task.issue_number,
             phase=task.phase,
         )
+        if repin:
+            note = _repin_note(repin)
+            log.info(
+                "runtime_identity_repinned",
+                repo=task.repo,
+                issue=task.issue_number,
+                note=note,
+            )
         print(
             f"{task.ref}: {action} → {task.phase}"
             + (f" ({task.last_error})" if task.last_error else "")
         )
+        if repin:
+            print(f"  note: {_repin_note(repin)}")
         # The Issue status comment follows the durable state, so an operator command
         # cannot leave a comment describing the phase before it. Best-effort by
         # design: an unreachable GitHub must not fail a command that already changed

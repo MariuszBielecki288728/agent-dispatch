@@ -1,10 +1,13 @@
 # agent-dispatch — Architecture and Task State Contract
 
-**Issue:** #2 (design-only)
-**Status:** Proposed for maintainer review
+**Issue:** #2 (design-only at the time; now implemented)
+**Status:** **Implemented** — Issues #3–#6 and #17 are merged. The current code and
+[`operations.md`](./operations.md) are authoritative for behaviour; this document is
+the design contract and the observed ground truth that shaped it. Where the two
+disagree, the code wins and the document is the bug.
 **Inputs:** [#1 / PR #7](https://github.com/MariuszBielecki288728/agent-dispatch/pull/7) — [`docs/feasibility.md`](./feasibility.md)
 **Target environment:** `craftlypse-agent` (Ubuntu 24.04.5, user `craftlypse`, `systemd --user` with `Linger=yes`)
-**Implementation plan:** Issues #3 → #6. This document does **not** implement the service.
+**Implementation plan:** Issues #3 → #6.
 
 ---
 
@@ -42,6 +45,14 @@ Issue #1 left an open decision: production unattended file mutation was **not de
 - **D2 — `--yolo` must be re-passed on every invocation, including every resume.** Permission grants do not persist inside a resumed session (probe D). The runtime adapter therefore never treats permission state as sticky session metadata.
 - **D3 — Model/effort are likewise re-passed explicitly on every resume.** `--model` persistence across resume was **not** verified. Re-passing the pinned values is a deliberate design choice: it makes "config change silently moves an existing session onto another model" structurally impossible, satisfying the pinning requirement in Issue #2.
 
+**Re-verified on v1.64.1 (2026-09-29, during the Issue #6 pilot).** The mutation
+unlocks above are unchanged, but the accepted `--effort` set is **model dependent and
+can change under a runtime upgrade**: `deepseek/deepseek-v4-flash` now accepts only
+`high|max`, and `medium` (valid on v1.64.0 the day before) makes the CLI exit 1 with
+`Unknown effort "medium". Supported: high, max.` and an **empty stream**. That is why
+a refused start is classified as a configuration fault rather than a task failure —
+see §8.
+
 ### 2.2 Silent false-success hazard (highest-risk finding)
 
 A run whose tool calls were **all blocked** still reported:
@@ -66,7 +77,7 @@ In a successful `--yolo` run this event is **absent** (tool events progress `too
 ### 2.3 Session, stream, and resume facts
 
 - `--output-format json` emits NDJSON: `run_start` carries `sessionId` on the **first line**; the final `result` line carries `subtype`, `sessionId`, `finalText`, `stopReason`, `usage{inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}`, `durationMs`.
-- After a **cleanly completed** run, resume via `--session <id>` keeps the same `sessionId` and retains prior-turn context (verified by asking the agent to recall a filename it created in an earlier turn). Resume also works from a different working directory.
+- After a **cleanly completed** run, resume via `--session <id>` keeps the same `sessionId` and retains prior-turn context (verified by asking the agent to recall a filename it created in an earlier turn). Resume also works from a different working directory. **Re-verified live on v1.64.1 (2026-09-29, Issue #6 pilot):** the review round resumed the implementation session and implemented a follow-up request touching the file the first turn had created.
 - A turn-cap hit exits with **code 8** (per `--help`), distinct from a normal failure exit 1.
 - Confirmed relevant flags: `-p/--print`, `--output-format`, `--session`, `-m/--model`, `--effort`, `--yolo` / `--dangerously-skip-permissions`, `--max-turns`, `-t/--trust`, `--skip-onboarding`, `--no-auto-update`, `--no-skills`, `--list-models`, `-w/--worktree`, `-r/--resume`. 80 models listed; default `deepseek/deepseek-v4-flash`.
 - `commandcode status` / `whoami` expose authentication state without printing credentials.
@@ -89,7 +100,7 @@ On this VM the effective order for `github.com` is:
 1. `/usr/bin/gh auth git-credential` — the **unapproved** raw helper, from `~/.gitconfig`
 2. `gh-craftlypse auth git-credential` — the approved wrapper, from `.git/config`
 
-Today the raw helper happens to return **no** credentials, so the chain falls through to the wrapper. That is **incidental, not guaranteed** — it depends on ambient file ordering and on whether a raw `gh` credential ever exists. A single `-c` override alone therefore does **not** ensure the wrapper is used.
+**Measured again on 2026-09-25: the raw helper currently *does* return a real credential for `github.com`.** The reset entry is therefore **load-bearing, not defensive** — without it the unapproved helper answers first and stops the chain. (The earlier #2 observation that it returned nothing was accurate when taken; ambient helper state can change without any change here.) A single `-c` override alone does **not** ensure the wrapper is used.
 
 > **Requirement:** clear the inherited list, then set the wrapper — in that order:
 > ```bash
@@ -109,7 +120,11 @@ This remains an **operational guardrail on a personal VM, not hard isolation**: 
 
 ### 2.5 Labels
 
-`take-it` and `agent:fix` **do not exist** in this repository yet (only GitHub's 10 default labels). Issue #3 must create them (or the maintainer must). Until then the trigger protocol is inert by construction — a safe default.
+`take-it` and `agent:fix` are created **deliberately** by
+`agent-dispatch setup-labels --repo owner/name --yes`, never as a side effect of
+polling, and both must exist before their protocol does anything: with no label
+present, discovery finds nothing at all — a safe default rather than a bug. `doctor`
+reports a missing label together with that exact command.
 
 ### 2.6 Explicitly unknown / not tested
 
@@ -443,7 +458,7 @@ First turn (note: no redirect inside the worktree — logs live outside, §6):
 ```bash
 cd <worktree>
 commandcode -p "<bounded instruction>" \
-  --model deepseek/deepseek-v4-flash --effort medium \
+  --model deepseek/deepseek-v4-flash --effort high \
   --yolo \
   --output-format json --max-turns 40 \
   --skip-onboarding --no-auto-update \
@@ -456,7 +471,7 @@ Follow-up round (identical except `--session`):
 cd <worktree>
 commandcode -p "<consolidated review feedback>" \
   --session <pinned-session-id> \
-  --model deepseek/deepseek-v4-flash --effort medium \
+  --model deepseek/deepseek-v4-flash --effort high \
   --yolo \
   --output-format json --max-turns 40 \
   --skip-onboarding --no-auto-update \
@@ -490,6 +505,57 @@ must not open an empty PR, whereas a review round that correctly concludes that 
 comment needs no code change is a *valid* outcome and is accepted and recorded as a
 no-op. What is never allowed is claiming changes were made — the round's committed
 diff is what the PR branch actually carries.
+
+### A runtime that refuses to start is a configuration fault
+
+A process that exits non-zero **without emitting a single stream record** never began
+a conversation: the CLI rejected its own invocation (the observed v1.64.1 case was an
+`--effort` value the pinned model no longer accepts) or crashed at startup. The driver
+reads the stderr sidecar for exactly that shape and quotes it into the failure, the
+orchestrator parks the task as `needs_attention`, and the claim's attempt is
+**refunded** — no model work was attempted and nothing was paid for, so charging the
+bounded-retry budget would park a healthy task for a configuration fault. Any stream
+record at all makes the classification impossible, so a run that actually started
+keeps its normal meaning and its normal cost. A refused review round is treated the
+same way: the round is parked for an explicit `review --retry-round`, and its review
+attempt is refunded so `review_round_attempts` keeps meaning *model turns spent*.
+
+All three facts land in **one transaction** (`Store.finalise_refused_start` /
+`finalise_refused_round`), because they are only true together: written separately, a
+crash in between left the task `running` (or the round `running`) with a charged
+attempt while the newest run already said the invocation never started — which the
+reconcile passes cannot distinguish from a genuinely interrupted, paid-for run, and
+would therefore requeue or park as the wrong thing.
+
+### Runtime identity is pinned per task, and only a refusal may re-pin it
+
+`tasks.runtime_{driver,model,effort}`/`permission_mode` are recorded when the row is
+created — repo configuration supplies the defaults for a **new** task — and every
+subsequent invocation uses the row, not the current config: an ordinary retry and a
+review resume both invoke the model/effort the task started with, and the row, the
+status comment and the journal all name that identity. Otherwise a config change
+would silently move an existing session to a different model while the comment
+claimed the old one — and the provider's cost would disagree with the UI.
+
+One operator command is the single, deliberately narrow exception, and only for a
+**first-start** refusal: `retry` may adopt the current configuration when the task has
+never started a model turn at all — no session, no run that actually started, no
+review round (`Store.may_repin_identity`). The reason is that a refusal attempted no
+model work, so there is no conversation whose identity must be preserved, and the
+usual reason an operator runs `retry` is that they just fixed the configuration. The
+re-pin and the re-queue are one SQL statement, so a live worker cannot claim the task
+in between and invoke the old pin, and the change is recorded and reported
+(`runtime_identity_repinned`), never silent.
+
+It is explicitly **not** available to `review --retry-round`. A review round only
+exists because the task has a clean resumable session, and that conversation was
+created under the pinned model/effort; resuming it with a different model would
+silently redefine what "the same session" means. If a runtime upgrade makes the pinned
+value impossible to invoke, the honest state is `needs_attention` until the compatible
+runtime or settings are restored — never a silent migration of an existing
+conversation. `permission_flag` and `max_turns` stay operational configuration rather
+than part of the pin: the pin answers "which model/effort produced this conversation",
+while the flag and cap describe how the current build invokes any model at all.
 
 ### Retry semantics after an interrupted run
 
@@ -867,7 +933,7 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 - **Fail-closed tests:** a truncated feedback listing, a missing session, a closed or foreign PR, a paused task, a missing `take-it` and a concurrent handoff all refuse or defer with the feedback neither silently lost nor incorrectly marked complete.
 - The merged #17 one-comment lifecycle is reused: a round heartbeats the **same** comment, publication recovery may edit it later with no live runtime, the final body is `Awaiting review`, and a late `Running` write can never follow terminal publication.
 - No auto-merge, no cross-repo mutation.
-- **Not covered offline, and stated as such:** a live `agent:fix` round against real GitHub and real Command Code (same-session continuity with real concurrent feedback, real pagination on the review endpoints, and a real label deletion). That is the opt-in VM smoke, and it is reported as *not tested* rather than assumed.
+- **Not covered offline, and stated as such:** a live `agent:fix` round against real GitHub and real Command Code (same-session continuity with real concurrent feedback, real pagination on the review endpoints, and a real label deletion). **Live-verified once on the pilot repository (2026-09-29)** — the round resumed the same session ID on the real PR, applied a fresh review request, was acknowledged after publication, and survived a worker restart with no duplicate invocation; the paused/withdrawn states and the legacy crash-signature repair were observed too. Still **not** live-tested: concurrent feedback arriving mid-round, real pagination/rate limits on the review endpoints, and crash windows inside a round.
 
 **#6 — operational release**
 - Fault/reconciliation matrix exercised: duplicate events, pagination gaps, crash during run, push-ok/timeout, PR created/DB write failed, PR merged or closed externally, provider unavailable, VM downtime, rate limit, edited/deleted comments, branch-base divergence.
@@ -880,7 +946,7 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 ## 13. Open items for maintainer confirmation
 
 1. **`--yolo` is the configured mode and no re-approval is requested.** The maintainer has approved the broad grant and the Command Code choice; no Docker/sandbox requirement is added. Recorded here only because it is the single verified mutation unlock (§2.1) and because `--permission-mode yolo` / `--tools-all` are *not* working substitutes if the flag is ever revisited.
-2. **Label creation.** `take-it` and `agent:fix` do not exist yet; confirm who creates them.
-3. **Disposable test repository.** Confirm which repo is allowlisted for the #4/#6 end-to-end runs, and confirm `agent-dispatch` itself is within the credential's permitted set.
-4. **Effort default.** `--effort medium` is proposed; adjust if the default model behaves better at another level.
-5. **Worktree-local Git config is written by the orchestrator.** Provisioning will set the reset-then-wrapper credential sequence in each managed worktree's repo-local config (§2.4). Flagging because it modifies Git config state that the maintainer may want to inspect; it does not touch the user's normal checkout.
+2. **Label creation — resolved.** `setup-labels` creates `take-it` and `agent:fix` explicitly and idempotently; both exist in the allowlisted repositories.
+3. **Disposable test repository — resolved.** `MariuszBielecki288728/agent-dispatch-pilot` is the dedicated live-test repository. Reads are verifiable with `doctor`; **writes** (branch push, PR, labels, status comment) additionally require the wrapper's credential to hold Contents/Issues/Pull-requests write access there.
+4. **Effort — per-repository and model dependent.** The shipped config uses `--effort high` because that is what the pinned model accepts on v1.64.1 (`high|max`; `medium` is now rejected outright). The value is per-repository (#6), so a cheaper repository can override it, and an accepted value is only authoritative for the runtime version that accepted it — a refused start is reported and costs no attempt (§8).
+5. **Worktree-local Git config — implemented as opt-in.** The inherited `GIT_CONFIG_*` pairs always cover orchestrator Git *and* the agent subprocess; writing the same reset-then-wrapper sequence into the source clone's repo-local config is `worker.write_repo_local_credentials`, **off by default** because a worktree shares that configuration with every other worktree of the clone.

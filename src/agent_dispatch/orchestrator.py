@@ -40,7 +40,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from .config import Config, RepoConfig
+from .config import Config, RepoConfig, RuntimeConfig
 from .gitcmd import Git, GitError
 from .github import ErrorKind, GitHubClient, GitHubError, Issue
 from .instruction import build_instruction
@@ -642,20 +642,21 @@ class Orchestrator:
                 ],
             )
 
-        self.store.record_runtime_identity(
-            task.id,
-            driver=repo.runtime.driver,
-            model=repo.runtime.model,
-            effort=repo.runtime.effort,
-            permission_mode=repo.runtime.permission_mode,
-        )
+        # The identity this task is pinned to — NOT the current repo config. Repo
+        # configuration supplied the default when the row was created, and it must not
+        # silently replace the pin here: an ordinary retry has to invoke the
+        # model/effort the task started with. Only the explicit operator recovery paths
+        # (`retry`, `review --retry-round`) may re-pin, and only after a recorded
+        # startup refusal (`Store.last_run_refused`). A legacy row with no recorded
+        # identity is backfilled once, here, before anything renders it.
+        self._effective_runtime(task, repo)
 
         # Re-read the row so the run and its status comment are driven by the identity
-        # just PINNED, not by the snapshot taken before the claim. `task` was loaded
-        # during discovery, so a config change in between would otherwise let the
-        # driver invoke the new model while the comment rendered the old one — the
-        # comment claiming a model that never ran this task, which is exactly what the
-        # pinned identity exists to prevent.
+        # the task is PINNED to, not by the snapshot taken before the claim. `task` was
+        # loaded during discovery, so a config change in between would otherwise let
+        # the comment render a different model than the one the task is pinned to —
+        # the comment claiming a model that never ran this task, which is exactly what
+        # the pinned identity exists to prevent.
         pinned = self.store.get_task(task.repo, task.issue_number) or task
 
         # ONE publisher for the whole run lifecycle (Starting -> Running heartbeats ->
@@ -715,6 +716,55 @@ class Orchestrator:
             run_started_at=self._run_started_at,
         )
 
+    def _effective_runtime(self, task: Task, repo: RepoConfig) -> RuntimeConfig:
+        """The runtime identity a run for this task must use: the row's pinned one.
+
+        Repo configuration supplies the defaults for a **new** task (recorded when the
+        row is created) and is backfilled once here for a legacy row that has no
+        identity. It must never silently replace an existing task's pin: an ordinary
+        retry, or a review round resuming the same session, has to invoke the
+        model/effort that task started with, or the row, the status comment and the
+        provider's actual cost disagree about what ran.
+
+        The two explicit operator recovery paths (``retry`` and
+        ``review --retry-round``) may deliberately re-pin after a recorded startup
+        refusal — no model turn happened, so there is no conversation whose identity
+        must be preserved — and they write the row themselves (see
+        ``Store.last_run_refused``).
+
+        ``permission_flag`` and ``max_turns`` stay operational configuration rather
+        than part of the pin: the pin answers "which model/effort produced this
+        conversation", while the flag and the turn cap describe how the current build
+        is allowed to invoke any model at all.
+        """
+        if task.runtime_driver and task.runtime_model and task.permission_mode:
+            return RuntimeConfig(
+                driver=task.runtime_driver,
+                model=task.runtime_model,
+                effort=task.runtime_effort,
+                permission_mode=task.permission_mode,
+                permission_flag=repo.runtime.permission_flag,
+                max_turns=repo.runtime.max_turns,
+            )
+        # Legacy row with no recorded identity: adopt the configured defaults once and
+        # record them, so from here on the task has a pin like any other.
+        runtime = repo.runtime
+        self.store.record_runtime_identity(
+            task.id,
+            driver=runtime.driver,
+            model=runtime.model,
+            effort=runtime.effort,
+            permission_mode=runtime.permission_mode,
+        )
+        self.log.info(
+            "runtime_identity_backfilled",
+            repo=repo.slug,
+            issue=task.issue_number,
+            model=runtime.model,
+            effort=runtime.effort,
+        )
+        return runtime
+
     def _run_once(
         self,
         *,
@@ -767,8 +817,9 @@ class Orchestrator:
             # second, duplicate thread created for no reason.
             publisher.begin(task, attempt=attempt, run_started_at=self._run_started_at)
 
+        runtime = self._effective_runtime(task, repo)
         driver = CommandCodeDriver(
-            repo.runtime,
+            runtime,
             run_log_dir=self.config.worker.run_log_dir,
             repo=repo.slug,
             issue_number=task.issue_number,
@@ -807,10 +858,14 @@ class Orchestrator:
             run_id=run_id,
             kind=kind,
             resumed_from=session_id,
-            model=repo.runtime.model,
-            effort=repo.runtime.effort,
-            permission_flag=repo.runtime.permission_flag,
-            max_turns=repo.runtime.max_turns,
+            # The EFFECTIVE identity (the task's pin), not the current repo config:
+            # the journal must agree with the argv that actually runs and with the
+            # status comment's "Runtime:" line, or the log is a second source of truth
+            # that can disagree.
+            model=runtime.model,
+            effort=runtime.effort,
+            permission_flag=runtime.permission_flag,
+            max_turns=runtime.max_turns,
             timeout_seconds=self.config.worker.run_timeout_seconds,
             worktree=str(worktree),
             argv=" ".join(redact_argv(driver.build_argv(instruction, session_id=session_id))),
@@ -1011,6 +1066,23 @@ class Orchestrator:
 
         if not result.ok:
             detail = result.validation.summary()
+            if result.runtime_refused:
+                # ONE transaction closes the run, refunds the attempt the claim charged
+                # and parks the task. Written separately, a crash in between left the
+                # task `running` with a charged attempt while its newest run already
+                # said the invocation never started — which reconciliation can only
+                # read as an interrupted run, i.e. a configuration fault queued to
+                # repeat itself.
+                self.store.finalise_refused_start(
+                    run_row,
+                    task.id,
+                    detail=detail,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    produced_work=after.produced_work,
+                )
+                return self._refused_start_outcome(task, result, detail)
             self.store.finish_run(
                 run_row,
                 outcome=RUN_FAILED,
@@ -1205,6 +1277,33 @@ class Orchestrator:
             run=result,
             attempts=attempted,
             notes=notes,
+        )
+
+    def _refused_start_outcome(self, task: Task, result: RunResult, detail: str) -> DispatchOutcome:
+        """Describe a task whose runtime refused to start. The writes already happened.
+
+        A process that exits non-zero without emitting a single stream record never
+        started a conversation: the CLI rejected its own invocation (observed on
+        Command Code v1.64.1: ``Unknown effort "medium". Supported: high, max.``) or
+        crashed at startup. Nothing was sent to the model and nothing was paid for, so
+        this is a **configuration fault** — the same class as a missing runtime binary
+        — rather than a task failure. Charging it to the attempt budget is what parked
+        a healthy task as ``failed`` after three no-op attempts during the #6 pilot;
+        ``Store.finalise_refused_start`` closes the run, refunds the attempt and parks
+        the task in one transaction, and this method only reports it.
+        """
+        return DispatchOutcome(
+            action=OUTCOME_NEEDS_ATTENTION,
+            task_ref=task.ref,
+            reason="runtime_refused",
+            session_id=result.session_id,
+            run=result,
+            attempts=task.attempts,
+            notes=[
+                detail,
+                "no model work was attempted, so no attempt was consumed; fix the "
+                "configuration (for example the pinned effort) and run `agent-dispatch retry`",
+            ],
         )
 
     def _publish(
@@ -2537,43 +2636,76 @@ class Orchestrator:
         after = manager.inspect(before.path, before.branch)
         attempted = round_row.attempts
 
-        if publisher is not None:
-            # The round's turn has stopped. Publish the review-specific intermediate
-            # state BEFORE the terminal flag is raised: `Publishing feedback changes`
-            # says "the model is done and the pull request does not have the changes
-            # yet", which is exactly true here and is what a maintainer needs. Raising
-            # the flag first would suppress this write as a background one.
+        if publisher is not None and result.ok:
+            # The round's turn has stopped CLEANLY. Publish the review-specific
+            # intermediate state BEFORE the terminal flag is raised: `Publishing
+            # feedback changes` says "the model is done and the pull request does not
+            # have the changes yet", which is exactly true here and is what a maintainer
+            # needs. Raising the flag first would suppress this write as a background one.
+            #
+            # Guarded by `result.ok` for the same reason the implementation path guards
+            # its own `Publishing` write: a blocked, timed-out, failed or refused turn
+            # has nothing valid to publish, so claiming it is publishing would be a
+            # false intermediate state — and for a refused start it would announce
+            # progress for a round in which no model turn happened at all. The message
+            # must also stay consistent with the heartbeat's terminal ordering, so a
+            # failed round raises the flag without the publishing write.
             publisher.publishing_review(task, round_number=round_row.round)
+            publisher.begin_terminal()
+        elif publisher is not None:
             publisher.begin_terminal()
 
         if not result.ok:
             detail = result.validation.summary()
-            self.store.finish_run(
-                run_row,
-                outcome=RUN_FAILED,
-                session_id=result.session_id,
-                exit_code=result.exit_code,
-                subtype=result.subtype,
-                tool_hook_blocked=result.tool_hook_blocked,
-                timed_out=result.timed_out,
-                produced_work=after.produced_work,
-                detail=detail,
-            )
-            # A failed turn is NEVER auto-repeated. The feedback snapshot stays
-            # unacknowledged, so nothing is lost: the maintainer can fix the cause and
-            # re-add the label, and the round will carry the same feedback again.
-            self.store.park_round(
-                round_row.id,
-                state=ROUND_FAILED,
-                stage=None,
-                note=detail,
-            )
-            self.store.set_phase(
-                task.id,
-                "needs_attention",
-                f"review round {round_row.round} did not complete: {detail}. The feedback is "
-                "recorded and unacknowledged; no second model round was started.",
-            )
+            if result.runtime_refused:
+                # The review-side counterpart of the implementation finaliser, and the
+                # same all-or-nothing rule: run row, refunded turn, parked round and
+                # task phase land together, so a crash cannot leave the round `running`
+                # with a turn it never spent.
+                self.store.finalise_refused_round(
+                    run_row,
+                    round_row.id,
+                    task.id,
+                    detail=detail,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    produced_work=after.produced_work,
+                )
+                self.log.info(
+                    "review_round_attempt_refunded",
+                    repo=task.repo,
+                    issue=task.issue_number,
+                    round=round_row.round,
+                    detail="the runtime refused to start; no model turn was spent",
+                )
+            else:
+                self.store.finish_run(
+                    run_row,
+                    outcome=RUN_FAILED,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    tool_hook_blocked=result.tool_hook_blocked,
+                    timed_out=result.timed_out,
+                    produced_work=after.produced_work,
+                    detail=detail,
+                )
+                # A failed turn is NEVER auto-repeated. The feedback snapshot stays
+                # unacknowledged, so nothing is lost: the maintainer can fix the cause
+                # and re-add the label, and the round will carry the same feedback again.
+                self.store.park_round(
+                    round_row.id,
+                    state=ROUND_FAILED,
+                    stage=None,
+                    note=detail,
+                )
+                self.store.set_phase(
+                    task.id,
+                    "needs_attention",
+                    f"review round {round_row.round} did not complete: {detail}. The feedback is "
+                    "recorded and unacknowledged; no second model round was started.",
+                )
             if publisher is not None:
                 # Derived from the row the failure path just wrote, not asserted here:
                 # the heartbeat can legitimately have published a live state moments

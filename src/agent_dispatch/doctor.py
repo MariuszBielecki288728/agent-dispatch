@@ -184,9 +184,9 @@ def _check_wrapper(
             report.add(f"labels:{slug}", "warn", f"could not read labels ({exc.kind}): {exc}")
             continue
 
-        # Only the trigger label matters for dispatch in #3; the review label is
-        # reported because #5 will need it, and because its absence today is why
-        # the trigger protocol is inert.
+        # Both labels are reported: the trigger gates dispatch, the handoff gates
+        # review rounds, and a missing label is why the corresponding protocol is
+        # inert — a safe default, reported with the exact command that fixes it.
         missing = [name for name in required_labels if name not in labels]
         if missing:
             report.add(
