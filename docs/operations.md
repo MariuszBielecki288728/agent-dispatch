@@ -1204,7 +1204,7 @@ a mock. The cases most worth knowing about:
 | `ReviewPublicationTests` | a failed push/PR step is finished on a later pass with the **same PR** and **zero** extra runtime calls, and only then does the cursor advance; a no-op round is accepted; a failed commit parks with its own stage |
 | `ReviewHandoffCrashTests` | a failed label removal cannot start a second round; a claimed-but-unstarted round is re-driven; a round from a dead process is parked with no new model call; a restart after publication leaves exactly one applied round with the same PR and cursor |
 | `FinalisationAtomicityTests` | the handover is one SQLite transaction (asserted on the statement trace), and a failure inside it rolls back every coupled fact |
-| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Awaiting review`, and opens no second comment |
+| `ReviewStatusCommentTests` | a round heartbeats the **same** comment, reports `Applying feedback` → `Publishing feedback changes` → `Awaiting review`, and opens no second comment; a blocked or refused round **never** writes `Publishing feedback changes` (asserted on the round's whole write log, not just the final body) |
 | `StatusCommentIsNotFeedbackTests` | the dispatcher's own status comment is not in the claimed cursor, a status edit after the claim still lets the round re-drive, and editing *real* feedback still refuses (the negative control) |
 | `OversizedFeedbackIsNeverSilentlyAcknowledgedTests` | new feedback past the instruction bound defers instead of claiming; a fitting batch delivers **every** item it acknowledges; the guard refuses rather than slicing |
 | `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard measures the longest requirement variant the builder can join, so a batch that fits only while the diff is readable is refused and an admitted handoff builds under either; the unreadable-diff requirement set is a strict superset of the readable one, and the built instruction emits each required section exactly once with the closing instruction last |
@@ -1502,9 +1502,15 @@ configuration rather than from anything in those texts.
 | State | Meaning |
 |---|---|
 | `Applying feedback` | The resumed session is working through the round's feedback. |
-| `Publishing feedback changes` | The turn completed and the changes are being committed and pushed. No further model run is involved. |
+| `Publishing feedback changes` | The turn **completed cleanly** and its changes are being committed and pushed. No further model run is involved. |
 | `Awaiting review` | The round is published; the feedback it carried is acknowledged. |
 | `Needs attention` | A round is unfinished — either its publication failed and will be retried, or its agent turn failed and a human decision is needed. |
+
+`Publishing feedback changes` is written **only** for a turn that succeeded. A blocked,
+timed-out, failed or refused turn has nothing valid to publish, so it goes straight to
+`Needs attention` — exactly as the implementation path withholds `Publishing` on a
+failed run. A refused start in particular must never announce progress, because no
+model turn happened at all.
 
 It is deliberately **one** comment, edited in place, exactly as in §13: a review
 round heartbeats the comment the task already owns, and a round never opens a second
@@ -1790,7 +1796,7 @@ rests on; the dated evidence lives in the pull request that closed Issue #6.
 | Runtime refused to start (the pilot's real bug) | after the runtime auto-updated to v1.64.1 the pinned `effort` became invalid; the run exited 1 with an empty stream. The task parked as `Needs attention` quoting `Unknown effort "medium". Supported: high, max.` and **consumed no attempt**; fixing the value and `retry` completed the task on its first real run (attempt 1 of 3, PR #5) |
 | `tool_hook_blocked` guard | `smoke-runtime.sh --live` produced a real blocked stream (`exit=0`, `subtype=success`) and the production validator rejected it |
 
-**Automated offline:** 425 tests (`test-offline.sh`), `ruff check` /
+**Automated offline:** 426 tests (`test-offline.sh`), `ruff check` /
 `ruff format --check` / pre-commit hooks, and `smoke-runtime.sh --mock` — all green;
 the runner needs no network, no model credits and no GitHub mutation.
 

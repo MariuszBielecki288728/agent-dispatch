@@ -537,7 +537,7 @@ status comment and the journal all name that identity. Otherwise a config change
 would silently move an existing session to a different model while the comment
 claimed the old one — and the provider's cost would disagree with the UI.
 
-Two operator commands are the single, deliberately narrow exception, and only for a
+One operator command is the single, deliberately narrow exception, and only for a
 **first-start** refusal: `retry` may adopt the current configuration when the task has
 never started a model turn at all — no session, no run that actually started, no
 review round (`Store.may_repin_identity`). The reason is that a refusal attempted no
