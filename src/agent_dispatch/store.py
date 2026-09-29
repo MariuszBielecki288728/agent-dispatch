@@ -1081,7 +1081,16 @@ class Store:
         )
         return cursor.rowcount > 0
 
-    def retry(self, repo: str, issue_number: int) -> Task:
+    def retry(
+        self,
+        repo: str,
+        issue_number: int,
+        *,
+        repin_driver: str | None = None,
+        repin_model: str | None = None,
+        repin_effort: str | None = None,
+        repin_permission_mode: str | None = None,
+    ) -> Task:
         """Re-queue a failed/needs_attention task with a cleared attempt budget.
 
         Refused for a publish-pending task. ``retry`` means "try the implementation
@@ -1089,6 +1098,14 @@ class Store:
         completed and only publishing failed: it would spend credits twice and let a
         second run modify work that is already finished. The refusal names the action
         that does help, so the operator is not left guessing.
+
+        The optional ``repin_*`` arguments adopt a new runtime identity in the **same
+        statement** that makes the task queued. That ordering is the point: a mutation
+        command does not hold the worker lock, so setting the identity in a second
+        write would leave a window in which a live worker claims the newly queued task
+        and invokes the old pin. They are only ever passed for the one case
+        :meth:`may_repin_identity` allows (a first-start refusal), and passing them for
+        any other task raises rather than silently rewriting a conversation's identity.
         """
         task = self._require(repo, issue_number)
         if task.is_publish_pending:
@@ -1103,10 +1120,25 @@ class Store:
             raise ValueError(
                 f"{task.ref} is {task.phase}; retry applies to {', '.join(sorted(RETRYABLE_PHASES))} only"
             )
-        self._conn.execute(
-            "UPDATE tasks SET phase = 'queued', attempts = 0, last_error = NULL, updated_at = ? WHERE id = ?",
-            (utcnow_iso(), task.id),
+        repin = (
+            repin_driver is not None or repin_model is not None or repin_permission_mode is not None
         )
+        if repin and not self.may_repin_identity(task.id):
+            raise ValueError(
+                f"{task.ref} has already started a model turn (or owns a review round or "
+                "session), so its recorded runtime identity may not be re-pinned; the "
+                "task keeps the model/effort its conversation was created with"
+            )
+        sql = "UPDATE tasks SET phase = 'queued', attempts = 0, last_error = NULL, updated_at = ?"
+        params: list[Any] = [utcnow_iso()]
+        if repin:
+            sql += (
+                ", runtime_driver = ?, runtime_model = ?, runtime_effort = ?, permission_mode = ?"
+            )
+            params += [repin_driver, repin_model, repin_effort, repin_permission_mode]
+        sql += " WHERE id = ?"
+        params.append(task.id)
+        self._conn.execute(sql, params)
         return self._require(repo, issue_number)
 
     def resume_publication(self, repo: str, issue_number: int) -> Task:
@@ -1154,46 +1186,11 @@ class Store:
             (task_id, int(trigger_present), issue_state, linked_pr_number, linked_pr_state, now),
         )
 
-    def refund_attempt(self, task_id: int) -> None:
-        """Give back the attempt charged when this run was claimed.
-
-        Used only for a runtime that refused to start (it exited non-zero without
-        emitting a single stream record): the claim had already charged an attempt
-        before the refusal was knowable, and no model work was attempted or paid
-        for. Charging the bounded-retry budget for a configuration fault is what
-        parked a healthy task as `failed` after three no-op attempts during the #6
-        pilot. Guarded so a double refund cannot mint budget.
-        """
-        self._conn.execute(
-            "UPDATE tasks SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, "
-            "updated_at = ? WHERE id = ?",
-            (utcnow_iso(), task_id),
-        )
-
-    def refund_round_attempt(self, round_id: int) -> None:
-        """Give back the review turn charged when the round was started.
-
-        The review counterpart of :meth:`refund_attempt`, and the same rule: a
-        refusal (non-zero exit, zero stream records) attempted no model work, so
-        ``review_round_attempts`` — documented as *model turns spent* — must not
-        count it. The round itself stays parked for an explicit
-        ``review --retry-round``; only the accounting is corrected.
-        """
-        self._conn.execute(
-            "UPDATE review_rounds SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 "
-            "END WHERE id = ?",
-            (round_id,),
-        )
-
     def last_run_refused(self, task_id: int) -> bool:
         """Whether the newest recorded run refused to start.
 
         ``True`` only for a run that exited non-zero without emitting a single
-        stream record — no session, no model turn, no provider cost. This is the
-        durable evidence behind the one exception to runtime-identity pinning: the
-        operator's explicit ``retry`` / ``review --retry-round`` may adopt the
-        current configuration, because there is no started conversation whose
-        identity must be preserved.
+        stream record — no session, no model turn, no provider cost.
         """
         row = self._conn.execute(
             "SELECT COALESCE(refused, 0) AS refused FROM runs WHERE task_id = ? ORDER BY id DESC "
@@ -1201,6 +1198,139 @@ class Store:
             (task_id,),
         ).fetchone()
         return bool(row["refused"]) if row is not None else False
+
+    def may_repin_identity(self, task_id: int) -> bool:
+        """Whether a refused start may adopt the current configuration for this task.
+
+        Deliberately much narrower than :meth:`last_run_refused`, because a refused
+        start is **not** proof that no conversation exists:
+
+        * a task that ever captured a ``session_id`` has a conversation that was
+          created under its pinned model/effort, and every review round requires
+          one — resuming that with a different model would silently redefine what
+          "the same session" means;
+        * an earlier attempt may have really started (its run emitted records and is
+          not marked refused), so the task has model history even when the newest
+          run is a refusal.
+
+        So the only safe case is a task that has never started a model turn at all:
+        no session, no run that actually started, no review round, and a newest run
+        that is the refusal being recovered from. That is practically the initial
+        implementation startup refusal — the case where an operator fixes the
+        configuration and retries before anything was ever sent to a provider.
+
+        When this returns ``False`` the pin stands, and a pinned value the runtime no
+        longer accepts is an honest ``needs_attention`` rather than a silent
+        migration of an existing conversation.
+        """
+        task = self._conn.execute(
+            "SELECT session_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None or task["session_id"]:
+            return False
+        started = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE task_id = ? AND COALESCE(refused, 0) = 0",
+            (task_id,),
+        ).fetchone()
+        if started is not None and int(started["n"]) > 0:
+            # A run that is not a refusal either started, crashed mid-flight, or is
+            # still open. All three mean "do not touch this task's identity".
+            return False
+        if self._table_present("review_rounds"):
+            rounds = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM review_rounds WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if rounds is not None and int(rounds["n"]) > 0:
+                return False
+        return self.last_run_refused(task_id)
+
+    def finalise_refused_start(
+        self,
+        run_row_id: int,
+        task_id: int,
+        *,
+        detail: str,
+        session_id: str | None,
+        exit_code: int | None,
+        subtype: str | None,
+        produced_work: bool | None,
+    ) -> None:
+        """Close a refused implementation run, refund its attempt and park the task.
+
+        One transaction, because these three facts are only true together. Written
+        separately (``finish_run(refused=True)`` then the refund then the park), a
+        crash in between left the task `running` with a charged attempt while its
+        newest run already said the invocation never started — and startup
+        reconciliation, which cannot see a partial intention, would then treat it as
+        an interrupted run and requeue a configuration fault.
+        """
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            self._write_run_completion(
+                conn,
+                run_row_id,
+                outcome=RUN_FAILED,
+                session_id=session_id,
+                exit_code=exit_code,
+                subtype=subtype,
+                tool_hook_blocked=False,
+                timed_out=False,
+                produced_work=produced_work,
+                detail=detail,
+                refused=True,
+            )
+            conn.execute(
+                "UPDATE tasks SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, "
+                "phase = 'needs_attention', last_error = ?, updated_at = ? WHERE id = ?",
+                (detail, now, task_id),
+            )
+
+    def finalise_refused_round(
+        self,
+        run_row_id: int,
+        round_id: int,
+        task_id: int,
+        *,
+        detail: str,
+        session_id: str | None,
+        exit_code: int | None,
+        subtype: str | None,
+        produced_work: bool | None,
+    ) -> None:
+        """Close a refused review run, refund its turn and park the round + task.
+
+        The review counterpart of :meth:`finalise_refused_start`, and the same
+        all-or-nothing rule: the run row, the round's refunded turn, the parked round
+        and the task phase are one transaction, so a crash cannot leave the round
+        ``running`` with a turn it never spent — which ``reconcile_review_rounds``
+        would otherwise report and park as an interrupted *paid* turn.
+        """
+        now = utcnow_iso()
+        with self.transaction() as conn:
+            self._write_run_completion(
+                conn,
+                run_row_id,
+                outcome=RUN_FAILED,
+                session_id=session_id,
+                exit_code=exit_code,
+                subtype=subtype,
+                tool_hook_blocked=False,
+                timed_out=False,
+                produced_work=produced_work,
+                detail=detail,
+                refused=True,
+            )
+            conn.execute(
+                "UPDATE review_rounds SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 "
+                "ELSE 0 END, state = ?, recovery_stage = COALESCE(?, recovery_stage), error = ?, "
+                "finished_at = ? WHERE id = ?",
+                (ROUND_FAILED, None, detail, now, round_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET phase = 'needs_attention', last_error = ?, updated_at = ? "
+                "WHERE id = ?",
+                (detail, now, task_id),
+            )
 
     def mark_needs_attention(self, task_id: int, note: str) -> None:
         self._conn.execute(
@@ -1346,10 +1476,10 @@ class Store:
         """Record the runtime identity a task is pinned to.
 
         Called when a task row is created (repo config supplies the defaults for
-        **new** tasks), for a one-off backfill of a legacy row that has no
-        recorded identity, and by the two **explicit** operator recovery paths that
-        may deliberately adopt the current configuration after a recorded startup
-        refusal (see :meth:`last_run_refused`).
+        **new** tasks), to backfill a legacy row that has no recorded identity, and by
+        nothing else: an existing task's pin is never replaced, and the two explicit
+        recovery commands that may re-pin a never-started task after a refusal do it
+        inside :meth:`retry` so the identity and the re-queue are one statement.
 
         It must NOT be called on every claim: an existing task keeps the
         model/effort it started with, so a config change cannot silently move a
@@ -1424,6 +1554,47 @@ class Store:
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def _write_run_completion(
+        self,
+        conn: sqlite3.Connection,
+        run_row_id: int,
+        *,
+        outcome: str,
+        session_id: str | None,
+        exit_code: int | None,
+        subtype: str | None,
+        tool_hook_blocked: bool,
+        timed_out: bool,
+        produced_work: bool | None,
+        detail: str | None,
+        refused: bool = False,
+    ) -> None:
+        """The one statement that closes a ``runs`` row.
+
+        Shared by :meth:`finish_run` and the refused-start finalisers so the shape of
+        "what a closed run row looks like" exists once — a second copy is how the two
+        paths drift apart. ``conn`` is the connection the caller is writing on, which
+        is what lets the finalisers keep this inside their transaction.
+        """
+        conn.execute(
+            "UPDATE runs SET outcome = ?, session_id = COALESCE(?, session_id), exit_code = ?, "
+            "subtype = ?, tool_hook_blocked = ?, timed_out = ?, refused = ?, produced_work = ?, "
+            "detail = ?, finished_at = ? WHERE id = ?",
+            (
+                outcome,
+                session_id,
+                exit_code,
+                subtype,
+                int(tool_hook_blocked),
+                int(timed_out),
+                int(refused),
+                None if produced_work is None else int(produced_work),
+                detail,
+                utcnow_iso(),
+                run_row_id,
+            ),
+        )
+
     def finish_run(
         self,
         run_row_id: int,
@@ -1447,24 +1618,24 @@ class Store:
         ``refused`` records the one shape :meth:`last_run_refused` acts on: a
         non-zero exit with no stream at all. Defaults to ``False`` so every other
         failure keeps its normal meaning.
+
+        A refused start whose *consequences* (the refund and the park) also have to
+        land uses :meth:`finalise_refused_start` / :meth:`finalise_refused_round`
+        instead: closing the run on its own here leaves the task `running` with a
+        charged attempt if the process dies before the next statement.
         """
-        self._conn.execute(
-            "UPDATE runs SET outcome = ?, session_id = COALESCE(?, session_id), exit_code = ?, "
-            "subtype = ?, tool_hook_blocked = ?, timed_out = ?, refused = ?, produced_work = ?, "
-            "detail = ?, finished_at = ? WHERE id = ?",
-            (
-                outcome,
-                session_id,
-                exit_code,
-                subtype,
-                int(tool_hook_blocked),
-                int(timed_out),
-                int(refused),
-                None if produced_work is None else int(produced_work),
-                detail,
-                utcnow_iso(),
-                run_row_id,
-            ),
+        self._write_run_completion(
+            self._conn,
+            run_row_id,
+            outcome=outcome,
+            session_id=session_id,
+            exit_code=exit_code,
+            subtype=subtype,
+            tool_hook_blocked=tool_hook_blocked,
+            timed_out=timed_out,
+            produced_work=produced_work,
+            detail=detail,
+            refused=refused,
         )
 
     def run_history(self, task_id: int) -> list[Run]:

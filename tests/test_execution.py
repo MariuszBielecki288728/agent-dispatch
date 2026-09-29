@@ -1118,6 +1118,78 @@ class RuntimePinningTests(ExecutionCase):
         self.assertEqual(task.runtime_effort, "high")
         self.assertEqual(task.phase, "awaiting_review")
 
+    def test_a_later_refusal_does_not_repin_a_task_that_already_started(self) -> None:
+        # The negative control the review asked for: "the newest run was refused" is
+        # NOT sufficient evidence that no conversation exists. Run 1 really starts on
+        # A (it emits records and fails), so the task has model history; a later attempt
+        # then refuses at startup, and the config says B. The pin must survive, because
+        # re-pinning would rewrite the identity of a task that has already talked to a
+        # provider.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-1",
+                    "subtype": "error",
+                    "exit_code": 1,
+                    "events": ["tool_completed"],
+                    "edits": {"partial.txt": "half\n"},
+                },
+                {
+                    "no_stream": True,
+                    "exit_code": 1,
+                    "stderr": 'Unknown effort "high". Supported: low, max.',
+                },
+                {"session_id": "sess-3", "subtype": "success", "edits": {"done.txt": "1\n"}},
+            ]
+        )
+        self.set_issues(issue(1, "Started then refused", labels=[TRIGGER]))
+        self.runtime_config(model="model-a", effort="high", max_attempts=1)
+
+        # Run 1: really starts, then fails. Budget spent, so the task is `failed`.
+        self.assertEqual(self.run_cli("run").returncode, 1)
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        self.assertEqual(store.get_task(self.slug, 1).phase, "failed")
+
+        # Explicit retry: permitted (the phase allows it), but it must NOT re-pin — a
+        # started run exists.
+        retried = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertNotIn("re-pinned", retried.stdout)
+
+        # Run 2 refuses at startup: parked, attempt refunded, refusal recorded.
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 1)
+        refused = store.get_task(self.slug, 1)
+        self.assertEqual(refused.phase, "needs_attention")
+        self.assertEqual(refused.attempts, 0)
+        self.assertTrue(store.last_run_refused(refused.id))
+        self.assertFalse(
+            store.may_repin_identity(refused.id),
+            "a task with a started run must never be allowed to re-pin",
+        )
+
+        # The config changes, and the operator retries again. The refusal is the newest
+        # run, but the task already started on A, so the pin stands.
+        self.runtime_config(model="model-b", effort="max", max_attempts=1)
+        retried_again = self.run_cli("retry", "--repo", self.slug, "--issue", "1")
+        self.assertEqual(retried_again.returncode, 0, retried_again.stderr)
+        self.assertNotIn(
+            "re-pinned",
+            retried_again.stdout,
+            "an earlier started run must block the re-pin even when the newest run refused",
+        )
+        self.assertEqual(self.run_cli("run", "--skip-poll").returncode, 0)
+
+        argv = self.recorded_argv()[-1]
+        self.assertIn("model-a", argv, "the pinned model still runs")
+        self.assertNotIn("model-b", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+        task = store.get_task(self.slug, 1)
+        self.assertEqual(task.runtime_model, "model-a")
+        self.assertEqual(task.runtime_effort, "high")
+        self.assertEqual(task.phase, "awaiting_review")
+
 
 class RuntimeRefusalTests(ExecutionCase):
     """The #6 pilot's real failure: the CLI refused its invocation outright.
@@ -1197,6 +1269,115 @@ class RuntimeRefusalTests(ExecutionCase):
         self.assertEqual(len(self.recorded_argv()), 2, "one refusal, then one real run")
         self.assertEqual(len(self.world.read_world()["repos"][self.slug]["pulls"]), 1)
         self.assertIn(task.branch, self._remote_branches())
+
+    def test_the_refused_start_finalisation_is_one_transaction(self) -> None:
+        # Review round 2 (blocker 2): closing the run, refunding the attempt and parking
+        # the task are only true together. Autocommitted separately, a crash between
+        # them left the task `running` with a charged attempt while its newest run
+        # already said the invocation never started — which reconciliation can only
+        # read as an interrupted run, i.e. a configuration fault queued to repeat.
+        import sqlite3  # noqa: PLC0415 - local to keep the module header small
+
+        from agent_dispatch.store import Store
+
+        self.set_issues(issue(1, "Refused atomic", labels=[TRIGGER]))
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        store.upsert_discovered(
+            repo=self.slug,
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="m",
+            runtime_effort="high",
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        task = store.get_task(self.slug, 1)
+        store.set_owned_worktree(
+            task.id, branch="dispatch/issue-1-x", worktree_path=str(self.tmp), base_branch="main"
+        )
+        assert store.claim_for_run(
+            task.id, branch="dispatch/issue-1-x", worktree_path=str(self.tmp), base_branch="main"
+        )
+        run_row = store.start_run(
+            task.id,
+            run_id="20260929T000000000000-implementation-refused1",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "refused.ndjson"),
+        )
+        self.assertEqual(store.get_task(self.slug, 1).attempts, 1, "the claim charged one")
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            store.finalise_refused_start(
+                run_row,
+                task.id,
+                detail=self.REFUSAL,
+                session_id=None,
+                exit_code=1,
+                subtype=None,
+                produced_work=None,
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+
+        begins = [s for s in statements if s.strip().upper().startswith("BEGIN")]
+        commits = [s for s in statements if s.strip().upper().startswith("COMMIT")]
+        self.assertEqual(len(begins), 1, f"one transaction expected: {statements}")
+        self.assertEqual(len(commits), 1, f"one commit expected: {statements}")
+
+        fresh = store.get_task(self.slug, 1)
+        self.assertEqual(fresh.phase, "needs_attention")
+        self.assertEqual(fresh.attempts, 0, "the refund lands with the park")
+        self.assertTrue(store.last_run_refused(task.id), "the run is closed as refused")
+
+        # And it must roll back as a unit: fail inside the transaction on the LAST
+        # table it writes and assert that nothing landed. `start_run` charges a fresh
+        # attempt, so "nothing happened" is distinguishable from "it succeeded".
+        second_run = store.start_run(
+            task.id,
+            run_id="20260929T000000000001-implementation-refused2",
+            kind="implementation",
+            resumed_from=None,
+            log_path=str(self.tmp / "refused2.ndjson"),
+        )
+        self.assertEqual(store.get_task(self.slug, 1).attempts, 1, "the new run is charged")
+        store._conn.executescript(
+            "CREATE TRIGGER fail_refused BEFORE UPDATE ON tasks "
+            "WHEN NEW.phase = 'needs_attention' "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure mid-refusal'); END;"
+        )
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                store.finalise_refused_start(
+                    second_run,
+                    task.id,
+                    detail="boom",
+                    session_id=None,
+                    exit_code=1,
+                    subtype=None,
+                    produced_work=None,
+                )
+        finally:
+            store._conn.executescript("DROP TRIGGER fail_refused")
+
+        rolled_back = store.get_task(self.slug, 1)
+        self.assertEqual(
+            rolled_back.attempts, 1, "the rejected finalisation must not refund the attempt"
+        )
+        self.assertEqual(rolled_back.phase, "needs_attention", "and must not re-park the task")
+        self.assertEqual(
+            store.run_history(task.id)[-1].outcome,
+            "running",
+            "the run row must stay open when the transaction rolls back",
+        )
 
 
 class SessionIdentityTests(ExecutionCase):

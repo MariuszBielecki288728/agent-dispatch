@@ -1066,6 +1066,23 @@ class Orchestrator:
 
         if not result.ok:
             detail = result.validation.summary()
+            if result.runtime_refused:
+                # ONE transaction closes the run, refunds the attempt the claim charged
+                # and parks the task. Written separately, a crash in between left the
+                # task `running` with a charged attempt while its newest run already
+                # said the invocation never started — which reconciliation can only
+                # read as an interrupted run, i.e. a configuration fault queued to
+                # repeat itself.
+                self.store.finalise_refused_start(
+                    run_row,
+                    task.id,
+                    detail=detail,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    produced_work=after.produced_work,
+                )
+                return self._refused_start_outcome(task, result, detail)
             self.store.finish_run(
                 run_row,
                 outcome=RUN_FAILED,
@@ -1076,13 +1093,7 @@ class Orchestrator:
                 timed_out=result.timed_out,
                 produced_work=after.produced_work,
                 detail=detail,
-                refused=result.runtime_refused,
             )
-            # A runtime that never emitted a record never started a conversation: no
-            # model work was attempted or paid for, so it is a configuration fault and
-            # must not be charged to the attempt budget.
-            if result.runtime_refused:
-                return self._record_runtime_refusal(task, result, detail)
             return self._record_failure(task, result, after, attempted, detail)
 
         # A registered worktree that is no longer on the branch this task owns can
@@ -1268,27 +1279,19 @@ class Orchestrator:
             notes=notes,
         )
 
-    def _record_runtime_refusal(
-        self, task: Task, result: RunResult, detail: str
-    ) -> DispatchOutcome:
-        """Park a task whose runtime refused to start, without spending an attempt.
+    def _refused_start_outcome(self, task: Task, result: RunResult, detail: str) -> DispatchOutcome:
+        """Describe a task whose runtime refused to start. The writes already happened.
 
         A process that exits non-zero without emitting a single stream record never
         started a conversation: the CLI rejected its own invocation (observed on
         Command Code v1.64.1: ``Unknown effort "medium". Supported: high, max.``) or
-        crashed at startup. Nothing was sent to the model and nothing was paid for,
-        so this is a **configuration fault** — the same class as a missing runtime
-        binary — rather than a task failure. Charging it to the attempt budget is what
-        parked a healthy task as ``failed`` after three no-op attempts during the #6
-        pilot; instead the attempt count is left untouched and the task waits in
-        ``needs_attention`` with the runtime's own message. Fix the configuration,
-        then ``agent-dispatch retry``.
+        crashed at startup. Nothing was sent to the model and nothing was paid for, so
+        this is a **configuration fault** — the same class as a missing runtime binary
+        — rather than a task failure. Charging it to the attempt budget is what parked
+        a healthy task as ``failed`` after three no-op attempts during the #6 pilot;
+        ``Store.finalise_refused_start`` closes the run, refunds the attempt and parks
+        the task in one transaction, and this method only reports it.
         """
-        note = detail
-        # The claim charged one attempt before the refusal was knowable; no model work
-        # happened, so it is given back and the retry budget stays whole.
-        self.store.refund_attempt(task.id)
-        self.store.mark_needs_attention(task.id, note)
         return DispatchOutcome(
             action=OUTCOME_NEEDS_ATTENTION,
             task_ref=task.ref,
@@ -1297,7 +1300,7 @@ class Orchestrator:
             run=result,
             attempts=task.attempts,
             notes=[
-                note,
+                detail,
                 "no model work was attempted, so no attempt was consumed; fix the "
                 "configuration (for example the pinned effort) and run `agent-dispatch retry`",
             ],
@@ -2644,25 +2647,21 @@ class Orchestrator:
 
         if not result.ok:
             detail = result.validation.summary()
-            self.store.finish_run(
-                run_row,
-                outcome=RUN_FAILED,
-                session_id=result.session_id,
-                exit_code=result.exit_code,
-                subtype=result.subtype,
-                tool_hook_blocked=result.tool_hook_blocked,
-                timed_out=result.timed_out,
-                produced_work=after.produced_work,
-                detail=detail,
-                refused=result.runtime_refused,
-            )
-            # A refused start attempted no model work (non-zero exit, zero stream
-            # records), so the review turn it was charged must be given back — the
-            # round is still parked for an explicit `review --retry-round`, but
-            # `review_round_attempts` is documented as *model turns spent* and this
-            # was not one. The implementation path does the same (Store.refund_attempt).
             if result.runtime_refused:
-                self.store.refund_round_attempt(round_row.id)
+                # The review-side counterpart of the implementation finaliser, and the
+                # same all-or-nothing rule: run row, refunded turn, parked round and
+                # task phase land together, so a crash cannot leave the round `running`
+                # with a turn it never spent.
+                self.store.finalise_refused_round(
+                    run_row,
+                    round_row.id,
+                    task.id,
+                    detail=detail,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    produced_work=after.produced_work,
+                )
                 self.log.info(
                     "review_round_attempt_refunded",
                     repo=task.repo,
@@ -2670,21 +2669,33 @@ class Orchestrator:
                     round=round_row.round,
                     detail="the runtime refused to start; no model turn was spent",
                 )
-            # A failed turn is NEVER auto-repeated. The feedback snapshot stays
-            # unacknowledged, so nothing is lost: the maintainer can fix the cause and
-            # re-add the label, and the round will carry the same feedback again.
-            self.store.park_round(
-                round_row.id,
-                state=ROUND_FAILED,
-                stage=None,
-                note=detail,
-            )
-            self.store.set_phase(
-                task.id,
-                "needs_attention",
-                f"review round {round_row.round} did not complete: {detail}. The feedback is "
-                "recorded and unacknowledged; no second model round was started.",
-            )
+            else:
+                self.store.finish_run(
+                    run_row,
+                    outcome=RUN_FAILED,
+                    session_id=result.session_id,
+                    exit_code=result.exit_code,
+                    subtype=result.subtype,
+                    tool_hook_blocked=result.tool_hook_blocked,
+                    timed_out=result.timed_out,
+                    produced_work=after.produced_work,
+                    detail=detail,
+                )
+                # A failed turn is NEVER auto-repeated. The feedback snapshot stays
+                # unacknowledged, so nothing is lost: the maintainer can fix the cause
+                # and re-add the label, and the round will carry the same feedback again.
+                self.store.park_round(
+                    round_row.id,
+                    state=ROUND_FAILED,
+                    stage=None,
+                    note=detail,
+                )
+                self.store.set_phase(
+                    task.id,
+                    "needs_attention",
+                    f"review round {round_row.round} did not complete: {detail}. The feedback is "
+                    "recorded and unacknowledged; no second model round was started.",
+                )
             if publisher is not None:
                 # Derived from the row the failure path just wrote, not asserted here:
                 # the heartbeat can legitimately have published a live state moments

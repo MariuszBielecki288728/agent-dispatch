@@ -72,6 +72,7 @@ from agent_dispatch.store import (  # noqa: E402
     ROUND_PUBLISH_PENDING,
     ROUND_PUBLISHED,
     ROUND_RELEASED,
+    ROUND_RUNNING,
     ROUND_STAGE_PR,
     ROUND_STAGE_PUSH,
     ROUND_STAGES,
@@ -4253,15 +4254,19 @@ class ReviewRuntimePinningTests(ReviewCase):
         self.assertIn(f"`{pinned.runtime_model}`", self.status_body())
         self.assertEqual(self.task_row().runtime_model, pinned.runtime_model)
 
-    def test_a_refused_review_start_refunds_the_turn_and_leaves_the_round_parked(self) -> None:
+    def test_a_refused_review_start_refunds_the_turn_and_keeps_the_pinned_identity(self) -> None:
         """Zero stream records means no model turn: `review_round_attempts` must not count it.
 
-        The feedback stays unacknowledged and the round stays parked (no automatic
-        re-drive), so the accounting matches the documented meaning of the counter:
-        *model turns this task has spent on review rounds*.
+        And the round must keep the task's **pinned** identity: a round only exists
+        because the implementation session is resumable, so that conversation was
+        created under the pinned model/effort. Adopting a changed configuration here
+        would silently redefine what "the same session" means — the reason pinning is
+        enforced at all. If the pinned value can no longer be invoked, the honest state
+        is `needs_attention`.
         """
         self.first_run()
-        session = self.task_row().session_id
+        pinned = self.task_row()
+        session = pinned.session_id
         self.hand_off()
         comment = self.add_comment("Please rename this function.")
         before = self.task_row().feedback_cursor
@@ -4293,9 +4298,10 @@ class ReviewRuntimePinningTests(ReviewCase):
             self.run_cli("review")
         self.assertEqual(self.runtime_calls(), calls, "a parked round is never auto-retried")
 
-        # Fix the configuration, then the documented explicit retry: the SAME session
-        # is resumed, with the now-fixed identity, and exactly one real turn is charged.
-        self.write_repo_runtime(model="model-b", effort="high")
+        # The operator changes the repo defaults, then uses the documented explicit
+        # retry. It must resume the SAME session on the PINNED identity — never on the
+        # new configuration — and no re-pin may be reported, because none may happen.
+        self.write_repo_runtime(model="model-b", effort="max")
         self.review_scenario(
             session_id=session,
             subtype="success",
@@ -4303,18 +4309,122 @@ class ReviewRuntimePinningTests(ReviewCase):
         )
         retried = self.run_cli("review", "--retry-round", "--repo", self.slug, "--issue", "1")
         self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-        self.assertIn("re-pinned", retried.stdout, "the re-pin must be reported")
+        self.assertNotIn("re-pinned", retried.stdout, "a review round keeps the pin")
 
         argv = self.recorded_argv()[-1]
         self.assertEqual(argv[argv.index("--session") + 1], session)
-        self.assertEqual(argv[argv.index("--model") + 1], "model-b")
-        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertEqual(
+            argv[argv.index("--model") + 1],
+            pinned.runtime_model,
+            "the retried round must invoke the identity the session was created with",
+        )
+        self.assertEqual(argv[argv.index("--effort") + 1], pinned.runtime_effort)
+        self.assertNotIn("model-b", argv)
+        self.assertNotIn("max", argv)
 
         task = self.task_row()
         self.assertEqual(task.phase, "awaiting_review", task.last_error)
+        self.assertEqual(task.runtime_model, pinned.runtime_model, "the pin is untouched")
+        self.assertEqual(task.runtime_effort, pinned.runtime_effort)
         self.assertEqual(store.review_round_attempts(task.id), 1, "exactly one real turn")
         self.assertEqual(self.rounds()[0].state, ROUND_PUBLISHED)
         self.assertIn(f"conversation:{comment}", parse_cursor(task.feedback_cursor or "{}"))
+
+    def test_the_refused_round_finalisation_is_one_transaction(self) -> None:
+        # Blocker 2, review side: the run row, the refunded turn, the parked round and
+        # the task phase land together. Split writes used to leave the round `running`
+        # with a charged turn, which `reconcile_review_rounds` reports as an interrupted
+        # *paid* turn.
+        self.first_run()
+        store = self.store()
+        task = self.task_row()
+        cursor = self.claimed_cursor()
+        claimed = store.claim_review_round(
+            task.id,
+            pr_number=PR_NUMBER,
+            branch=task.branch,
+            worktree_path=task.worktree_path,
+            session_id=task.session_id,
+            cursor_json=cursor,
+            snapshot_json=cursor,
+        )
+        store.start_review_round(claimed.id, session_id=task.session_id)
+        run_row = store.start_run(
+            task.id,
+            run_id="20260929T000000000000-review-refused1",
+            kind="review",
+            resumed_from=task.session_id,
+            log_path=str(self.tmp / "refused.ndjson"),
+            consumes_attempt=False,
+        )
+        self.assertEqual(store.review_round_attempts(task.id), 1, "the round charged one turn")
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            store.finalise_refused_round(
+                run_row,
+                claimed.id,
+                task.id,
+                detail="the runtime refused to start",
+                session_id=None,
+                exit_code=1,
+                subtype=None,
+                produced_work=None,
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+
+        begins = [s for s in statements if s.strip().upper().startswith("BEGIN")]
+        commits = [s for s in statements if s.strip().upper().startswith("COMMIT")]
+        self.assertEqual(len(begins), 1, f"one transaction expected: {statements}")
+        self.assertEqual(len(commits), 1, f"one commit expected: {statements}")
+
+        fresh = store.get_task(self.slug, 1)
+        self.assertEqual(fresh.phase, "needs_attention")
+        self.assertEqual(store.review_round_attempts(task.id), 0, "the turn is refunded")
+        self.assertEqual(store.review_round(task.id, claimed.round).state, ROUND_FAILED)
+        self.assertTrue(store.last_run_refused(task.id))
+
+        # A failure inside it leaves nothing half-written.
+        second_run = store.start_run(
+            task.id,
+            run_id="20260929T000000000001-review-refused2",
+            kind="review",
+            resumed_from=task.session_id,
+            log_path=str(self.tmp / "refused2.ndjson"),
+            consumes_attempt=False,
+        )
+        store.start_review_round(claimed.id, session_id=task.session_id)
+        store._conn.executescript(
+            "CREATE TRIGGER fail_refused_round BEFORE UPDATE ON tasks "
+            "WHEN NEW.phase = 'needs_attention' "
+            "BEGIN SELECT RAISE(ABORT, 'injected failure mid-refusal'); END;"
+        )
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                store.finalise_refused_round(
+                    second_run,
+                    claimed.id,
+                    task.id,
+                    detail="boom",
+                    session_id=None,
+                    exit_code=1,
+                    subtype=None,
+                    produced_work=None,
+                )
+        finally:
+            store._conn.executescript("DROP TRIGGER fail_refused_round")
+
+        self.assertEqual(
+            store.review_round(task.id, claimed.round).state,
+            ROUND_RUNNING,
+            "the round must not be parked by a rolled-back transaction",
+        )
+        self.assertEqual(
+            store.review_round_attempts(task.id), 1, "and its turn must not be refunded"
+        )
+        self.assertFalse(store.last_run_refused(task.id))
 
 
 class PinnedSessionTests(ReviewCase):
