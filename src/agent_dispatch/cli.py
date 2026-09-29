@@ -1,6 +1,6 @@
 """Command-line interface.
 
-Operator surface for Issues #3–#4:
+Operator surface for Issues #3–#6 (plus #17):
 
 | Command | Purpose |
 |---|---|
@@ -414,8 +414,8 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print()
         print("  own#N = a PR this worker created; obs#N = a PR that merely references the Issue.")
         print(
-            "  In this release an eligible task is executed, pushed and opened as one PR; "
-            "the review loop is Issue #5."
+            "  An eligible task is executed, pushed and opened as one PR; a review round "
+            "starts only from an explicit `agent:fix` handoff on that PR."
         )
         print(
             "  Each claimed task has ONE status comment on its Issue, edited in place while it "
@@ -675,6 +675,7 @@ def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
         print(f"  branch         : {task.branch or '-'}")
         print(f"  worktree       : {task.worktree_path or '-'}")
         print(f"  base           : {task.base_branch or '-'}")
+        print(f"  issue          : https://github.com/{task.repo}/issues/{task.issue_number}")
         print(
             "  owned PR       : "
             + (f"#{task.pr_number} {task.pr_url or ''}" if task.pr_number else "-")

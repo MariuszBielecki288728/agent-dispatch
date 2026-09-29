@@ -26,6 +26,9 @@ Coverage maps to the Issue #4 acceptance list:
 * duplicate polls, restarts and crash windows neither duplicate work nor adopt a
   foreign PR;
 * the credential ordering is verifiable in the environment the agent inherits;
+* two allowlisted repositories (Issue #6): identical Issue numbers and titles do
+  not collide in rows, branches, worktrees, run logs or PRs, and only one task
+  runs at a time across both;
 * ``status`` stays read-only and no run log is ever written inside the worktree.
 """
 
@@ -66,6 +69,7 @@ from agent_dispatch.runtime import (  # noqa: E402
 from agent_dispatch.store import Store  # noqa: E402
 from test_offline import (  # noqa: E402
     FAKE_WRAPPER,
+    HANDOFF,
     TRIGGER,
     BaseCase,
     issue,
@@ -94,16 +98,26 @@ class ExecutionCase(BaseCase):
     # ------------------------------------------------------------------ setup
 
     def _make_source_clone(self) -> None:
+        """The default source clone, exposed as ``self.source``/``self.remote``."""
+        self.source, self.remote = self._create_source_clone("source-clone")
+        # The previous test's config pointed at a different checkout; point it here.
+        self.world.repo_path = self.source
+
+    def _create_source_clone(self, name: str) -> tuple[Path, Path]:
         """A real, bare-ish source clone with a commit on ``main``.
 
         A genuine repository is required: the worktree tests assert on real
         ``git worktree add``/``status``/``log`` output, and the credential test
         asserts the environment a real Git child would inherit.
+
+        Returns ``(clone_path, bare_remote_path)``. ``name`` keeps a multi-repo
+        test from sharing one checkout, which is the collision it exists to rule
+        out (Issue #6).
         """
         import subprocess
 
-        self.source = self.tmp / "source-clone"
-        self.source.mkdir()
+        clone = self.tmp / name
+        clone.mkdir()
         env = {
             **os.environ,
             "GIT_AUTHOR_NAME": "T",
@@ -114,7 +128,7 @@ class ExecutionCase(BaseCase):
 
         def git(*args: str) -> None:
             subprocess.run(
-                ["git", "-C", str(self.source), *args],
+                ["git", "-C", str(clone), *args],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -122,24 +136,23 @@ class ExecutionCase(BaseCase):
             )
 
         git("init", "-q", "-b", "main")
-        (self.source / "README.md").write_text("# fixture\n", encoding="utf-8")
+        (clone / "README.md").write_text("# fixture\n", encoding="utf-8")
         git("add", "-A")
         git("commit", "-q", "-m", "initial")
         # `origin` points at the clone itself so fetch/push/ls-remote succeed
         # offline against a real Git remote rather than a mocked one.
-        self.remote = self.tmp / "remote.git"
+        remote = self.tmp / f"{name}-remote.git"
         subprocess.run(
-            ["git", "init", "-q", "--bare", str(self.remote)],
+            ["git", "init", "-q", "--bare", str(remote)],
             check=True,
             capture_output=True,
             text=True,
             env=env,
         )
-        git("remote", "add", "origin", str(self.remote))
+        git("remote", "add", "origin", str(remote))
         git("push", "-q", "-u", "origin", "main")
         git("fetch", "-q", "origin")
-        # The previous test's config pointed at a different checkout; point it here.
-        self.world.repo_path = self.source
+        return clone, remote
 
     def execution_overrides(self, **extra: object) -> dict[str, object]:
         overrides: dict[str, object] = {
@@ -1628,6 +1641,226 @@ class ConcurrencyTests(ExecutionCase):
         self.assertEqual(len(self.recorded_argv()), 1, "exactly one agent run happened")
 
 
+class MultiRepoExecutionTests(ExecutionCase):
+    """ "Two allowlisted repositories, one active task" — Issue #6's acceptance case.
+
+    Both repositories carry an Issue with the **same number and the same title**, so
+    even the derived branch name is identical. Nothing may be shared between them:
+    task rows are keyed by ``(repo, issue_number)``, and branches, worktrees, run
+    logs and PRs all have to stay with their own repository. Each repository gets
+    its own source clone and bare remote here, because one shared clone would hide
+    exactly the collision this class exists to rule out.
+    """
+
+    TITLE = "Same title"
+    SECOND_SLUG = "example/other"
+
+    def setUp(self) -> None:
+        super().setUp()
+        world = self.world.read_world()
+        world["repos"][self.SECOND_SLUG] = {
+            "labels": [TRIGGER, HANDOFF],
+            "issues": [],
+            "pulls": [],
+            "accessible": True,
+        }
+        self.world.world = world
+        self.world.write_world()
+        self.second_source, self.second_remote = self._create_source_clone("source-clone-other")
+        # Each repo points at its own clone; the default block would point both at
+        # `self.source`, which is the sharing this test must not rely on.
+        self.world.write_config(
+            worker_overrides=self.execution_overrides(),
+            repos_block=self._two_repo_block(),
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _two_repo_block(self) -> str:
+        blocks = []
+        for slug, path in ((self.slug, self.source), (self.SECOND_SLUG, self.second_source)):
+            blocks.append(
+                f"""
+[repos."{slug}"]
+path = "{path}"
+base_branch = "main"
+agents_file = "AGENTS.md"
+
+[repos."{slug}".runtime]
+driver = "commandcode"
+model = "deepseek/deepseek-v4-flash"
+effort = "medium"
+permission_mode = "allow-all"
+permission_flag = "--yolo"
+max_turns = 40
+"""
+            )
+        return "\n".join(blocks)
+
+    def set_other_issues(self, *issues: dict) -> None:
+        # Same read-modify-write as BaseCase.set_issues, and for the same reason:
+        # the fake wrapper rewrites the world file as it serves requests.
+        world = self.world.read_world()
+        world["repos"][self.SECOND_SLUG]["issues"] = list(issues)
+        self.world.world = world
+        self.world.write_world()
+
+    def open_store(self):
+        from agent_dispatch.store import Store
+
+        store = Store(self.world.load_config().worker.state_db)
+        self.addCleanup(store.close)
+        return store
+
+    def remote_branches(self, remote: Path) -> list[str]:
+        import subprocess
+
+        return subprocess.run(
+            ["git", "-C", str(remote), "branch", "--list", "--format=%(refname:short)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+
+    def tree_files(self, remote: Path, branch: str) -> set[str]:
+        import subprocess
+
+        listing = subprocess.run(
+            ["git", "-C", str(remote), "ls-tree", "--name-only", "-r", branch],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return set(listing.split())
+
+    # ------------------------------------------------------------------- tests
+
+    def test_two_allowlisted_repos_queue_independent_tasks(self) -> None:
+        # Identical Issue numbers in two repositories: one row per (repo, Issue).
+        self.set_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        self.set_other_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+
+        worker, store, _ = self.worker()
+        outcome = worker.poll_once()
+        self.assertTrue(outcome.ok, outcome.error)
+
+        first = store.get_task(self.slug, 1)
+        second = store.get_task(self.SECOND_SLUG, 1)
+        self.assertIsNotNone(first, "the first repo's Issue must have its own row")
+        self.assertIsNotNone(
+            second, "the same Issue number in another repository is a different task"
+        )
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(len(store.list_tasks()), 2, "one row per (repo, issue), not per number")
+        self.assertEqual(
+            {repo.slug for repo in outcome.result.repos}, {self.slug, self.SECOND_SLUG}
+        )
+        # Discovery queues; it never starts anything.
+        self.assertEqual(store.active_task_count(), 0)
+
+    def test_the_two_repos_run_one_at_a_time_with_fully_separate_artifacts(self) -> None:
+        self.set_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        self.set_other_issues(issue(1, self.TITLE, labels=[TRIGGER]))
+        # One scripted run per task, each distinguishable in its remote branch.
+        self.write_scenario(
+            runs=[
+                {
+                    "session_id": "sess-one",
+                    "subtype": "success",
+                    "edits": {"one.txt": "one\n"},
+                },
+                {
+                    "session_id": "sess-two",
+                    "subtype": "success",
+                    "edits": {"two.txt": "two\n"},
+                },
+            ]
+        )
+
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        after_first = self.open_store()
+        self.assertEqual(
+            sorted(task.phase for task in after_first.list_tasks()),
+            ["awaiting_review", "queued"],
+            "one task runs and the other waits its turn — one active task globally",
+        )
+        self.assertEqual(len(self.recorded_argv()), 1, "exactly one agent run so far")
+
+        self.assertEqual(self.run_cli("run").returncode, 0)
+        self.assertEqual(len(self.recorded_argv()), 2, "the queued repo runs on the next pass")
+
+        store = self.open_store()
+        tasks = {slug: store.get_task(slug, 1) for slug in (self.slug, self.SECOND_SLUG)}
+        world = self.world.read_world()
+        for slug, task in tasks.items():
+            self.assertEqual(task.phase, "awaiting_review")
+            pulls = world["repos"][slug]["pulls"]
+            self.assertEqual(len(pulls), 1, f"{slug} must end with exactly one PR")
+            self.assertEqual(pulls[0]["number"], task.pr_number)
+            self.assertEqual(pulls[0]["head"]["ref"], task.branch)
+
+        first, second = tasks[self.slug], tasks[self.SECOND_SLUG]
+        # The collision pressure is real: same Issue number and even the same branch
+        # name, yet every artifact belongs to exactly one repository.
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(first.branch, second.branch, "both repos derive the identical branch name")
+        self.assertNotEqual(first.worktree_path, second.worktree_path)
+        self.assertIn("example__repo", first.worktree_path)
+        self.assertIn("example__other", second.worktree_path)
+        # PR numbers are per-repository, so both being #1 is fine; what would collide
+        # is a PR recorded under the wrong repo, which the per-repo checks above rule
+        # out (`world["repos"][slug]["pulls"]` holds exactly the task's own PR).
+        self.assertEqual(
+            {first.session_id, second.session_id},
+            {"sess-one", "sess-two"},
+            "each task pins the session its own run reported",
+        )
+
+        # Each worktree is a worktree of its own clone, pushes to its own remote,
+        # and holds no orchestrator artifact.
+        for slug, task, remote in (
+            (self.slug, first, self.remote),
+            (self.SECOND_SLUG, second, self.second_remote),
+        ):
+            import subprocess
+
+            origin = subprocess.run(
+                ["git", "-C", task.worktree_path, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            self.assertEqual(origin, str(remote), f"{slug}'s worktree belongs to its own clone")
+            self.assertIn(task.branch, self.remote_branches(remote))
+            self.assert_worktree_clean_of_orchestrator_files(Path(task.worktree_path))
+
+        # The two runs produced different work under the identical branch name in
+        # different repositories: no cross-repo contamination.
+        produced = {"one.txt", "two.txt"}
+        first_work = self.tree_files(self.remote, first.branch) & produced
+        second_work = self.tree_files(self.second_remote, second.branch) & produced
+        self.assertEqual(len(first_work), 1, f"unexpected work in {self.slug}: {first_work}")
+        self.assertEqual(
+            len(second_work), 1, f"unexpected work in {self.SECOND_SLUG}: {second_work}"
+        )
+        self.assertNotEqual(first_work, second_work, "each repo's branch carries its own work")
+
+        # Run logs are per-repo and each run log carries its own task's session.
+        logs: dict[str, set[Path]] = {}
+        for slug, task in tasks.items():
+            runs = store.run_history(task.id)
+            self.assertEqual(len(runs), 1)
+            paths = {Path(run.log_path) for run in runs if run.log_path}
+            self.assertEqual(len(paths), 1)
+            log_path = paths.pop()
+            self.assertTrue(log_path.is_file())
+            self.assertIn(task.session_id, log_path.read_text(encoding="utf-8"))
+            logs[slug] = {log_path}
+        self.assertFalse(
+            logs[self.slug] & logs[self.SECOND_SLUG], "run logs must never be shared across repos"
+        )
+
+
 class StatusReadOnlyTests(ExecutionCase):
     def test_status_and_open_never_start_an_agent(self) -> None:
         self.set_issues(issue(1, "Observe only", labels=[TRIGGER]))
@@ -1649,6 +1882,7 @@ class StatusReadOnlyTests(ExecutionCase):
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertIn("phase          : awaiting_review", opened.stdout)
         self.assertIn("dispatch/issue-1-inspect-me", opened.stdout)
+        self.assertIn(f"https://github.com/{self.slug}/issues/1", opened.stdout)
         self.assertIn("commandcode --session", opened.stdout)
 
     def test_open_is_read_only(self) -> None:

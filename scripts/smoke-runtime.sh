@@ -5,6 +5,8 @@
 # Smoke verification suite for agent-dispatch:
 # - Deterministic mock suite and negative failure-injection tests (default / CI).
 # - Opt-in live VM provider verification (--live / SMOKE_LIVE=1).
+# - Live false-success guard: a real blocked-tool stream must fail the production
+#   validator (Issue #6), imported from src/ rather than re-implemented here.
 # - Strict assertions: structural JSON parsing, turn continuity, bounded timeouts.
 # - Sanitized reporting: no credentials, tokens, or raw unfiltered outputs dumped.
 # - Safe parsing: zero code interpolation of untrusted model outputs into Python.
@@ -84,6 +86,11 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
     log_fail "interpreter not found: $PYTHON"
     exit 1
 fi
+
+# Repository root (this script lives in scripts/). The live guard check imports the
+# service's own predicate and validator from src/, so this suite verifies the
+# production rule instead of keeping a second copy of it that could drift.
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ==============================================================================
 # Shared Turn Validator & Data Parser
@@ -536,6 +543,131 @@ run_live_suite() {
         fi
     else
         record_result "commandcode_systemd_run" "SKIP" "Command Code binary missing"
+    fi
+
+    # 7. The false-success guard, against a REAL blocked stream (Issue #6)
+    #
+    # A run whose tool calls were refused still reports subtype=success with exit 0;
+    # the only reliable signal is the tool_hook_blocked event. This step produces that
+    # stream with the real CLI (deliberately WITHOUT --yolo) in a throwaway scratch
+    # directory, then feeds the observed facts through the service's own predicate and
+    # validator. It fails if the probe stops reproducing the hazard OR if the guard
+    # stops failing the stream - both are required for the release claim to be true.
+    log_info "Step 7: Testing the blocked-tool false-success guard on a real stream..."
+    if [[ -x "$cmdcode_bin" ]]; then
+        local blocked_dir="$SCRATCH_DIR/blocked-probe"
+        mkdir -p "$blocked_dir"
+        local blocked_log="$SCRATCH_DIR/cmdcode_blocked.jsonl"
+        local blocked_code=0
+        (
+            cd "$blocked_dir" &&
+                timeout 60s "$cmdcode_bin" -p "Use the write_file tool to create a file named smoke_blocked_probe.txt containing the text BLOCKED_OK, then reply DONE." \
+                    --output-format json
+        ) > "$blocked_log" 2>/dev/null || blocked_code=$?
+
+        local guard
+        if guard="$(PYTHONPATH="$REPO_ROOT/src" "$PYTHON" - "$blocked_log" "$blocked_code" << 'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+from agent_dispatch.runtime import (
+    RunResult,
+    RunValidation,
+    is_tool_hook_blocked,
+    parse_ndjson_line,
+    validate_run,
+)
+
+try:
+    log_path = Path(sys.argv[1])
+    exit_code = int(sys.argv[2])
+
+except Exception as exc:  # pragma: no cover - defensive one-line reporting
+    print(f"guard check could not start: {type(exc).__name__}: {exc}")
+    sys.exit(1)
+
+session_id = None
+subtype = None
+stop_reason = None
+final_text = ""
+blocked_events = 0
+events_seen = 0
+result_lines = 0
+
+try:
+    if log_path.is_file():
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                event = parse_ndjson_line(line)
+                if event is None:
+                    continue
+                events_seen += 1
+                sid = event.get("sessionId") or event.get("session_id")
+                if isinstance(sid, str) and sid and session_id is None:
+                    session_id = sid
+                if is_tool_hook_blocked(event):
+                    blocked_events += 1
+                if event.get("type") == "result":
+                    result_lines += 1
+                    if isinstance(event.get("subtype"), str):
+                        subtype = event["subtype"]
+                    if isinstance(event.get("stopReason"), str):
+                        stop_reason = event["stopReason"]
+                    if isinstance(event.get("finalText"), str):
+                        final_text = event["finalText"]
+except Exception as exc:  # pragma: no cover - defensive one-line reporting
+    print(f"guard check could not read the stream: {type(exc).__name__}: {exc}")
+    sys.exit(1)
+
+# The observed facts are fed through the production validator, exactly as the
+# driver would after a run; nothing here re-implements the rule.
+result = RunResult(
+    run_id="smoke-live-blocked",
+    session_id=session_id,
+    exit_code=exit_code,
+    subtype=subtype,
+    stop_reason=stop_reason,
+    final_text=final_text or "",
+    usage=None,
+    duration_ms=None,
+    tool_hook_blocked=blocked_events > 0,
+    resumed_from=None,
+    log_path=log_path,
+    validation=RunValidation(ok=True),
+    started_at="",
+    finished_at="",
+    events_seen=events_seen,
+    result_lines=result_lines,
+)
+validation = validate_run(result, expected_session=None)
+guard_failed = validation.checks.get("no_blocked_tool_events") is False
+ok = blocked_events > 0 and guard_failed and not validation.ok
+
+trap = f"exit={exit_code} subtype={subtype!r}"
+if ok:
+    reason = (
+        f"real blocked stream ({blocked_events} tool_hook_blocked event(s); {trap}) is "
+        "rejected by the production validator"
+    )
+else:
+    reason = (
+        f"no tool_hook_blocked event observed ({trap}; {result_lines} result line(s)); "
+        "the live probe did not reproduce the false-success shape"
+        if blocked_events == 0
+        else f"production validator did not fail the blocked stream: {validation.summary()}"
+    )
+
+print(reason)
+sys.exit(0 if ok else 1)
+PYEOF
+        )"; then
+            record_result "live_blocked_tool_guard" "PASS" "${guard}"
+        else
+            record_result "live_blocked_tool_guard" "FAIL" "${guard}"
+        fi
+    else
+        record_result "live_blocked_tool_guard" "SKIP" "Command Code binary missing"
     fi
 
     # Optional alternatives recorded as SKIP unless explicitly requested
