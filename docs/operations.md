@@ -703,16 +703,25 @@ Fix the configuration (the pinned `effort` is the usual culprit — check the ru
 emitted even one record has started, so a later failure keeps its normal meaning and
 its normal cost against `worker.max_attempts`.
 
-**A refused start is also the one case that may re-pin a task's runtime identity.**
-An existing task keeps the model/effort it started with — a retry and a review resume
-invoke the pinned identity, and the row and status comment keep naming it, even if the
-repository's defaults changed since (§17). A refused start is the documented
-exception, because no model turn happened and there is no started conversation whose
-identity must be preserved: the explicit operator recovery commands
-(`agent-dispatch retry`, `review --retry-round`) adopt the current configuration and
-report the change (`runtime_identity_repinned`). Dispatch never re-pins on its own,
-and the refusal reads the *newest recorded run*, so a task whose run actually started
-keeps its pin.
+**A refused start is also the one case that may re-pin a task's runtime identity — and
+only for a task that has never started a model turn at all.** An existing task keeps
+the model/effort it started with: a retry and a review resume invoke the pinned
+identity, and the row and status comment keep naming it, even if the repository's
+defaults changed since (§17). The exception exists because a refusal attempted no
+model work, so there is no conversation whose identity must be preserved — but being
+refused is **not** proof that no conversation exists, so `agent-dispatch retry` adopts
+the current configuration only when the task has no session, no run that actually
+started, and no review round (`Store.may_repin_identity`). The re-pin and the re-queue
+are one SQL statement, so a live worker can never claim the task in between and invoke
+the identity the operator just replaced, and the change is logged and printed
+(`runtime_identity_repinned`) rather than silent.
+
+**`review --retry-round` never re-pins.** A review round exists only because the task
+has a clean resumable session, and that conversation was created under the pinned
+model/effort; resuming it with a different model would silently redefine what "the same
+session" means. If a runtime upgrade makes the pinned value impossible to invoke, the
+honest state is `Needs attention` until the compatible runtime or settings are restored
+— never a silent migration of an existing conversation.
 
 The same classification covers a **review round**: a refused start parks the round
 (`failed`, feedback unacknowledged, reason recorded) and returns the task to
@@ -720,7 +729,10 @@ The same classification covers a **review round**: a refused start parks the rou
 configuration is fixed — no round is silently consumed and no second round is minted.
 The refused turn's attempt is **refunded** as well (`review_round_attempts` counts
 *model turns spent*, and a refused start spent none), so the retried round records
-exactly one real turn.
+exactly one real turn. The run row, the refund and the park are written in **one
+transaction** on both paths (`finalise_refused_start` / `finalise_refused_round`), so a
+crash cannot leave a task or round `running` with a charged attempt that the reconcile
+passes would then read as an interrupted, paid-for run.
 
 ---
 
@@ -1153,9 +1165,10 @@ a mock. The cases most worth knowing about:
 |---|---|
 | `BlockedRunTests` | a `tool_hook_blocked` stream with `subtype=success` and exit 0 **fails** the task and opens no PR |
 | `RuntimeRefusalTests` | the #6 pilot's real failure: a CLI that exits non-zero with **no** stream is reported from its own stderr, parks as `needs_attention`, and refunds the attempt — and fixing the configuration then retrying completes the same task |
-| `RuntimePinningTests` | an existing task keeps the pinned model/effort on a retry even after the repo defaults changed (asserted on the recorded argv), while the **turn cap** follows the current config; a retry after a *refused* start adopts the fixed configuration and reports it |
+| `RuntimePinningTests` | an existing task keeps the pinned model/effort on a retry even after the repo defaults changed (asserted on the recorded argv), while the **turn cap** follows the current config; a retry after a *refused* start adopts the fixed configuration and reports it — and a task that already started can never re-pin, even when its newest run was refused |
 | `PinnedIdentityTests` (`test_status_comment`) | the status comment — on every live write, not just the final one — names the pinned model when the config changed after discovery, and the argv agrees with it |
-| `ReviewRuntimePinningTests` | a review round resumes the pinned identity after a repo-default change, and a *refused* review start charges no review turn, stays unacknowledged and parked, and `review --retry-round` then resumes the same session with the fixed identity and charges exactly one real turn |
+| `ReviewRuntimePinningTests` | a review round resumes the pinned identity after a repo-default change, and a *refused* review start charges no review turn, stays unacknowledged and parked, and `review --retry-round` then resumes the same session **on the pinned identity** and charges exactly one real turn; the refused-review finalisation is asserted to be one transaction, and a failure inside it leaves nothing half-written |
+| `RuntimeRefusalTests.test_the_refused_start_finalisation_is_one_transaction` | the implementation refused-start finaliser writes the run row, the refund and the park in one transaction, and rolls back as a unit |
 | `TimeoutTests` | a hung run is killed at the deadline, recorded as a timeout, and leaves no live process |
 | `RetryTests` | an interrupted run's edits are preserved and the retry starts a **fresh** session |
 | `IdempotencyTests` | restart adopts the existing PR/branch instead of duplicating work |
@@ -1654,11 +1667,12 @@ some flags are **model dependent**. The real case: the pinned
 
 The dispatcher reports that honestly and safely: the task's message quotes the
 runtime's stderr, the task parks as `Needs attention`, and **no attempt is consumed**
-because no model work happened (§9). Fix the pinned value and `retry`: because a
-refused start never reached the model, that explicit command adopts the fixed
-configuration for the task (and reports the re-pin) — an existing task otherwise keeps
-the model/effort it started with. To avoid the surprise, after upgrading the runtime
-check `commandcode --help` and the model's own `/effort` list, and run
+because no model work happened (§9). Fix the pinned value and `retry`: when the task
+has never started a model turn, that explicit command adopts the fixed configuration for
+the task (in the same statement that re-queues it) and reports the re-pin — an existing
+task otherwise keeps the model/effort it started with, and a **review round always
+keeps it**. To avoid the surprise, after upgrading the runtime check
+`commandcode --help` and the model's own `/effort` list, and run
 `agent-dispatch doctor`.
 
 ### Wrapper write permission is a prerequisite, and it fails visibly
@@ -1776,7 +1790,7 @@ rests on; the dated evidence lives in the pull request that closed Issue #6.
 | Runtime refused to start (the pilot's real bug) | after the runtime auto-updated to v1.64.1 the pinned `effort` became invalid; the run exited 1 with an empty stream. The task parked as `Needs attention` quoting `Unknown effort "medium". Supported: high, max.` and **consumed no attempt**; fixing the value and `retry` completed the task on its first real run (attempt 1 of 3, PR #5) |
 | `tool_hook_blocked` guard | `smoke-runtime.sh --live` produced a real blocked stream (`exit=0`, `subtype=success`) and the production validator rejected it |
 
-**Automated offline:** 422 tests (`test-offline.sh`), `ruff check` /
+**Automated offline:** 425 tests (`test-offline.sh`), `ruff check` /
 `ruff format --check` / pre-commit hooks, and `smoke-runtime.sh --mock` — all green;
 the runner needs no network, no model credits and no GitHub mutation.
 
@@ -1785,9 +1799,16 @@ contract was not actually enforced (every claim re-pinned from the current repo
 config, so a retry or a review resume could invoke a different model than the row and
 status comment advertised) and that a refused *review* start still charged a review
 turn. Both are fixed, with argv-level regressions: the task's recorded identity is now
-the effective identity for every invocation, `retry` / `review --retry-round` are the
-only commands that may re-pin (and only after a recorded refusal, and they report it),
-and a refused review start refunds its turn.
+the effective identity for every invocation; `retry` may re-pin **only** a task that
+has never started a model turn, in the same statement that re-queues it, and reports
+it; and a refused review start refunds its turn.
+
+**Round-2 review.** Narrowed that further and made it crash-safe: `review
+--retry-round` never re-pins (its session was created under the pin, so resuming it on
+another model would redefine "the same session"), `retry` refuses to re-pin a task with
+any started run even when the newest run was refused, and the refused-start
+finalisation — run row, refund and park — is one transaction on both the implementation
+and review paths.
 
 **Not live-tested (offline coverage only):** an interrupted run's fresh-session retry
 and preserved edits, push/PR API timeouts, a foreign PR, and a closed or merged PR.

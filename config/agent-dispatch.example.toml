@@ -204,9 +204,11 @@ driver = "commandcode"
 # and a review resume both invoke the model/effort the task started with, and the
 # row/status comment keep naming it.
 #
-# The one exception is a *refused start* (the runtime exits non-zero without emitting
-# a single stream record): no model turn happened, so `agent-dispatch retry` and
-# `review --retry-round` adopt the current configuration and report that they did.
+# The one exception is a *first-start* refusal: the runtime exits non-zero without
+# emitting a single stream record and the task had never started a model turn, so
+# `agent-dispatch retry` adopts the current configuration (in the same statement that
+# re-queues the task) and reports that it did. A review round always keeps its pin,
+# because its session was created under it.
 # Applied to every invocation, including each resume.
 # Verified available on this VM (v1.64.0: 80 models listed).
 model = "deepseek/deepseek-v4-flash"

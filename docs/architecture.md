@@ -520,6 +520,13 @@ keeps its normal meaning and its normal cost. A refused review round is treated 
 same way: the round is parked for an explicit `review --retry-round`, and its review
 attempt is refunded so `review_round_attempts` keeps meaning *model turns spent*.
 
+All three facts land in **one transaction** (`Store.finalise_refused_start` /
+`finalise_refused_round`), because they are only true together: written separately, a
+crash in between left the task `running` (or the round `running`) with a charged
+attempt while the newest run already said the invocation never started — which the
+reconcile passes cannot distinguish from a genuinely interrupted, paid-for run, and
+would therefore requeue or park as the wrong thing.
+
 ### Runtime identity is pinned per task, and only a refusal may re-pin it
 
 `tasks.runtime_{driver,model,effort}`/`permission_mode` are recorded when the row is
@@ -530,15 +537,25 @@ status comment and the journal all name that identity. Otherwise a config change
 would silently move an existing session to a different model while the comment
 claimed the old one — and the provider's cost would disagree with the UI.
 
-Two operator commands are the single, deliberately narrow exception: `retry` and
-`review --retry-round`, and only when the **newest recorded run refused to start**
-(`runs.refused`). A refusal attempted no model work, so there is no conversation whose
-identity must be preserved, and the usual reason an operator runs either command is
-that they just fixed the configuration. The re-pin is recorded and reported
-(`runtime_identity_repinned`), never silent. `permission_flag` and `max_turns` stay
-operational configuration rather than part of the pin: the pin answers "which
-model/effort produced this conversation", while the flag and cap describe how the
-current build invokes any model at all.
+Two operator commands are the single, deliberately narrow exception, and only for a
+**first-start** refusal: `retry` may adopt the current configuration when the task has
+never started a model turn at all — no session, no run that actually started, no
+review round (`Store.may_repin_identity`). The reason is that a refusal attempted no
+model work, so there is no conversation whose identity must be preserved, and the
+usual reason an operator runs `retry` is that they just fixed the configuration. The
+re-pin and the re-queue are one SQL statement, so a live worker cannot claim the task
+in between and invoke the old pin, and the change is recorded and reported
+(`runtime_identity_repinned`), never silent.
+
+It is explicitly **not** available to `review --retry-round`. A review round only
+exists because the task has a clean resumable session, and that conversation was
+created under the pinned model/effort; resuming it with a different model would
+silently redefine what "the same session" means. If a runtime upgrade makes the pinned
+value impossible to invoke, the honest state is `needs_attention` until the compatible
+runtime or settings are restored — never a silent migration of an existing
+conversation. `permission_flag` and `max_turns` stay operational configuration rather
+than part of the pin: the pin answers "which model/effort produced this conversation",
+while the flag and cap describe how the current build invokes any model at all.
 
 ### Retry semantics after an interrupted run
 
