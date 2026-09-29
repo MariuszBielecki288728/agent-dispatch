@@ -516,7 +516,29 @@ orchestrator parks the task as `needs_attention`, and the claim's attempt is
 **refunded** — no model work was attempted and nothing was paid for, so charging the
 bounded-retry budget would park a healthy task for a configuration fault. Any stream
 record at all makes the classification impossible, so a run that actually started
-keeps its normal meaning and its normal cost.
+keeps its normal meaning and its normal cost. A refused review round is treated the
+same way: the round is parked for an explicit `review --retry-round`, and its review
+attempt is refunded so `review_round_attempts` keeps meaning *model turns spent*.
+
+### Runtime identity is pinned per task, and only a refusal may re-pin it
+
+`tasks.runtime_{driver,model,effort}`/`permission_mode` are recorded when the row is
+created — repo configuration supplies the defaults for a **new** task — and every
+subsequent invocation uses the row, not the current config: an ordinary retry and a
+review resume both invoke the model/effort the task started with, and the row, the
+status comment and the journal all name that identity. Otherwise a config change
+would silently move an existing session to a different model while the comment
+claimed the old one — and the provider's cost would disagree with the UI.
+
+Two operator commands are the single, deliberately narrow exception: `retry` and
+`review --retry-round`, and only when the **newest recorded run refused to start**
+(`runs.refused`). A refusal attempted no model work, so there is no conversation whose
+identity must be preserved, and the usual reason an operator runs either command is
+that they just fixed the configuration. The re-pin is recorded and reported
+(`runtime_identity_repinned`), never silent. `permission_flag` and `max_turns` stay
+operational configuration rather than part of the pin: the pin answers "which
+model/effort produced this conversation", while the flag and cap describe how the
+current build invokes any model at all.
 
 ### Retry semantics after an interrupted run
 
