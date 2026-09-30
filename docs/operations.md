@@ -602,11 +602,12 @@ deletes only `*.ndjson`.
 
 If that file **cannot be written**, the dispatch is refused before the runtime starts:
 no run row, no attempt consumed, the task stays `queued`, and the reason is printed by
-`status` and `open` (from `tasks.last_error`). Nothing needs to be reset by hand — the
-next poll retries once the state directory is writable again. This is deliberate: an
-unwritable state directory is a configuration fault (the same class as a missing runtime
-binary), not a task failure, so it must not burn an attempt or strand the task behind an
-operator command.
+`status` and `open` — from `tasks.dispatch_fault`, which is kept separate from
+`last_error` so a refusal can never be mistaken for a failed attempt or erase the newest
+run's outcome. Nothing needs to be reset by hand — the next poll retries once the state
+directory is writable again. This is deliberate: an unwritable state directory is a
+configuration fault (the same class as a missing runtime binary), not a task failure, so
+it must not burn an attempt or strand the task behind an operator command.
 
 `--log-format json` emits one JSON object per line for journald/CI capture.
 

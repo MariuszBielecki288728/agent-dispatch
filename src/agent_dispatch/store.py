@@ -79,12 +79,12 @@ RECOVERY_INTERRUPTED = "interrupted"
 INTERRUPTED_RUN_MARKER = "interrupted: the worker process ended while this run was in flight"
 
 #: Detail prefix of a **pre-claim dispatch refusal** (#22): the dispatcher could not
-#: assemble a whole instruction, so it never started a run at all. A stable prefix
-#: rather than free prose because :meth:`Store.clear_dispatch_fault` matches on it,
-#: and that match is what keeps the clear from ever discarding a recorded *run*
-#: failure instead. Clearing matters because `tasks.last_error` is fed back into the
-#: next instruction as "the previous attempt was rejected because ...": a fault that
-#: started no attempt must not be presented to the model as one.
+#: assemble a whole instruction, so it never started a run at all. Kept as a stable
+#: lead-in rather than free prose so a journal line, a `status` line and a test can all
+#: name the same thing. It is recorded in its own column (``tasks.dispatch_fault``),
+#: never in ``last_error``: a refusal must be visible while it persists *and* must not
+#: erase the newest run's outcome, which the next instruction receives as
+#: "the previous attempt was rejected because ...".
 DISPATCH_FAULT_PREFIX = "refused dispatch:"
 
 #: Stages whose preserved local work is finished work and may be published without a
@@ -271,6 +271,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- bookkeeping
   attempts          INTEGER NOT NULL DEFAULT 0,
   last_error        TEXT,
+  -- A pre-claim dispatch refusal (#22): the dispatcher could not assemble a whole
+  -- instruction, so no run started at all. Kept separate from `last_error`, which
+  -- keeps describing the newest RUN: the reason a previous attempt failed is fed to
+  -- the next instruction as `previous_error`, so a configuration fault must not
+  -- erase it — and the fault must stay visible while it persists.
+  dispatch_fault    TEXT,
   last_run_at       TEXT,
   pause_reason      TEXT,                      -- label_withdrawn | maintainer
   created_at        TEXT    NOT NULL,
@@ -606,6 +612,15 @@ class Task:
     #: only after the label was observed absent. Defaults to ``1`` so an existing
     #: row written before the review loop existed is claimable.
     handoff_armed: int = 1
+    #: Why the last dispatch was refused before it could claim (#22): a configuration
+    #: fault such as an unwritable state directory. Deliberately separate from
+    #: :attr:`last_error`, because both can be true at once and each has its own
+    #: consumer — the refusal is what ``status``/``open`` must show, and the newest run
+    #: outcome is what the next instruction receives as "the previous attempt was
+    #: rejected because ...". ``None`` means no refusal recorded. Cleared by the next
+    #: dispatch that gets past instruction preparation, never by a pause or a close, so
+    #: it always describes the **last** dispatch attempt.
+    dispatch_fault: str | None = None
 
     @property
     def handoff_claimable(self) -> bool:
@@ -781,6 +796,11 @@ class Store:
         # durable evidence rather than a string match on a message. Older rows default
         # to 0 ("no refusal was recorded"), which keeps the pin authoritative for them.
         ("runs", "refused", "INTEGER NOT NULL DEFAULT 0"),
+        # Issue #22. A pre-claim refusal (the complete Issue body could not be written)
+        # is a configuration fault that leaves the task queued for the next poll. Its
+        # own column, so recording or clearing it can never overwrite `last_error`,
+        # which keeps describing the newest run outcome.
+        ("tasks", "dispatch_fault", "TEXT"),
     )
 
     def _add_missing_columns(self) -> None:
@@ -1359,28 +1379,33 @@ class Store:
         the dispatcher can simply retry, and that command (``retry``) would also reset
         the attempt budget of a task that may have real history.
 
-        The note is the recorded reason: ``status`` and ``open`` both print
-        ``tasks.last_error``, which is what makes the refusal visible.
+        The note goes to its own column (``dispatch_fault``), which ``status`` and
+        ``open`` print as the **last** dispatch refusal — **never** to ``last_error``.
+        Two independent facts have to coexist here: this refusal and the newest run's
+        outcome (the reason a previous attempt failed, which the next instruction
+        receives as ``previous_error``). Writing the one over the other loses whichever
+        the retry needed more.
+
+        It is a statement about the last attempt, so it is cleared only by a later
+        dispatch that gets past instruction preparation (or replaced by that later
+        attempt's own refusal). Pausing or finishing the task does not rewrite it: those
+        change *intent*, not what the last dispatch found.
         """
         self._conn.execute(
-            "UPDATE tasks SET last_error = ?, updated_at = ? WHERE id = ?",
+            "UPDATE tasks SET dispatch_fault = ?, updated_at = ? WHERE id = ?",
             (note, utcnow_iso(), task_id),
         )
 
     def clear_dispatch_fault(self, task_id: int) -> None:
         """Forget a recorded pre-claim refusal once the dispatcher can proceed again.
 
-        Only a note written by :meth:`record_dispatch_fault` is cleared — matched by
-        its fixed prefix — because ``last_error`` is also where run failures live, and
-        those must survive until a real run replaces them. The narrowness is the point:
-        ``build_instruction(previous_error=...)`` turns this field into "the previous
-        attempt was rejected because ...", and a fault that never started an attempt
-        must not be handed to the model as one. A stale *run* failure, by contrast,
-        still describes something that happened.
+        Only the fault field is cleared. ``last_error`` is deliberately left alone: it
+        is a statement about a *run*, and a later successful dispatch is what replaces
+        it — not the disappearance of an unrelated configuration fault.
         """
         self._conn.execute(
-            "UPDATE tasks SET last_error = NULL, updated_at = ? WHERE id = ? AND last_error LIKE ?",
-            (utcnow_iso(), task_id, f"{DISPATCH_FAULT_PREFIX}%"),
+            "UPDATE tasks SET dispatch_fault = NULL, updated_at = ? WHERE id = ?",
+            (utcnow_iso(), task_id),
         )
 
     def park_for_recovery(self, task_id: int, *, stage: str, note: str) -> None:
@@ -2401,6 +2426,7 @@ def _row_to_task(row: Mapping[str, Any]) -> Task:
         dispatched_at=observed("dispatched_at", None),
         recovery_stage=observed("recovery_stage", None),
         handoff_armed=observed("handoff_armed", 1),
+        dispatch_fault=observed("dispatch_fault", None),
     )
 
 

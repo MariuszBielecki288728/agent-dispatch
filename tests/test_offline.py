@@ -1102,8 +1102,13 @@ class ConfigTests(BaseCase):
         self.assertIsNotNone(task, "existing rows must survive the migration")
         self.assertEqual(task.title, "Legacy row")
         self.assertIsNone(task.pause_reason, "the new column is added as NULL")
+        self.assertIsNone(task.dispatch_fault, "#22's column is added as NULL too")
         self.assertIn(
             "pause_reason",
+            {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")},
+        )
+        self.assertIn(
+            "dispatch_fault",
             {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")},
         )
 

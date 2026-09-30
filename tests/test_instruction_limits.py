@@ -37,6 +37,7 @@ Coverage maps to the acceptance list on the Issue:
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -381,8 +382,8 @@ class CompleteCopyWriterTests(unittest.TestCase):
 
 
 class DispatchFaultNoteTests(unittest.TestCase):
-    """The refusal note is recorded where operators look, and cleared when it stops
-    being true — without ever discarding a recorded *run* failure."""
+    """A pre-claim refusal is recorded where operators look, and cleared while leaving
+    the newest *run* outcome alone — the two facts must be able to coexist."""
 
     def setUp(self) -> None:
         self.store = Store.in_memory()
@@ -407,23 +408,132 @@ class DispatchFaultNoteTests(unittest.TestCase):
         self.assertIsNotNone(task)
         return task
 
-    def test_only_a_dispatch_fault_note_is_cleared(self) -> None:
+    def test_a_dispatch_fault_is_recorded_and_cleared_on_its_own(self) -> None:
         task = self.task()
 
         self.store.record_dispatch_fault(
             task.id, f"{DISPATCH_FAULT_PREFIX} the complete copy could not be written"
         )
-        self.assertIn("complete copy", self.task().last_error or "")
-        self.assertEqual(self.task().phase, "queued", "recording a fault changes no phase")
+
+        row = self.task()
+        self.assertIn("complete copy could not be written", row.dispatch_fault or "")
+        self.assertIsNone(row.last_error, "a refusal must not invent a run failure")
+        self.assertEqual(row.phase, "queued", "recording a fault changes no phase")
+        self.assertEqual(row.attempts, 0)
 
         self.store.clear_dispatch_fault(task.id)
-        self.assertIsNone(self.task().last_error)
+        row = self.task()
+        self.assertIsNone(row.dispatch_fault)
+        self.assertIsNone(row.last_error)
 
-        # A real run failure is NOT a dispatch fault: it keeps describing something
-        # that happened, and a clear must never erase it.
-        self.store.set_phase(task.id, "failed", "the run failed for a real reason")
+    def test_a_dispatch_fault_never_overwrites_a_recorded_run_failure(self) -> None:
+        task = self.task()
+        # A recorded run failure is what the next instruction receives as
+        # `previous_error`, so no configuration fault may replace it.
+        self.store.set_phase(task.id, "failed", "attempt 1/3 the run failed for a reason")
+
+        self.store.record_dispatch_fault(
+            task.id, f"{DISPATCH_FAULT_PREFIX} the complete copy could not be written"
+        )
+
+        row = self.task()
+        self.assertIn("complete copy could not be written", row.dispatch_fault or "")
+        self.assertEqual(
+            row.last_error,
+            "attempt 1/3 the run failed for a reason",
+            "the run failure must survive the refusal",
+        )
+
         self.store.clear_dispatch_fault(task.id)
-        self.assertEqual(self.task().last_error, "the run failed for a real reason")
+        row = self.task()
+        self.assertIsNone(row.dispatch_fault)
+        self.assertEqual(
+            row.last_error,
+            "attempt 1/3 the run failed for a reason",
+            "clearing a fault must not erase a run failure either",
+        )
+
+
+class DispatchFaultSchemaTests(unittest.TestCase):
+    """A database written before #22 has no ``dispatch_fault`` column.
+
+    Read-only stores deliberately never migrate — that is what makes them read-only — so
+    a read path has to tolerate the missing column rather than raise. That is the same
+    class of bug as the pre-#17 ``status_comments`` crash the #18 review found, and the
+    fix is the same rule: an absent optional column means "no refusals recorded", and a
+    read must not add it.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="agent-dispatch-pre22-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = self.tmp / "state.db"
+
+        store = Store(self.db)
+        store.upsert_discovered(
+            repo="example/repo",
+            issue_number=1,
+            title="A task",
+            base_branch="main",
+            runtime_driver="commandcode",
+            runtime_model="deepseek/deepseek-v4-flash",
+            runtime_effort=None,
+            permission_mode="allow-all",
+            trigger_present=True,
+            issue_state="open",
+            linked_pr_number=None,
+            linked_pr_state=None,
+        )
+        store.close()
+
+        if sqlite3.sqlite_version_info < (3, 35):
+            self.skipTest("modelling a pre-#22 schema needs ALTER TABLE ... DROP COLUMN")
+        connection = sqlite3.connect(self.db)
+        try:
+            # Fixture precondition: dropping a column that is not there would pass
+            # vacuously and the test would stop modelling anything.
+            self.assertIn(
+                "dispatch_fault",
+                {str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)")},
+            )
+            connection.execute("ALTER TABLE tasks DROP COLUMN dispatch_fault")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _columns(self, store: Store) -> set[str]:
+        return {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")}
+
+    def test_a_read_only_store_tolerates_the_missing_column(self) -> None:
+        store = Store.open_read_only(self.db)
+        self.addCleanup(store.close)
+
+        task = store.get_task("example/repo", 1)
+
+        self.assertIsNotNone(task, "a pre-#22 database must still be readable")
+        self.assertIsNone(task.dispatch_fault, "an absent column means no refusal recorded")
+        self.assertNotIn(
+            "dispatch_fault",
+            self._columns(store),
+            "a read-only store must not migrate (that is what makes it read-only)",
+        )
+
+    def test_a_writable_store_migrates_the_column_and_the_new_semantics_work(self) -> None:
+        store = Store(self.db)
+        self.addCleanup(store.close)
+
+        task = store.get_task("example/repo", 1)
+        self.assertIsNotNone(task)
+        self.assertIn("dispatch_fault", self._columns(store))
+        self.assertIsNone(task.dispatch_fault, "a migrated row recorded no refusal")
+
+        store.record_dispatch_fault(task.id, f"{DISPATCH_FAULT_PREFIX} a fault")
+        row = store.get_task("example/repo", 1)
+        self.assertEqual(row.dispatch_fault, f"{DISPATCH_FAULT_PREFIX} a fault")
+        self.assertIsNone(row.last_error)
+
+        store.clear_dispatch_fault(task.id)
+        self.assertIsNone(store.get_task("example/repo", 1).dispatch_fault)
 
 
 class OversizedIssueDispatchTests(ExecutionCase):
@@ -548,7 +658,11 @@ class OversizedIssueDispatchTests(ExecutionCase):
         self.assertEqual(task.phase, "queued", "an environment fault is not a task failure")
         self.assertEqual(task.attempts, 0, "the refusal must consume no attempt")
         self.assertIsNone(task.pr_number)
-        self.assertIn("complete copy could not be written", task.last_error or "")
+        self.assertIn("complete copy could not be written", task.dispatch_fault or "")
+        self.assertIsNone(
+            task.last_error,
+            "the refusal is recorded as a dispatch fault, not as a run failure",
+        )
         self.assertEqual(self.store().run_history(task.id), [], "no run row may be written")
 
         # Visible where an operator looks, not only in the journal.
@@ -569,9 +683,8 @@ class OversizedIssueDispatchTests(ExecutionCase):
         self.assertEqual(
             self.copy_path().read_text(encoding="utf-8"), issue_body_excerpt(self.body).document
         )
-        self.assertNotIn(
-            DISPATCH_FAULT_PREFIX,
-            task.last_error or "",
+        self.assertIsNone(
+            task.dispatch_fault,
             "the stale fault note is cleared once the dispatcher can proceed",
         )
         instruction = self.instruction_of()
@@ -581,6 +694,84 @@ class OversizedIssueDispatchTests(ExecutionCase):
             "a dispatcher fault that started no attempt must never be presented to the "
             "model as a rejected attempt",
         )
+
+    def test_a_refused_dispatch_keeps_the_worktree_it_created_for_the_retry(self) -> None:
+        """The worktree a refusal just created stays OWNED, so the retry reuses it.
+
+        This is the round-1 review's blocker, pinned at the boundary it names. The
+        worktree PATH is derived from the Issue NUMBER while the branch name comes from
+        the TITLE — which every poll refreshes. So an unrecorded worktree plus a title
+        edit makes the next pass derive a *different* branch for the same existing path,
+        and `ensure()` rightly refuses it as unprovable ownership: a self-healing
+        configuration fault turns into a `worktree not usable` park, contradicting the
+        promise that the next poll simply retries.
+        """
+        config = self.config()
+        task_dir = runlogs.run_dir(config.worker.run_log_dir, self.slug, 1)
+        task_dir.parent.mkdir(parents=True, exist_ok=True)
+        task_dir.write_text("a file where the run directory should be\n", encoding="utf-8")
+        self.assertEqual(self.run_cli("enqueue", "--repo", self.slug, "--issue", "1").returncode, 0)
+
+        refused = self.run_cli("run", "--skip-poll")
+        self.assertEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertEqual(self.recorded_argv(), [], "no model may be called")
+
+        task = self.task_row()
+        self.assertEqual(task.phase, "queued")
+        self.assertEqual(task.attempts, 0, "the refusal consumes no attempt")
+        self.assertEqual(self.store().run_history(task.id), [], "no run row was written")
+        # `manager.ensure()` created these resources before the refusal; ownership is a
+        # durable fact about the dispatcher's own Git state, not a claim about a run.
+        original_branch = task.branch
+        original_path = task.worktree_path
+        self.assertIsNotNone(original_branch, "the created branch must be recorded")
+        self.assertIsNotNone(original_path, "the created worktree must be recorded")
+        self.assertTrue(Path(original_path or "").is_dir(), "the worktree really exists")
+
+        # The maintainer renames the Issue while fixing the environment — which changes
+        # the branch name the dispatcher would derive — and the fault clears.
+        renamed = "A large Issue, renamed after the refusal"
+        self.set_issues(issue(1, renamed, labels=[TRIGGER], body=self.body))
+        task_dir.unlink()
+
+        recovered = self.run_cli("run")  # a full poll, so discovery refreshes the title
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+
+        task = self.task_row()
+        self.assertEqual(task.title, renamed, "the poll really did refresh the title")
+        self.assertEqual(task.phase, "awaiting_review", task.last_error)
+        self.assertEqual(
+            task.branch, original_branch, "the retry must reuse the branch that was created"
+        )
+        self.assertEqual(task.worktree_path, original_path)
+        self.assertEqual(task.attempts, 1, "one attempt in total")
+        self.assertEqual(len(self.recorded_argv()), 1, "exactly one model call")
+        self.assertIsNotNone(task.pr_number)
+        self.assertNotIn(
+            "worktree",
+            (task.last_error or "").lower(),
+            "the retry must not have parked as a worktree-ownership problem",
+        )
+
+        # Exactly ONE task branch exists: the retry did not derive a second one from the
+        # new title, and the task was never parked as `worktree not usable`.
+        # `--format` avoids the `*`/`+` worktree decoration `git branch --list` prints.
+        branches = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.source),
+                "branch",
+                "--list",
+                "dispatch/*",
+                "--format=%(refname:short)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        self.assertEqual(branches, [original_branch], f"expected one branch, got {branches}")
+        self.assertTrue(self.copy_path().is_file())
 
     def test_two_attempts_keep_one_copy_of_the_snapshot_the_attempt_actually_used(
         self,

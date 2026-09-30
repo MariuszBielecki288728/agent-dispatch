@@ -607,6 +607,29 @@ class Orchestrator:
                 "worktree_provisioned", repo=repo.slug, issue=task.issue_number, note=note
             )
 
+        # Ownership of the Git resources is recorded IMMEDIATELY, before any step below
+        # that may legitimately return without claiming (the attempt-budget check and
+        # the #22 instruction-copy refusal). `ensure()` has just created — or re-proved
+        # — this branch and worktree, so the row must be able to answer "which branch
+        # and directory belong to this task" from here on, even when no run happens.
+        #
+        # Leaving it unrecorded is a real trap, not a tidiness issue: the worktree PATH
+        # is derived from the Issue NUMBER alone, while the branch name is derived from
+        # the TITLE, which `upsert_discovered()` deliberately refreshes on every poll. A
+        # maintainer editing the title before the retry would make the next pass derive
+        # a different branch for the same existing path, and `ensure()` would rightly
+        # refuse that worktree as unprovable ownership — turning a self-healing
+        # configuration fault into a `needs_attention` park and breaking the promise
+        # that the next poll simply retries. Recording the paths claims nothing: no
+        # model call, no attempt consumed, no phase change. It is also what keeps
+        # `open` truthful while the fault persists.
+        self.store.set_owned_worktree(
+            task.id,
+            branch=provision.state.branch,
+            worktree_path=str(provision.state.path),
+            base_branch=repo.base_branch,
+        )
+
         # Attempts are bounded before the claim, so a task that already exhausted
         # its budget cannot be run again by a fresh poll.
         if task.attempts >= self.config.worker.max_attempts:
@@ -634,20 +657,11 @@ class Orchestrator:
         complete_body_file, refusal = self._prepare_instruction(task, repo, issue)
         if refusal is not None:
             return refusal
-        # The dispatcher can proceed, so a note from an earlier refusal is stale — and
-        # it must not reach the model as a "previous attempt" error, because no attempt
-        # ever started. Only the prefixed fault note is cleared; a recorded run failure
-        # keeps describing what actually happened.
+        # The dispatcher can proceed, so a refusal note from an earlier poll is stale — it
+        # must not keep describing a fault that no longer exists. Only the fault field is
+        # cleared: `last_error` is a statement about a RUN, and the newest run outcome is
+        # what the instruction below receives as `previous_error`.
         self.store.clear_dispatch_fault(task.id)
-
-        # Record the owned paths even if the claim then loses the race, so the row
-        # always answers "which branch/worktree belongs to this task".
-        self.store.set_owned_worktree(
-            task.id,
-            branch=provision.state.branch,
-            worktree_path=str(provision.state.path),
-            base_branch=repo.base_branch,
-        )
 
         claimed = self.store.claim_for_run(
             task.id,
@@ -773,7 +787,10 @@ class Orchestrator:
             f"complete copy could not be written — {problem}"
         )
         # Recorded WITHOUT a phase change: the task stays queued, so the next poll
-        # retries by itself once the fault clears and no attempt is consumed.
+        # retries by itself once the fault clears and no attempt is consumed. Recorded in
+        # its own field too, so it cannot erase the newest run's outcome — that outcome is
+        # fed to the next instruction as "the previous attempt was rejected because ...",
+        # and a fault that started no attempt is not an attempt.
         self.store.record_dispatch_fault(task.id, note)
         self.log.error(
             "dispatch_refused",
