@@ -33,7 +33,9 @@ def prune(run_log_dir: Path, keep: int) -> list[Path]:
     """Keep the newest ``keep`` log files per task; return the files removed.
 
     Deterministic (sorted by name, which is timestamp-prefixed by #4), cheap, and
-    never touches anything outside ``run_log_dir``.
+    never touches anything outside ``run_log_dir``. Only ``*.ndjson`` is deleted, so
+    the complete-Issue-body copy an oversized instruction points at (#22) survives
+    pruning for as long as its task's run directory does.
     """
     removed: list[Path] = []
     root = Path(run_log_dir)

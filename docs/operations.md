@@ -588,9 +588,26 @@ rather than discarding existing work.
 |---|---|
 | State database | `worker.state_db` (default `~/.local/state/agent-dispatch/state.db`) |
 | Raw NDJSON run logs | `worker.run_log_dir`, retained to `worker.run_log_keep` files per task |
+| Complete Issue body for an oversized instruction | `<run_log_dir>/<repo>/issue-<N>/issue-body.md` (#22) |
 | Runtime stderr per run | `<run-id>.stderr.txt` beside the NDJSON file |
 | Worker lock | `worker.lock_file` (pid + start time + command; never credentials) |
 | Service logs | `journalctl --user -u agent-dispatch -f` |
+
+`issue-body.md` holds the complete Issue body for an attempt whose instruction could
+not carry it whole. The instruction names that absolute path — untrusted, read-only task
+content of the same status as the excerpt in the prompt — and discloses the exact
+shown/omitted character counts. It is written from the same snapshot as the excerpt (one
+GitHub read), overwritten for each attempt, and never touched by `prune-logs`, which
+deletes only `*.ndjson`.
+
+If that file **cannot be written**, the dispatch is refused before the runtime starts:
+no run row, no attempt consumed, the task stays `queued`, and the reason is printed by
+`status` and `open` — from `tasks.dispatch_fault`, which is kept separate from
+`last_error` so a refusal can never be mistaken for a failed attempt or erase the newest
+run's outcome. Nothing needs to be reset by hand — the next poll retries once the state
+directory is writable again. This is deliberate: an unwritable state directory is a
+configuration fault (the same class as a missing runtime binary), not a task failure, so
+it must not burn an attempt or strand the task behind an operator command.
 
 `--log-format json` emits one JSON object per line for journald/CI capture.
 
@@ -1210,6 +1227,9 @@ a mock. The cases most worth knowing about:
 | `FinalPromptBoundaryTests` | at the real whole-prompt bound, every claimed item survives in the exact instruction handed to the runtime; optional sections are dropped whole; a required set that overflows raises instead of truncating, while one just inside the bound still builds; feedback that fits only *without* the framing defers before anything is claimed; the guard measures the longest requirement variant the builder can join, so a batch that fits only while the diff is readable is refused and an admitted handoff builds under either; the unreadable-diff requirement set is a strict superset of the readable one, and the built instruction emits each required section exactly once with the closing instruction last |
 | `ReviewReadOnlyTests` | `review --dry-run` creates nothing, and neither `status`, `dry-run` nor `worker --no-execute` starts a round |
 | `MultiRepoExecutionTests` | two allowlisted repositories carrying the same Issue number *and title* stay separate in task rows, branches, worktrees, run logs and PRs, and only one task runs at a time across both |
+| `InstructionRenderingTests` (`test_instruction_limits`) | the instruction for a body that fits is **byte-identical** to the pre-#22 rendering (golden), a copy is ignored and unnamed unless the body was really cut, the oversized body's disclosure appears exactly once with the exact shown/omitted counts and the absolute path, it sits outside the untrusted fence, the cut ends at a line boundary (the fixture asserts a character cut *would* slice a line, so it cannot go stale), and an oversized `AGENTS.md` is disclosed pointing at the worktree copy |
+| `CompleteCopyWriterTests` (`test_instruction_limits`) | the complete copy carries the document byte for byte, is atomic (no temporary left behind), is overwritten by a later attempt, and reports a problem instead of raising — leaving no partial file — when its directory cannot be created |
+| `OversizedIssueDispatchTests` (`test_instruction_limits`) | a real dispatch of an oversized Issue names the copy in the runtime argv and writes it outside the worktree and clone, the worktree, its `git status` and the pushed branch contain no such file, a maintainer's edit between attempts leaves **one** file carrying the newest snapshot, and an unwritable run directory refuses with no spawn, no run row, no attempt consumed, the reason in `status`/`open`, then completes on the next attempt once cleared |
 
 `test-offline.sh` ends by asserting that no state, lock or run-log artefact was
 created inside the checkout; `test_the_run_log_lives_outside_the_worktree` asserts

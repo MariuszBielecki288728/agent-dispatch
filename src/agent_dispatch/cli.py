@@ -349,6 +349,7 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
                         "pr_url": task.pr_url,
                         "attempts": task.attempts,
                         "last_error": task.last_error,
+                        "dispatch_fault": task.dispatch_fault,
                         "last_run_at": task.last_run_at,
                         "pause_reason": task.pause_reason,
                         "observed_at": task.observed_at,
@@ -410,6 +411,11 @@ def _cmd_status(args: argparse.Namespace, config: Config, log: Logger) -> int:
                 )
             if task.last_error:
                 print(f"      note: {task.last_error}")
+            if task.dispatch_fault:
+                # The LAST pre-claim refusal: a configuration fault that stopped the
+                # dispatcher before it claimed, reported even when the task has no run
+                # history at all (and kept distinct from a run failure).
+                print(f"      last dispatch fault: {task.dispatch_fault}")
 
         print()
         print("  own#N = a PR this worker created; obs#N = a PR that merely references the Issue.")
@@ -717,6 +723,8 @@ def _cmd_open(args: argparse.Namespace, config: Config, log: Logger) -> int:
         )
         if task.last_error:
             print(f"  last message   : {task.last_error}")
+        if task.dispatch_fault:
+            print(f"  last dispatch fault: {task.dispatch_fault}")
         if runs:
             print("  runs:")
             for run in runs:

@@ -235,6 +235,7 @@ def issue(
     labels: list[str] | None = None,
     state: str = "open",
     is_pr: bool = False,
+    body: str = "",
 ) -> dict:
     payload = {
         "number": number,
@@ -242,6 +243,11 @@ def issue(
         "state": state,
         "html_url": f"https://github.com/example/repo/issues/{number}",
         "labels": [{"name": name} for name in (labels or [])],
+        # GitHub always returns a `body` field (null for an empty description).
+        # #22's instruction-bound tests need real, oversized descriptions; every
+        # other fixture can keep omitting it and get the same empty default the
+        # service treats a missing body as.
+        "body": body,
     }
     if is_pr:
         payload["pull_request"] = {
@@ -1096,8 +1102,13 @@ class ConfigTests(BaseCase):
         self.assertIsNotNone(task, "existing rows must survive the migration")
         self.assertEqual(task.title, "Legacy row")
         self.assertIsNone(task.pause_reason, "the new column is added as NULL")
+        self.assertIsNone(task.dispatch_fault, "#22's column is added as NULL too")
         self.assertIn(
             "pause_reason",
+            {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")},
+        )
+        self.assertIn(
+            "dispatch_fault",
             {str(row["name"]) for row in store._conn.execute("PRAGMA table_info(tasks)")},
         )
 

@@ -487,6 +487,50 @@ context, the observed commit/file state of the branch, and the repository's own
 instructions, and it explicitly asks the agent to push back on comments it disagrees
 with or that are out of scope rather than implementing them blindly.
 
+### Instruction bounds are disclosed, never silently applied (#22)
+
+Both implementation bounds — Issue body 12 000 characters, repository instructions
+8 000 — can be exceeded by real input, and the implementation path cannot *defer* the way
+a review round defers a handoff (the Issue **is** the task). Its honest equivalent is to
+**disclose the cut and keep the complete text reachable**:
+
+| Requirement | How it is met |
+|---|---|
+| Never silent | A fixed, service-authored `[DISPATCHER NOTE]` sentence sits in `instruction.text` **adjacent to the fenced content**, stating that the document was truncated and the exact shown/omitted character counts. It is built only from those integers and a path — never from Issue text — and appears exactly once per document, which a test asserts. An oversized `AGENTS.md` is disclosed the same way. |
+| Never lost | The complete Issue body is written to the task's run directory — `runlogs.run_dir(...)/issue-body.md`, outside every repository and worktree — and the instruction names that absolute path as untrusted, read-only task content. The `Work only inside this worktree` sentence gains an explicit carve-out that *reading* this one provided file is expected; writing anything outside the worktree stays forbidden. |
+| One snapshot | The excerpt, the file contents and the disclosed numbers all derive from ONE `Excerpt` (`text` = what the prompt embeds, `document` = what the file is written with), built from the same fetch the dispatch already re-validated against. The pointer and the excerpt cannot describe different revisions. |
+| Fail closed | If the complete copy cannot be written, the dispatch is refused **before** the runtime is spawned: no claim, no run row, no attempt consumed, and `tasks.dispatch_fault` — printed by `status` and `open` as the **last** pre-claim refusal — records why. The task stays `queued`, so the next poll retries by itself once the fault clears. That is the `dispatch_unavailable` class, because an unwritable state directory is a configuration fault, not a task failure. The fault lives in its **own** column rather than `last_error`, so a refusal can neither be mistaken for a failed attempt nor erase the newest run's outcome, which the next instruction receives as "the previous attempt was rejected because ...". For the retry promise to hold, the branch and worktree `manager.ensure()` just created are recorded **immediately after provisioning**, before any step that may return without claiming: the worktree *path* is derived from the Issue number while the *branch name* comes from the poll-refreshed title, so an unrecorded worktree plus a title edit would make the retry derive a different branch for the same existing path and refuse it as unprovable ownership. |
+| Common path unchanged | An Issue that fits produces the pre-#22 instruction **byte for byte** (pinned by a golden test rendered from the old builder): no disclosure, no pointer, no file, and the original scope sentence. |
+
+The cut itself prefers a **line boundary**, so no line (and therefore no code fence or
+table row) is ever sliced in half; the exact omitted count is disclosed either way, which
+is what keeps a shorter-than-the-limit cut honest rather than silently generous. Placement
+is asserted on a real repository rather than trusted as convention: the copy must not
+appear in the worktree, in its `git status`, or in the commit the PR is opened from —
+`git add -A` would sweep anything materialized inside the worktree into the task's commit.
+
+The stable per-task file name is deliberate: `build_instruction()` runs before a run id
+exists, and each attempt overwrites the copy with the snapshot **that attempt** actually
+read, so a maintainer's edit between attempts cannot leave the instruction pointing at an
+older body. `runlogs.prune()` deletes only `*.ndjson`, so the copy survives log pruning.
+This is the implementation counterpart of [§ "Nothing is acknowledged that was not
+delivered (#5)"](#nothing-is-acknowledged-that-was-not-delivered-5): the invariant is "the
+model must never be led to believe it received something it did not", not "review feedback
+is special".
+
+Two consequences of the stable name are accepted deliberately, because the alternative
+costs more than it buys:
+
+* **Earlier snapshots are not retained.** An attempt that follows an edit overwrites the
+  previous copy, so an older omitted tail is not reconstructible from local state alone —
+  the run journal records the *counts*, not the omitted text. Retaining one file per
+  attempt would require a name the instruction can predict before a run id exists, and the
+  audit value is low next to the prompt-integrity value this file provides.
+* **An attempt whose body fits writes nothing and deletes nothing.** The copy then on disk
+  is simply not referenced (the instruction names it only when it truncated), and it is
+  overwritten by the next oversized attempt. Deleting it would add a second failure path
+  to a success path in exchange for removing a file no consumer reads.
+
 ### Mandatory post-run validation
 
 A run is accepted **only if all** hold:
@@ -940,6 +984,13 @@ Routine CI must not spend model credits; real runs are opt-in and low-cost.
 - Multi-repo config: no credential, state, or worktree collisions; concurrency bounded; credentials absent from Git/logs/artifacts.
 - Install/uninstall/upgrade documented; `doctor`, `status`, `pause`, `resume`, `retry`, `dry-run` verified; no VS Code window required.
 - Pilot report split into **Observed on VM**, **Automated/tested**, and **Not tested / maintainer-only**, including one real same-session review cycle.
+
+**#22 — instruction bounds**
+- **Byte-identical common path:** the fitted-body instruction is compared against the text the pre-#22 builder produced for the same fixture (a golden constant), so a stray disclosure, pointer or rewording fails.
+- **Disclosure falsification:** removing the disclosure sentence makes the oversized-body tests fail; emitting it for a fitting body fails the golden test. The sentence is asserted to appear exactly once, carry the exact shown/omitted counts, and sit outside the untrusted fence.
+- **Placement on a real repository:** after a real dispatch, the named path is outside the worktree and the clone, the worktree holds no such file, and the branch the PR is opened from does not contain it.
+- **Fail-closed with a positive control:** an unwritable run directory yields no runtime spawn, no run row, no attempt consumed, a still-`queued` task and a reason visible in `status`/`open`; clearing the obstruction and running again completes the same task with the copy present.
+- **Rewrite per attempt:** a maintainer's edit between two attempts yields exactly one stable file carrying the *newest* snapshot, and the second instruction's disclosure counts match it.
 
 ---
 
